@@ -423,6 +423,7 @@ ClangTidyASTConsumerFactory::createASTConsumer(CompilerInstance &Compiler,
   Context.setSourceManager(SM);
   Context.setCurrentFile(File);
   Context.setASTContext(&Compiler.getASTContext());
+  Context.setCodeGenOpts(Compiler.getCodeGenOpts());
 
   auto WorkingDir = Compiler.getSourceManager()
                         .getFileManager()

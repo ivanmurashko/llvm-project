@@ -43,6 +43,12 @@ extern volatile int CERTModuleAnchorSource;
 [[maybe_unused]] static int CERTModuleAnchorDestination =
     CERTModuleAnchorSource;
 
+#if CLANG_ENABLE_CIR
+// This anchor is used to force the linker to link the CIRModule.
+extern volatile int CIRModuleAnchorSource;
+[[maybe_unused]] static int CIRModuleAnchorDestination = CIRModuleAnchorSource;
+#endif
+
 // This anchor is used to force the linker to link the ConcurrencyModule.
 extern volatile int ConcurrencyModuleAnchorSource;
 [[maybe_unused]] static int ConcurrencyModuleAnchorDestination =

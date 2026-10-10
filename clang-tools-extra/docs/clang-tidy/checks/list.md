@@ -13,6 +13,7 @@ android/*
 boost/*
 bugprone/*
 cert/*
+cir/*
 clang-analyzer/*
 concurrency/*
 cppcoreguidelines/*
@@ -189,6 +190,7 @@ readability/*
 | {doc}`bugprone-unused-return-value <bugprone/unused-return-value>` |  |
 | {doc}`bugprone-use-after-move <bugprone/use-after-move>` |  |
 | {doc}`bugprone-virtual-near-miss <bugprone/virtual-near-miss>` | Yes |
+| {doc}`cir-lifetime-check <cir/lifetime-check>` |  |
 | {doc}`concurrency-mt-unsafe <concurrency/mt-unsafe>` |  |
 | {doc}`concurrency-thread-canceltype-asynchronous <concurrency/thread-canceltype-asynchronous>` |  |
 | {doc}`cppcoreguidelines-avoid-capturing-lambda-coroutines <cppcoreguidelines/avoid-capturing-lambda-coroutines>` |  |

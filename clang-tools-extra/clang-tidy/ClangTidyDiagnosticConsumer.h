@@ -13,6 +13,7 @@
 #include "ClangTidyProfiling.h"
 #include "FileExtensionsSet.h"
 #include "NoLintDirectiveHandler.h"
+#include "clang/Basic/CodeGenOptions.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Tooling/Core/Diagnostic.h"
 #include "llvm/ADT/DenseMap.h"
@@ -85,6 +86,9 @@ public:
     this->DiagEngine = DiagEngine;
   }
 
+  /// Returns the engine whose diagnostic IDs and client this context uses.
+  DiagnosticsEngine &getDiagnosticsEngine() const { return *DiagEngine; }
+
   ~ClangTidyContext();
 
   ClangTidyContext(const ClangTidyContext &) = delete;
@@ -141,6 +145,11 @@ public:
 
   /// Gets the language options from the AST context.
   const LangOptions &getLangOpts() const { return LangOpts; }
+
+  /// Sets the code generation options for the current translation unit.
+  void setCodeGenOpts(const CodeGenOptions &Opts) { CodeGenOpts = Opts; }
+
+  const CodeGenOptions &getCodeGenOpts() const { return CodeGenOpts; }
 
   /// Returns the name of the clang-tidy check which produced this
   /// diagnostic ID.
@@ -254,6 +263,7 @@ private:
   FileExtensionsSet ImplementationFileExtensions;
 
   LangOptions LangOpts;
+  CodeGenOptions CodeGenOpts;
 
   ClangTidyStats Stats;
 
