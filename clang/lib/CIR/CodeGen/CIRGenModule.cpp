@@ -3922,10 +3922,50 @@ CIRGenModule::getMLIRVisibilityFromCIRLinkage(cir::GlobalLinkageKind glk) {
 
 void CIRGenModule::setLifetimeFunctionAttr(
     cir::FuncOp funcOp, const clang::FunctionDecl *funcDecl) {
-  if (const auto *method = dyn_cast_or_null<CXXMethodDecl>(funcDecl))
-    funcOp.setLifetimeAttr(cir::LifetimeFunctionAttr::get(
-        &getMLIRContext(), /*isMethod=*/true, method->isStatic(),
-        method->isConst(), method->isOverloadedOperator()));
+  if (!funcDecl)
+    return;
+
+  const auto *method = dyn_cast<CXXMethodDecl>(funcDecl);
+  bool hasImplicitObject = method && method->isImplicitObjectMemberFunction();
+  std::string methodName = method ? method->getDeclName().getAsString() : "";
+
+  // This hook does not know the GlobalDecl structor variant. Inherited
+  // constructors can omit source parameters, and virtual bases can add a VTT
+  // parameter. Do not guess their source-to-CIR mapping from the argument
+  // count.
+  bool canMapParameters = funcDecl->hasPrototype();
+  if (const auto *ctor = dyn_cast<CXXConstructorDecl>(funcDecl))
+    canMapParameters &= !ctor->getInheritedConstructor();
+  if (isa<CXXConstructorDecl, CXXDestructorDecl>(funcDecl))
+    canMapParameters &= !method->getParent()->getNumVBases();
+
+  mlir::DenseI32ArrayAttr parameterKinds, parameterIndices;
+  if (canMapParameters) {
+    llvm::SmallVector<int32_t> kinds, indices;
+    unsigned index = hasImplicitObject ? 1 : 0;
+    for (const ParmVarDecl *param : funcDecl->parameters()) {
+      cir::LifetimeParameterKind kind = cir::LifetimeParameterKind::Value;
+      if (param->getType()->isRValueReferenceType())
+        kind = cir::LifetimeParameterKind::RValueReference;
+      else if (param->getType()->isLValueReferenceType())
+        kind = cir::LifetimeParameterKind::LValueReference;
+      kinds.push_back(static_cast<int32_t>(kind));
+      indices.push_back(index++);
+      if (param->hasAttr<PassObjectSizeAttr>())
+        ++index;
+    }
+    // Builtins and other synthesized signatures need not match the source
+    // declaration. Absence is deliberately different from zero parameters.
+    if (index == funcOp.getFunctionType().getNumInputs()) {
+      parameterKinds = builder.getDenseI32ArrayAttr(kinds);
+      parameterIndices = builder.getDenseI32ArrayAttr(indices);
+    }
+  }
+  funcOp.setLifetimeAttr(cir::LifetimeFunctionAttr::get(
+      &getMLIRContext(), /*isMethod=*/method != nullptr,
+      /*isStatic=*/method && method->isStatic(),
+      /*isConst=*/method && method->isConst(), funcDecl->isOverloadedOperator(),
+      hasImplicitObject, methodName, parameterKinds, parameterIndices));
 }
 
 void CIRGenModule::emitLifetimeRecords() {
@@ -3936,6 +3976,10 @@ void CIRGenModule::emitLifetimeRecords() {
     // owners and pointers, so explicit and inferred annotations share a path.
     bool owner = record->hasAttr<OwnerAttr>();
     bool pointer = record->hasAttr<PointerAttr>();
+    bool smartPointer = record->getDeclContext()->isStdNamespace() &&
+                        record->getIdentifier() &&
+                        (record->getName() == "unique_ptr" ||
+                         record->getName() == "shared_ptr");
     const auto *cxxRecord = dyn_cast<CXXRecordDecl>(record);
     bool lambda = cxxRecord && cxxRecord->isLambda();
     bool promiseType = false;
@@ -3949,15 +3993,15 @@ void CIRGenModule::emitLifetimeRecords() {
         }
       }
     }
-    if (!owner && !pointer && !lambda && !promiseType)
+    if (!owner && !pointer && !lambda && !promiseType && !smartPointer)
       continue;
-    entries.emplace_back(name, cir::LifetimeRecordAttr::get(
-                                   &getMLIRContext(), owner, pointer, lambda,
-                                   promiseType));
+    entries.emplace_back(
+        name, cir::LifetimeRecordAttr::get(&getMLIRContext(), owner, pointer,
+                                           lambda, promiseType, smartPointer));
   }
   if (!entries.empty())
     theModule->setAttr(cir::CIRDialect::getLifetimeRecordsAttrName(),
-                      mlir::DictionaryAttr::get(&getMLIRContext(), entries));
+                       mlir::DictionaryAttr::get(&getMLIRContext(), entries));
 }
 
 void CIRGenModule::release() {

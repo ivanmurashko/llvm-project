@@ -25,7 +25,7 @@ void sv0() {
   String name = "abcdefghijklmnop";
   sv = name;
   (void)sv.getSize(); // expected-remark {{pset => { name__1' }}}
-  name = "frobozz"; // expected-note {{invalidated by non-const use of owner type}}
+  name = "frobozz"; // expected-note {{invalidated by non-const use of owner type}} expected-remark {{pset => { ref.tmp1__1' }}}
   (void)sv.getSize(); // expected-warning {{use of invalid pointer 'sv'}}
   // expected-remark@-1 {{pset => { invalid }}}
   sv = name;
@@ -39,7 +39,7 @@ void sv1() {
   sv_other = sv;
   (void)sv.getSize();  // expected-remark {{pset => { name__1' }}}
   (void)sv_other.getSize();  // expected-remark {{pset => { name__1' }}}
-  name = "frobozz"; // expected-note 2 {{invalidated by non-const use of owner type}}
+  name = "frobozz"; // expected-note 2 {{invalidated by non-const use of owner type}} expected-remark {{pset => { ref.tmp1__1' }}}
   (void)sv.getSize(); // expected-warning {{use of invalid pointer 'sv'}}
   // expected-remark@-1 {{pset => { invalid }}}
   (void)sv_other.getSize(); // expected-warning {{use of invalid pointer 'sv_other'}}
@@ -53,7 +53,7 @@ void sv2() {
   String name = "abcdefghijklmnop";
   sv = name;
   char read0 = sv[0]; // expected-remark {{pset => { name__1' }}}
-  name = "frobozz"; // expected-note {{invalidated by non-const use of owner type}}
+  name = "frobozz"; // expected-note {{invalidated by non-const use of owner type}} expected-remark {{pset => { ref.tmp1__1' }}}
   char read1 = sv[0]; // expected-warning {{use of invalid pointer 'sv'}}
   // expected-remark@-1 {{pset => { invalid }}}
   sv = name;
@@ -77,7 +77,7 @@ void sv3() {
   String name = "abcdefghijklmnop";
   sv = name;
   cout << sv; // expected-remark {{pset => { name__1' }}}
-  name = "frobozz"; // expected-note {{invalidated by non-const use of owner type}}
+  name = "frobozz"; // expected-note {{invalidated by non-const use of owner type}} expected-remark {{pset => { ref.tmp1__1' }}}
   cout << sv[2]; // expected-warning {{use of invalid pointer 'sv'}}
   sv = name; // expected-remark@-1 {{pset => { invalid }}}
   cout << sv; // expected-remark {{pset => { name__2' }}}

@@ -44,14 +44,14 @@ template <> [[clang::sycl_external]] void tFunc<int>(int arg) {}
 // Defined without the attribute and not used in device code: not emitted.
 int squareNoAttr(int x) { return x * x; }
 
-// CIR: cir.func {{.*}}@_Z6squarei({{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"}
-// CIR: cir.func {{.*}}@_Z9deviceUsev() {{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"}
+// CIR: cir.func {{.*}}@_Z6squarei({{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR: cir.func {{.*}}@_Z9deviceUsev() {{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
 // CIR: cir.func private @_Z16declUsedInDevicei({{.*}} attributes {convergent{{[^"]*}}} loc
-// CIR: cir.func {{.*}}@_Z5func1i({{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"}
-// CIR: cir.func {{.*}}@_Z8withAttrv() {{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"}
+// CIR: cir.func {{.*}}@_Z5func1i({{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR: cir.func {{.*}}@_Z8withAttrv() {{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
 // CIR: cir.func {{.*}}@_Z4ret1v() {{.*}} attributes {convergent{{[^"]*}}} {
-// CIR: cir.func {{.*}}@_Z5tFuncIiEvT_({{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"}
-// CIR: cir.func {{.*}}@_ZTS2KN({{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"}
+// CIR: cir.func {{.*}}@_Z5tFuncIiEvT_({{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR: cir.func {{.*}}@_ZTS2KN({{.*}} attributes {{{.*}}"sycl-module-id" = "{{.*}}sycl-external.cpp"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
 // CIR-NOT: @_Z8declOnlyv
 // CIR-NOT: @_Z12squareNoAttri
 

@@ -1,0 +1,22 @@
+// RUN: cir-opt %s --verify-roundtrip | FileCheck %s
+// RUN: cir-opt %s --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --verify-roundtrip | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+
+module {
+  // CHECK-LABEL: cir.func @xvalue_read
+  // CHECK: cir.load xvalue %arg0 : !cir.ptr<!s32i>, !s32i
+  cir.func @xvalue_read(%arg0: !cir.ptr<!s32i>) -> !s32i {
+    %value = cir.load xvalue %arg0 : !cir.ptr<!s32i>, !s32i
+    cir.return %value : !s32i
+  }
+
+  // CHECK-LABEL: cir.func @ordinary_read
+  // CHECK: cir.load %arg0 : !cir.ptr<!s32i>, !s32i
+  // CHECK-NOT: cir.load xvalue
+  cir.func @ordinary_read(%arg0: !cir.ptr<!s32i>) -> !s32i {
+    %value = cir.load %arg0 : !cir.ptr<!s32i>, !s32i
+    cir.return %value : !s32i
+  }
+}

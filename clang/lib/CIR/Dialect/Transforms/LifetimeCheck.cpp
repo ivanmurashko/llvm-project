@@ -91,18 +91,63 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
     Direct,
     RetLambda,
     CallParam,
-    IndirectCallParam,
+    NullableCallParam,
+    UseAfterMove,
   };
-  void checkPointerDeref(mlir::Value addr, mlir::Location loc,
+  bool checkPointerDeref(mlir::Value addr, mlir::Location loc,
                          DerefStyle derefStyle = DerefStyle::Direct);
   void checkCoroTaskStore(StoreOp storeOp);
   void checkLambdaCaptureStore(StoreOp storeOp);
+  // Checks and tracks moved-from values in store operations.
+  // Handles two scenarios:
+  // 1. Detects use-after-move: Reports diagnostic if storing value loaded from
+  // moved-from source
+  // 2. Tracks rvalue initialization: Marks source as moved-from (e.g., int
+  // b(std::move(a))) Only applies to value types; only marks AllocaOp
+  // destinations; skips dereference operations.
+  void checkMovedFromValue(StoreOp storeOp);
   void trackCallToCoroutine(CallOp callOp);
 
   void checkCtor(CallOp callOp, cir::CXXCtorAttr ctor);
+  void checkMoveCtor(CallOp callOp, cir::CXXCtorAttr ctor);
   void checkMoveAssignment(CallOp callOp, cir::LifetimeFunctionAttr m);
+  // Checks function call arguments for moves via rvalue references and tracks
+  // their moved-from state.
+  //
+  // For each argument passed to an rvalue reference parameter (T&&), this
+  // function:
+  // 1. Checks if the argument is currently in a valid state (not already moved)
+  // 2. Marks the argument as moved-from after the call
+  //
+  // This performs both checking (detecting use-after-move) and tracking
+  // (updating program state) for function call arguments.
+  void
+  checkMoveInCallArgs(CallOp callOp,
+                      std::optional<unsigned> transferredArg = std::nullopt);
+  void checkArgForRValueRef(CallOp callOp, unsigned argIdx);
   void checkCopyAssignment(CallOp callOp, cir::LifetimeFunctionAttr m);
   void checkNonConstUseOfOwner(mlir::Value ownerAddr, mlir::Location loc);
+  void markOwnerAsMovedFrom(mlir::Value addr, mlir::Location loc);
+  // Returns true if the value represents a temporary that should be skipped
+  // for move tracking purposes.
+  //
+  // Temporaries are generally skipped because they're destroyed at the end of
+  // the full expression and cannot be used after being moved from. However,
+  // coroutine task temporaries are an exception - they need lifetime tracking
+  // even as temporaries because they may be captured by the coroutine frame.
+  //
+  // Note: Currently uses "ref.tmp" prefix detection which is not fully
+  // reliable. See FIXME comment in implementation for future improvements.
+  bool isSkippableTemporary(mlir::Value v);
+
+  // Helper methods for checking value states and tracking moved-from values
+  bool isValueType(mlir::Value addr);
+  bool hasInvalidState(mlir::Value addr);
+  bool isValueTypeMovedFrom(mlir::Value addr);
+  void markPointerOrValueTypeAsMovedFrom(mlir::Value addr, mlir::Location loc);
+
+  bool isSmartPointerType(mlir::Type type);
+  bool isSmartPointerSafeMethod(llvm::StringRef methodName);
   void checkOperators(CallOp callOp, cir::LifetimeFunctionAttr m);
   void checkOtherMethodsAndFunctions(CallOp callOp,
                                      cir::LifetimeFunctionAttr m);
@@ -346,10 +391,14 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
     invalidHist[ptr].add(ptr, invalidStyle, loc, extraVal);
   }
 
-  void markPsetNull(mlir::Value addr, mlir::Location loc) {
+  void markPsetNull(mlir::Value addr, mlir::Location loc,
+                    InvalidStyle invalidStyle = InvalidStyle::Unknown) {
     getPmap()[addr].clear();
     getPmap()[addr].insert(State::getNullPtr());
     pmapNullHist[addr] = loc;
+    // Also record in invalidHist for diagnostic history
+    if (invalidStyle != InvalidStyle::Unknown)
+      invalidHist[addr].add(addr, invalidStyle, loc);
   }
 
   void joinPmaps(SmallVectorImpl<PMapType> &pmaps);
@@ -408,6 +457,8 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
 
   // Track types we already know to be a lambda
   llvm::DenseMap<mlir::Type, bool> IsLambdaTyCache;
+  // Track types we already know to be smart pointers
+  llvm::DenseMap<mlir::Type, bool> IsSmartPointerTyCache;
   // Check if a given cir type is a record containing a lambda
   bool isLambdaType(mlir::Type ty);
   // Get the lambda record from a member access to it.
@@ -1057,6 +1108,42 @@ bool LifetimeCheckPass::isOwnerType(mlir::Type ty) {
   return lifetime && lifetime.getOwner();
 }
 
+bool LifetimeCheckPass::isSmartPointerType(mlir::Type ty) {
+  auto originalTy = ty;
+  if (IsSmartPointerTyCache.count(originalTy))
+    return IsSmartPointerTyCache[originalTy];
+
+  if (auto ptrType = dyn_cast<cir::PointerType>(ty))
+    ty = ptrType.getPointee();
+  auto recordType = dyn_cast<cir::RecordType>(ty);
+  auto lifetime = recordType ? cir::getLifetimeRecord(recordType, theModule)
+                             : cir::LifetimeRecordAttr{};
+  bool result = lifetime && lifetime.getSmartPointer();
+  IsSmartPointerTyCache[originalTy] = result;
+  return result;
+}
+
+bool LifetimeCheckPass::isSkippableTemporary(mlir::Value v) {
+  auto allocaOp = v.getDefiningOp<cir::AllocaOp>();
+  if (!allocaOp)
+    return false;
+
+  auto name = allocaOp.getName();
+  // Temporaries have names starting with "ref.tmp"
+  // FIXME: "ref.tmp" naming is not reliable. Consider adding a unit attribute
+  // is_temporary to AllocaOp that is set by CIRGen to definitively mark
+  // temporaries. This would be more robust than string prefix matching.
+  if (!name.starts_with("ref.tmp"))
+    return false;
+
+  // Don't skip coroutine tasks - they need lifetime tracking even as
+  // temporaries since they may be captured by the coroutine frame
+  if (isTaskType(v))
+    return false;
+
+  return true;
+}
+
 static bool containsPointerElts(cir::RecordType s) {
   auto members = s.getMembers();
   return std::any_of(members.begin(), members.end(), [](mlir::Type t) {
@@ -1494,6 +1581,9 @@ void LifetimeCheckPass::checkStore(StoreOp storeOp) {
     return;
   }
 
+  // Check if storing a moved-from value
+  checkMovedFromValue(storeOp);
+
   // The bulk of the check is done on top of store to pointer categories,
   // which usually represent the most common case.
   //
@@ -1511,18 +1601,61 @@ void LifetimeCheckPass::checkStore(StoreOp storeOp) {
   updatePointsTo(addr, storeOp.getValue(), storeOp.getValue().getLoc());
 }
 
+void LifetimeCheckPass::checkMovedFromValue(StoreOp storeOp) {
+  auto data = storeOp.getValue();
+  auto loadOp = data.getDefiningOp<cir::LoadOp>();
+  if (!loadOp)
+    return;
+
+  auto srcAddr = loadOp.getAddr();
+
+  // Check if source is moved-from
+  if (isValueTypeMovedFrom(srcAddr)) {
+    // Diagnose the read at the same location as checkLoad. A return-slot store
+    // can have a different location and must not diagnose the same read twice.
+    checkPointerDeref(srcAddr, loadOp.getLoc());
+    return; // Early return for consistency with other checkPointerDeref usages
+  }
+
+  // Only an explicitly recorded xvalue read establishes scalar move intent
+  // (e.g. int b(std::move(a))). Ordinary copies have the same load/store shape.
+  auto destAddr = storeOp.getAddr();
+  auto allocaOp = destAddr.getDefiningOp<cir::AllocaOp>();
+  if (!allocaOp)
+    return;
+
+  if (!isValueType(destAddr) || !getPmap().count(srcAddr) ||
+      !isValueType(srcAddr))
+    return;
+
+  if (!hasInvalidState(srcAddr) && !loadOp.getIsDeref() &&
+      loadOp.getSourceIsXvalue()) {
+    markPointerOrValueTypeAsMovedFrom(
+        srcAddr, storeOp.getLoc()); // Use helper for consistency
+  }
+}
+
 void LifetimeCheckPass::checkLoad(LoadOp loadOp) {
   auto addr = loadOp.getAddr();
   // Only interested in checking deference on top of pointer types.
   // Note that usually the use of the invalid address happens at the
   // load or store using the result of this loadOp.
-  if (!getPmap().count(addr) || !ptrs.count(addr))
+  if (!getPmap().count(addr))
     return;
 
-  if (!loadOp.getIsDeref())
+  // For pointer types, only check on deref
+  if (ptrs.count(addr)) {
+    if (!loadOp.getIsDeref())
+      return;
+    checkPointerDeref(addr, loadOp.getLoc());
     return;
+  }
 
-  checkPointerDeref(addr, loadOp.getLoc());
+  // For value types (not owners, not pointers), check if moved-from
+  if (isValueTypeMovedFrom(addr)) {
+    checkPointerDeref(addr, loadOp.getLoc());
+    return; // Keep checkPointerDeref at end
+  }
 }
 
 void LifetimeCheckPass::emitInvalidHistory(mlir::InFlightDiagnostic &D,
@@ -1569,13 +1702,17 @@ void LifetimeCheckPass::emitInvalidHistory(mlir::InFlightDiagnostic &D,
       D.attachNote(info.loc) << "invalidated by non-const use of owner type";
       break;
     }
+    case InvalidStyle::MovedFrom: {
+      D.attachNote(info.loc) << "moved here via std::move or rvalue reference";
+      break;
+    }
     default:
       llvm_unreachable("unknown history style");
     }
   }
 }
 
-void LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
+bool LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
                                           DerefStyle derefStyle) {
   bool hasInvalid = getPmap()[addr].count(State::getInvalid());
   bool hasNullptr = getPmap()[addr].count(State::getNullPtr());
@@ -1587,27 +1724,33 @@ void LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
     emitRemark(loc) << "pset => " << Out.str();
   };
 
-  // Do not emit the same warning twice or more.
-  if (emittedDiagnostics.count(loc))
-    return;
-
   bool psetRemarkEmitted = false;
   if (opts.emitRemarkPsetAlways()) {
     emitPsetRemark();
     psetRemarkEmitted = true;
   }
 
+  // Only skip temporaries in use-after-move paths — it's possible this can
+  // be generalized, but currently only tested for use-after-move.
+  if (derefStyle == DerefStyle::UseAfterMove && isSkippableTemporary(addr))
+    return false;
+
   // 2.4.2 - On every dereference of a Pointer p, enforce that p is valid.
   if (!hasInvalid && !hasNullptr)
-    return;
+    return false; // No error
 
   // TODO: create verbosity/accuracy levels, for now use deref styles directly
   // to decide when not to emit a warning.
 
-  // For indirect calls, do not relly on blunt nullptr passing, require some
-  // invalidation to have happened in a path.
-  if (derefStyle == DerefStyle::IndirectCallParam && !hasInvalid)
-    return;
+  // Neither an indirect call nor binding an lvalue reference proves that the
+  // callee dereferences pointer contents. Still check known invalidation.
+  if (derefStyle == DerefStyle::NullableCallParam && !hasInvalid)
+    return false; // No error
+
+  // Do not emit the same warning twice or more (check AFTER we know there's an
+  // error)
+  if (emittedDiagnostics.count(loc))
+    return true; // Already reported
 
   // Ok, filtered out questionable warnings, take the bad path leading to this
   // deference point and diagnose it.
@@ -1615,21 +1758,25 @@ void LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
   auto D = emitWarning(loc);
   emittedDiagnostics.insert(loc);
 
+  bool isValueType = this->isValueType(
+      addr); // Use helper method, keep lowerCamel style for locals
+
   if (tasks.count(addr))
     D << "use of coroutine '" << varName << "' with dangling reference";
   else if (derefStyle == DerefStyle::RetLambda)
     D << "returned lambda captures local variable";
   else if (derefStyle == DerefStyle::CallParam ||
-           derefStyle == DerefStyle::IndirectCallParam) {
+           derefStyle == DerefStyle::NullableCallParam) {
     bool isAgg = addr.getDefiningOp<cir::GetMemberOp>();
     D << "passing ";
     if (!isAgg)
-      D << "invalid pointer";
+      D << (isValueType ? "moved-from value" : "invalid pointer");
     else
       D << "aggregate containing invalid pointer member";
     D << " '" << varName << "'";
   } else
-    D << "use of invalid pointer '" << varName << "'";
+    D << "use of " << (isValueType ? "moved-from" : "invalid")
+      << (isValueType ? " value '" : " pointer '") << varName << "'";
 
   // TODO: add accuracy levels, different combinations of invalid and null
   // could have different ratios of false positives.
@@ -1644,6 +1791,8 @@ void LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
 
   if (!psetRemarkEmitted && opts.emitRemarkPsetInvalid())
     emitPsetRemark();
+
+  return true; // Error was reported
 }
 
 static FuncOp getCalleeFromSymbol(mlir::SymbolTable &symbols,
@@ -1706,6 +1855,10 @@ void LifetimeCheckPass::checkMoveAssignment(CallOp callOp,
 
   // Move assignments between pointer categories.
   if (dst && ptrs.count(src)) {
+    if (hasInvalidState(src)) {
+      checkPointerDeref(src, callOp.getLoc(), DerefStyle::UseAfterMove);
+      return;
+    }
     // Note that the current pattern here usually comes from a xvalue in src
     // where all the initialization is done, and this move assignment is
     // where we finally materialize it back to the original pointer category.
@@ -1713,20 +1866,118 @@ void LifetimeCheckPass::checkMoveAssignment(CallOp callOp,
 
     // 2.4.2 - It is an error to use a moved-from object.
     // To that intent we mark src's pset with invalid.
-    markPsetInvalid(src, InvalidStyle::MovedFrom, callOp.getLoc());
+    markPointerOrValueTypeAsMovedFrom(src, callOp.getLoc());
     return;
   }
 
-  // Copy assignments between owner categories.
+  // Move assignments between owner categories.
   dst = getThisParamOwnerCategory(callOp);
   if (dst && owners.count(src)) {
+    if (checkPointerDeref(src, callOp.getLoc(), DerefStyle::UseAfterMove))
+      return;
     // Handle as a non const use of owner, invalidating pointers.
     checkNonConstUseOfOwner(dst, callOp.getLoc());
 
     // 2.4.2 - It is an error to use a moved-from object.
-    // To that intent we mark src's pset with invalid.
-    markPsetInvalid(src, InvalidStyle::MovedFrom, callOp.getLoc());
+    markOwnerAsMovedFrom(src, callOp.getLoc());
   }
+}
+
+void LifetimeCheckPass::checkMoveInCallArgs(
+    CallOp callOp, std::optional<unsigned> transferredArg) {
+  if (!callOp.getCallee())
+    return;
+
+  auto calleeFuncOp = getCalleeFromSymbol(*moduleSymbols, *callOp.getCallee());
+  if (!calleeFuncOp)
+    return;
+  auto lifetime = calleeFuncOp.getLifetimeAttr();
+  if (!lifetime || !lifetime.hasParameterInfo())
+    return;
+
+  // Source parameters need not occupy consecutive CIR operands: an implicit
+  // object or a pass_object_size argument can precede the next parameter.
+  // Only use mappings that CIRGen could prove, and allow variadic operands
+  // beyond the mapped source parameters.
+  for (unsigned paramIdx = 0; paramIdx < lifetime.getNumParams(); ++paramIdx) {
+    if (!lifetime.isParamRValueReference(paramIdx))
+      continue;
+    unsigned argIdx = lifetime.getParamOperandIndex(paramIdx);
+    // A move special member must inspect and transfer its source state before
+    // invalidating it. Other rvalue-reference parameters still use this path.
+    if (transferredArg && argIdx == *transferredArg)
+      continue;
+    if (argIdx < callOp.getNumArgOperands())
+      checkArgForRValueRef(callOp, argIdx);
+  }
+}
+
+void LifetimeCheckPass::checkArgForRValueRef(CallOp callOp, unsigned argIdx) {
+  auto arg = callOp.getArgOperand(argIdx);
+
+  // Case 1: LoadOp (by-value argument loaded from memory)
+  // Detects use of moved-from VALUE TYPES passed by rvalue ref.
+  //   FAIL: int a = 42; int b = std::move(a);
+  //         foo(std::move(a)); // 'a' is moved-from
+  //   OK:   int a = 42;
+  //         foo(std::move(a)); // 'a' valid before move
+  if (auto loadOp = arg.getDefiningOp<cir::LoadOp>()) {
+    auto srcAddr = loadOp.getAddr();
+    if (isValueTypeMovedFrom(srcAddr)) {
+      checkPointerDeref(srcAddr, callOp.getLoc(), DerefStyle::UseAfterMove);
+    }
+    return;
+  }
+
+  // Handle move semantics for address arguments
+  mlir::Value addr = arg;
+  if (!addr.getDefiningOp<cir::AllocaOp>())
+    return;
+
+  if (!getPmap().count(addr))
+    return;
+
+  // Case 2: Owner types (unique_ptr, vector, string, etc.)
+  // Detects use of moved-from OWNER objects.
+  //   FAIL: unique_ptr<int> x = ...;
+  //         auto y = std::move(x);
+  //         bar(std::move(x)); // 'x' is moved-from
+  //   OK:   unique_ptr<int> x = ...;
+  //         bar(std::move(x)); // 'x' valid before move
+  if (owners.count(addr)) {
+    if (checkPointerDeref(addr, callOp.getLoc(), DerefStyle::UseAfterMove))
+      return; // Already reported error
+    markOwnerAsMovedFrom(addr, callOp.getLoc());
+    return;
+  }
+
+  // Case 3: Pointer types (T*, T&, iterators)
+  // Detects use of UNINITIALIZED/INVALID pointers (not null).
+  //   FAIL: int* ptr;
+  //         baz(std::move(ptr)); // 'ptr' uninitialized
+  //   OK:   int x; int* ptr = &x;
+  //         baz(std::move(ptr)); // 'ptr' is initialized
+  if (ptrs.count(addr)) {
+    if (getPmap()[addr].count(State::getInvalid())) {
+      checkPointerDeref(addr, callOp.getLoc(), DerefStyle::UseAfterMove);
+      return;
+    }
+    markPointerOrValueTypeAsMovedFrom(addr, callOp.getLoc());
+    return;
+  }
+
+  // Case 4: Value types (structs, classes without Owner semantics)
+  // Detects use of INVALID value type objects (rare - addresses
+  // passed as rvalue refs).
+  //   FAIL: MyStruct obj; /* obj becomes invalid */;
+  //         qux(std::move(obj)); // 'obj' is invalid
+  //   OK:   MyStruct obj;
+  //         qux(std::move(obj)); // 'obj' valid before move
+  if (getPmap()[addr].count(State::getInvalid())) {
+    checkPointerDeref(addr, callOp.getLoc(), DerefStyle::UseAfterMove);
+    return;
+  }
+  markPointerOrValueTypeAsMovedFrom(addr, callOp.getLoc());
 }
 
 void LifetimeCheckPass::checkCopyAssignment(CallOp callOp,
@@ -1817,6 +2068,9 @@ void LifetimeCheckPass::checkCtor(CallOp callOp, cir::CXXCtorAttr ctor) {
     return;
   }
 
+  // Move constructor - mark source as moved-from
+  checkMoveCtor(callOp, ctor);
+
   if (isCtorInitPointerFromOwner(callOp)) {
     auto addr = getThisParamPointerCategory(callOp);
     assert(addr && "expected pointer category");
@@ -1830,10 +2084,26 @@ void LifetimeCheckPass::checkCtor(CallOp callOp, cir::CXXCtorAttr ctor) {
 void LifetimeCheckPass::checkOperators(CallOp callOp,
                                        cir::LifetimeFunctionAttr m) {
   auto addr = getThisParamOwnerCategory(callOp);
+
   if (addr) {
-    // const access to the owner is fine.
+    // Smart pointers need special handling even for const methods
+    // (operator*, operator-> are const but unsafe when null)
+    if (isSmartPointerType(addr.getType())) {
+      // Get declaration name (works for operators too)
+      llvm::StringRef methodName = m.getMethodName();
+
+      if (isSmartPointerSafeMethod(methodName))
+        return; // Safe operation
+
+      // Unsafe: operator*, operator-> will fall through to deref check
+      checkPointerDeref(addr, callOp.getLoc());
+      return;
+    }
+
+    // const access to the owner is fine (for non-smart-pointers).
     if (m.getIsConst())
       return;
+
     // TODO: this is a place where we can hook in some idiom recocgnition
     // so we don't need to use actual source code annotation to make assumptions
     // on methods we understand and know to behave nicely.
@@ -1879,19 +2149,128 @@ void LifetimeCheckPass::checkNonConstUseOfOwner(mlir::Value ownerAddr,
   return;
 }
 
+void LifetimeCheckPass::markOwnerAsMovedFrom(mlir::Value addr,
+                                             mlir::Location loc) {
+  // Don't mark temporaries as moved-from - they're about to be destroyed
+  if (isSkippableTemporary(addr))
+    return;
+
+  // All owner types are marked invalid after move. Safe operations on specific
+  // owner types (e.g., smart pointer get/reset) are handled separately in
+  // isSmartPointerSafeMethod.
+  markPsetInvalid(addr, InvalidStyle::MovedFrom, loc);
+}
+
+bool LifetimeCheckPass::isValueType(mlir::Value addr) {
+  return !owners.count(addr) && !ptrs.count(addr);
+}
+
+bool LifetimeCheckPass::hasInvalidState(mlir::Value addr) {
+  return getPmap().count(addr) && getPmap()[addr].count(State::getInvalid());
+}
+
+bool LifetimeCheckPass::isValueTypeMovedFrom(mlir::Value addr) {
+  return isValueType(addr) && hasInvalidState(addr);
+}
+
+void LifetimeCheckPass::markPointerOrValueTypeAsMovedFrom(mlir::Value addr,
+                                                          mlir::Location loc) {
+  // Don't mark temporaries as moved-from
+  if (isSkippableTemporary(addr))
+    return;
+
+  markPsetInvalid(addr, InvalidStyle::MovedFrom, loc);
+}
+
+// Returns true if the method can be safely called on a moved-from (null)
+// smart pointer.
+//
+// Safe methods for std::unique_ptr and std::shared_ptr:
+// - get(): Returns the raw pointer (nullptr for moved-from pointer)
+// - release(): Releases ownership and returns pointer (nullptr if empty)
+// - reset(): Resets to a new pointer (handles nullptr gracefully)
+// - operator bool: Checks if pointer is non-null (returns false if moved-from)
+//
+// Unsafe methods that require valid (non-null) pointers:
+// - operator*: Dereferences pointer (undefined behavior if null)
+// - operator->: Member access through pointer (undefined behavior if null)
+//
+// This is specific to std::unique_ptr and std::shared_ptr because they have
+// well-defined null-after-move semantics. Other owner types may have different
+// contracts for moved-from state.
+bool LifetimeCheckPass::isSmartPointerSafeMethod(llvm::StringRef methodName) {
+  return methodName == "get" || methodName == "release" ||
+         methodName == "reset" || methodName == "operator bool";
+}
+
+void LifetimeCheckPass::checkMoveCtor(CallOp callOp, cir::CXXCtorAttr ctor) {
+  // Move constructors are already marked via CXXCtorAttr with CtorKind::Move
+  // (set during CIRGen in CIRGenModule.cpp). This attribute is part of
+  // CIR_CXXSpecialMemberAttr attached to FuncOp, which also includes move
+  // assignments (CXXAssignAttr with AssignKind::Move). See checkCall for
+  // dispatch logic.
+  if (ctor.getCtorKind() != cir::CtorKind::Move)
+    return;
+
+  // Get the source parameter (second argument after 'this')
+  if (callOp.getNumArgOperands() < 2)
+    return;
+
+  auto srcArg = callOp.getArgOperand(1);
+
+  // For move constructors, the source might be passed as a load
+  // Try to get the address from a LoadOp
+  mlir::Value src = srcArg;
+  if (auto loadOp = srcArg.getDefiningOp<cir::LoadOp>())
+    src = loadOp.getAddr();
+
+  // Check if this is an Owner type move constructor
+  auto addr = getThisParamOwnerCategory(callOp);
+  if (addr && owners.count(src)) {
+    if (checkPointerDeref(src, callOp.getLoc(), DerefStyle::UseAfterMove))
+      return;
+    markOwnerAsMovedFrom(src, callOp.getLoc());
+    return;
+  }
+
+  // Check if this is a Pointer type move constructor
+  addr = getThisParamPointerCategory(callOp);
+  if (addr && ptrs.count(src)) {
+    if (hasInvalidState(src)) {
+      checkPointerDeref(src, callOp.getLoc(), DerefStyle::UseAfterMove);
+      return;
+    }
+    markPointerOrValueTypeAsMovedFrom(src, callOp.getLoc());
+    return;
+  }
+}
+
 void LifetimeCheckPass::checkForOwnerAndPointerArguments(CallOp callOp,
                                                          unsigned firstArgIdx) {
   auto numOperands = callOp.getNumArgOperands();
   if (firstArgIdx >= numOperands)
     return;
 
-  llvm::SmallSetVector<mlir::Value, 8> ownersToInvalidate, ptrsToDeref;
+  llvm::SmallSetVector<mlir::Value, 8> ownersToInvalidate, ptrsToDeref,
+      nullablePtrsToCheck;
+  llvm::SmallSetVector<unsigned, 4> referenceParams;
+  cir::LifetimeFunctionAttr lifetime;
+  if (auto name = callOp.getCallee())
+    if (auto callee = getCalleeFromSymbol(*moduleSymbols, *name))
+      lifetime = callee.getLifetimeAttr();
+  if (lifetime && lifetime.hasParameterInfo())
+    for (unsigned param = 0; param < lifetime.getNumParams(); ++param)
+      if (lifetime.getParameterKinds()[param] ==
+          static_cast<int32_t>(LifetimeParameterKind::LValueReference))
+        referenceParams.insert(lifetime.getParamOperandIndex(param));
   for (unsigned i = firstArgIdx, e = numOperands; i != e; ++i) {
     auto arg = callOp.getArgOperand(i);
     // FIXME: apply p1179 rules as described in 2.5. Very conservative for now:
     //
     // - Owners: always invalidate.
-    // - Pointers: always check for deref.
+    // - Pointers: check for deref unless passed by lvalue reference. Binding
+    //   a reference alone does not dereference null contents or reinitialize
+    //   the object; moved-from and dangling states are still checked.
     // - Coroutine tasks: check the task for deref when calling methods of
     //   the task, but also when the passing the task around to other functions.
     // - Aggregates: check ptr subelements for deref.
@@ -1899,8 +2278,12 @@ void LifetimeCheckPass::checkForOwnerAndPointerArguments(CallOp callOp,
     // FIXME: even before 2.5 we should only invalidate non-const param types.
     if (owners.count(arg))
       ownersToInvalidate.insert(arg);
-    if (ptrs.count(arg))
-      ptrsToDeref.insert(arg);
+    if (ptrs.count(arg)) {
+      if (referenceParams.count(i))
+        nullablePtrsToCheck.insert(arg);
+      else
+        ptrsToDeref.insert(arg);
+    }
     if (tasks.count(arg))
       ptrsToDeref.insert(arg);
     if (aggregates.count(arg)) {
@@ -1925,7 +2308,10 @@ void LifetimeCheckPass::checkForOwnerAndPointerArguments(CallOp callOp,
   for (auto p : ptrsToDeref)
     checkPointerDeref(p, callOp.getLoc(),
                       callOp.getCallee() ? DerefStyle::CallParam
-                                         : DerefStyle::IndirectCallParam);
+                                         : DerefStyle::NullableCallParam);
+  for (auto p : nullablePtrsToCheck)
+    if (!ptrsToDeref.count(p))
+      checkPointerDeref(p, callOp.getLoc(), DerefStyle::NullableCallParam);
 }
 
 void LifetimeCheckPass::checkOtherMethodsAndFunctions(
@@ -1936,7 +2322,8 @@ void LifetimeCheckPass::checkOtherMethodsAndFunctions(
   // - If a method call to a class we consider interesting, like a method
   //   call on a coroutine task (promise_type).
   // - Skip the 'this' for any other method.
-  if (m && callOp.getNumArgOperands() > firstArgIdx &&
+  if (m && m.getIsMethod() && m.getHasImplicitObject() &&
+      callOp.getNumArgOperands() > firstArgIdx &&
       !tasks.count(callOp.getArgOperand(firstArgIdx)))
     firstArgIdx++;
   checkForOwnerAndPointerArguments(callOp, firstArgIdx);
@@ -1945,7 +2332,7 @@ void LifetimeCheckPass::checkOtherMethodsAndFunctions(
 bool LifetimeCheckPass::isOwnerOrPointerClassMethod(
     CallOp callOp, cir::LifetimeFunctionAttr m) {
   // For the sake of analysis, these behave like regular functions
-  if (!m || m.getIsStatic())
+  if (!m || !m.getIsMethod() || !m.getHasImplicitObject())
     return false;
   // Check the object for owner/pointer by looking at the 'this' pointer.
   return getThisParamPointerCategory(callOp) ||
@@ -2016,26 +2403,45 @@ void LifetimeCheckPass::checkCall(CallOp callOp) {
   trackCallToCoroutine(callOp);
 
   auto methodDecl = getMethod(*moduleSymbols, callOp);
-  if (!isOwnerOrPointerClassMethod(callOp, methodDecl))
+  bool isOwnerOrPointerMethod = isOwnerOrPointerClassMethod(callOp, methodDecl);
+  mlir::Attribute cxxSpecialMember;
+  if (isOwnerOrPointerMethod) {
+    if (auto fnName = callOp.getCallee()) {
+      auto calleeFuncOp = getCalleeFromSymbol(*moduleSymbols, *fnName);
+      if (calleeFuncOp)
+        cxxSpecialMember = calleeFuncOp.getFuncInfoAttr();
+    }
+  }
+
+  std::optional<unsigned> transferredArg;
+  if (auto ctor = dyn_cast_if_present<cir::CXXCtorAttr>(cxxSpecialMember)) {
+    if (ctor.getCtorKind() == cir::CtorKind::Move)
+      transferredArg = 1;
+  } else if (auto assign =
+                 dyn_cast_if_present<cir::CXXAssignAttr>(cxxSpecialMember)) {
+    if (assign.getAssignKind() == cir::AssignKind::Move)
+      transferredArg = 1;
+  }
+
+  // Track rvalue-reference arguments, leaving a move special member's source
+  // for its dedicated handler so pointer assignments copy the valid state.
+  checkMoveInCallArgs(callOp, transferredArg);
+
+  if (!isOwnerOrPointerMethod)
     return checkOtherMethodsAndFunctions(callOp, methodDecl);
 
   // From this point on only owner and pointer class methods handling,
   // starting from special methods.
-  if (auto fnName = callOp.getCallee()) {
-    auto calleeFuncOp = getCalleeFromSymbol(*moduleSymbols, *fnName);
-    if (calleeFuncOp && calleeFuncOp.getFuncInfoAttr()) {
-      auto cxxSpecialMember = calleeFuncOp.getFuncInfoAttr();
-      if (auto cxxCtor = dyn_cast<cir::CXXCtorAttr>(cxxSpecialMember))
-        return checkCtor(callOp, cxxCtor);
+  if (auto cxxCtor = dyn_cast_if_present<cir::CXXCtorAttr>(cxxSpecialMember))
+    return checkCtor(callOp, cxxCtor);
 
-      if (auto cxxAssign = dyn_cast<cir::CXXAssignAttr>(cxxSpecialMember)) {
-        switch (cxxAssign.getAssignKind()) {
-        case cir::AssignKind::Move:
-          return checkMoveAssignment(callOp, methodDecl);
-        case cir::AssignKind::Copy:
-          return checkCopyAssignment(callOp, methodDecl);
-        }
-      }
+  if (auto cxxAssign =
+          dyn_cast_if_present<cir::CXXAssignAttr>(cxxSpecialMember)) {
+    switch (cxxAssign.getAssignKind()) {
+    case cir::AssignKind::Move:
+      return checkMoveAssignment(callOp, methodDecl);
+    case cir::AssignKind::Copy:
+      return checkCopyAssignment(callOp, methodDecl);
     }
   }
   if (methodDecl.getIsOverloadedOperator())
@@ -2052,7 +2458,7 @@ void LifetimeCheckPass::checkCall(CallOp callOp) {
   // invalid access to Ptr if any of its methods are used.
   auto addr = getThisParamPointerCategory(callOp);
   if (addr)
-    return checkPointerDeref(addr, callOp.getLoc());
+    checkPointerDeref(addr, callOp.getLoc());
 }
 
 void LifetimeCheckPass::checkCleanupScope(CleanupScopeOp op) {

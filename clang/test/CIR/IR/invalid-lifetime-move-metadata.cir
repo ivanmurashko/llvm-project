@@ -1,0 +1,76 @@
+// RUN: cir-opt %s -verify-diagnostics -split-input-file
+
+module {
+  // expected-error @below {{lifetime parameter kinds and indices must be present together}}
+  cir.func private @missing_indices() attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = []>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{lifetime parameter kinds and indices must have the same size}}
+  cir.func private @wrong_count() attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = []>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{invalid lifetime parameter kind}}
+  cir.func private @bad_kind(!cir.int<s, 32>) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [3], parameter_indices = [0]>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{lifetime parameter indices must be nonnegative and strictly increasing}}
+  cir.func private @negative_index() attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0], parameter_indices = [-1]>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{lifetime parameter indices must be nonnegative and strictly increasing}}
+  cir.func private @duplicate_index(!cir.int<s, 32>) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0, 0], parameter_indices = [0, 0]>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{an implicit object parameter requires a non-static method}}
+  cir.func private @static_object() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = true, is_const = false, is_overloaded_operator = false, has_implicit_object = true>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{lifetime source parameters cannot map to the implicit object}}
+  cir.func private @object_index(!cir.ptr<!cir.int<s, 32>>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [1], parameter_indices = [0]>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{a lifetime method name requires a method}}
+  cir.func private @free_name() attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, method_name = "get">}
+}
+
+// -----
+
+module {
+  // expected-error @below {{lifetime parameter index is outside the function signature}}
+  cir.func private @outside(!cir.int<s, 32>) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0], parameter_indices = [1]>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{a lifetime reference parameter must map to a pointer input}}
+  cir.func private @not_pointer(!cir.int<s, 32>) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = [0]>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{an implicit object must be the first pointer input}}
+  cir.func private @no_object() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true>}
+}

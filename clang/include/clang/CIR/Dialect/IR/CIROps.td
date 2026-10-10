@@ -835,6 +835,13 @@ def CIR_LoadOp : CIR_Op<"load", [
     A unit attribute `invariant` can be used to indicate that the loaded memory
     never changes, mapping to LLVM IR's `!invariant.load` metadata.
 
+    The `source_is_xvalue` unit attribute, printed as `xvalue`, records that this
+    load performs an lvalue-to-rvalue conversion on a C++ xvalue. Lifetime
+    analysis uses this source-language fact to distinguish explicit scalar move
+    intent from an ordinary copy. Forming an xvalue or binding a reference
+    without reading its value does not produce such a load. The attribute does
+    not change the memory semantics of the operation.
+
     Example:
 
     ```
@@ -865,11 +872,13 @@ def CIR_LoadOp : CIR_Op<"load", [
                        OptionalAttr<I64Attr>:$alignment,
                        OptionalAttr<CIR_SyncScopeKindAttr>:$sync_scope,
                        OptionalAttr<CIR_MemOrderAttr>:$mem_order,
-                       UnitAttr:$invariant);
+                       UnitAttr:$invariant,
+                       UnitAttr:$source_is_xvalue);
   let results = (outs CIR_AnyType:$result);
 
   let assemblyFormat = [{
     (`deref` $isDeref^)?
+    (`xvalue` $source_is_xvalue^)?
     (`volatile` $is_volatile^)?
     (`nontemporal` $is_nontemporal^)?
     (`invariant` $invariant^)?
@@ -884,13 +893,15 @@ def CIR_LoadOp : CIR_Op<"load", [
       build($_builder, $_state, addr, /*isDeref=*/false,
             /*is_volatile=*/false, /*is_nontemporal=*/false,
             /*alignment=*/mlir::IntegerAttr{}, cir::SyncScopeKindAttr{},
-            cir::MemOrderAttr{}, /*invariant=*/false);
+            cir::MemOrderAttr{}, /*invariant=*/false,
+            /*source_is_xvalue=*/false);
     }]>,
     OpBuilder<(ins "mlir::Type":$result, "mlir::Value":$addr), [{
       build($_builder, $_state, result, addr, /*isDeref=*/false,
             /*is_volatile=*/false, /*is_nontemporal=*/false,
             /*alignment=*/mlir::IntegerAttr{}, cir::SyncScopeKindAttr{},
-            cir::MemOrderAttr{}, /*invariant=*/false);
+            cir::MemOrderAttr{}, /*invariant=*/false,
+            /*source_is_xvalue=*/false);
     }]>
   ];
 

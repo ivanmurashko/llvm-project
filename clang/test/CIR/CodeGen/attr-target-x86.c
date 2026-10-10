@@ -126,11 +126,11 @@ void usage(void){
 
 // f_use_before_def: same attributes as f_lakemont_mmx (checked above) - the
 // definition's attribute should be propagated to the earlier declaration.
-// The dictionary closes after the features, so the tune-cpu the declaration
+// Only nothrow and lifetime metadata may follow the features, so the tune-cpu
 // recorded before the definition was seen does not survive.
 // CIR:      cir.func{{.*}} @f_use_before_def()
 // CIR-SAME: "cir.target-cpu" = "lakemont"
-// CIR-SAME: "cir.target-features" = "+cx8,+mmx", nothrow}
+// CIR-SAME: "cir.target-features" = "+cx8,+mmx", nothrow{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
 __attribute__((target("arch=lakemont,mmx")))
 void f_use_before_def(void) {}
 
@@ -193,10 +193,10 @@ __attribute__((target("no-prefer-256-bit")))
 void f_no_prefer_256_bit(void) {}
 
 // A declaration gets the attributes too.  target(arch=) suppresses tune-cpu,
-// so the dictionary closes after the features.
+// so only lifetime metadata may follow the features.
 // CIR:      cir.func private @f_decl_only()
 // CIR-SAME: "cir.target-cpu" = "lakemont"
-// CIR-SAME: "cir.target-features" = "+cx8,+mmx"}
+// CIR-SAME: "cir.target-features" = "+cx8,+mmx"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
 
 // LLVM: [[f_decl_only]] = {{.*}}"target-cpu"="lakemont" "target-features"="+cx8,+mmx" }
 __attribute__((target("arch=lakemont,mmx")))

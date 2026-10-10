@@ -64,8 +64,8 @@ void methods(Owner &owner, Pointer pointer) {
 // CHECK-DAG: #cir.lifetime_record<owner = false, pointer = false, lambda = true, promise_type = false>
 
 // Constructor identity and lifetime facts are independent attributes.
-// CHECK-DAG: cir.func {{.*}}@_ZN5OwnerC2Ev{{.*}}func_info<#cir.cxx_ctor<{{.*}}> attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false>
-// CHECK-DAG: cir.func {{.*}}@_ZN5Owner6mutateEv{{.*}}attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false>
-// CHECK-DAG: cir.func {{.*}}@_ZNK5Owner7observeEv{{.*}}attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = false>
-// CHECK-DAG: cir.func {{.*}}@_ZN5Owner9staticUseEv{{.*}}attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = true, is_const = false, is_overloaded_operator = false>
-// CHECK-DAG: cir.func {{.*}}@_ZNK5OwnerdeEv{{.*}}attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = true>
+// CHECK-DAG: cir.func {{.*}}@_ZN5OwnerC2Ev{{.*}}func_info<#cir.cxx_ctor<{{.*}}> attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false{{.*}}>
+// CHECK-DAG: cir.func {{.*}}@_ZN5Owner6mutateEv{{.*}}attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false{{.*}}>
+// CHECK-DAG: cir.func {{.*}}@_ZNK5Owner7observeEv{{.*}}attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = false{{.*}}>
+// CHECK-DAG: cir.func {{.*}}@_ZN5Owner9staticUseEv{{.*}}attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = true, is_const = false, is_overloaded_operator = false{{.*}}>
+// CHECK-DAG: cir.func {{.*}}@_ZNK5OwnerdeEv{{.*}}attributes {{.*}}lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = true{{.*}}>

@@ -65,12 +65,12 @@ void f(void) {
 
 // The wildcard in the attributes is to allow this to work with and without -fno-builtin.
 
-// CIR: cir.func private @setjmp({{.*}}) -> !s32i attributes {{{.*}}returns_twice}
-// CIR: cir.func private @sigsetjmp({{.*}}) -> !s32i attributes {{{.*}}returns_twice}
-// CIR: cir.func private @_setjmp({{.*}}) -> !s32i attributes {{{.*}}returns_twice}
-// CIR: cir.func private @__sigsetjmp({{.*}}) -> !s32i attributes {{{.*}}returns_twice}
-// CIR: cir.func private @_setjmpex({{.*}}) -> !s32i attributes {{{.*}}returns_twice}
-// CIR: cir.func private @getcontext({{.*}}) -> !s32i attributes {{{.*}}returns_twice}
+// CIR: cir.func private @setjmp({{.*}}) -> !s32i attributes {{{.*}}returns_twice{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR: cir.func private @sigsetjmp({{.*}}) -> !s32i attributes {{{.*}}returns_twice{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR: cir.func private @_setjmp({{.*}}) -> !s32i attributes {{{.*}}returns_twice{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR: cir.func private @__sigsetjmp({{.*}}) -> !s32i attributes {{{.*}}returns_twice{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR: cir.func private @_setjmpex({{.*}}) -> !s32i attributes {{{.*}}returns_twice{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR: cir.func private @getcontext({{.*}}) -> !s32i attributes {{{.*}}returns_twice{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
 
 // LLVM: ; Function Attrs: returns_twice
 // LLVM-NEXT: declare {{.*}} @setjmp(

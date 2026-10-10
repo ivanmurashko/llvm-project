@@ -1,0 +1,17 @@
+// RUN: cir-opt %s --verify-roundtrip | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+module attributes {cir.lifetime_records = {
+  Smart = #cir.lifetime_record<owner = true, pointer = false, lambda = false, promise_type = false, smart_pointer = true>
+}} {
+  cir.func private @free(!s32i, !cir.ptr<!s32i>) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0, 2], parameter_indices = [0, 1]>}
+  cir.func private @method(!cir.ptr<!s32i>, !cir.ptr<!s32i>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = false, has_implicit_object = true, method_name = "get", parameter_kinds = [1], parameter_indices = [1]>}
+  cir.func private @with_hidden_argument(!cir.ptr<!s32i>, !s32i, !cir.ptr<!s32i>) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0, 2], parameter_indices = [0, 2]>}
+  cir.func private @zero() attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [], parameter_indices = []>}
+}
+
+// CHECK: smart_pointer = true
+// CHECK: @free{{.*}}parameter_kinds = [0, 2], parameter_indices = [0, 1]
+// CHECK: @method{{.*}}has_implicit_object = true, method_name = "get", parameter_kinds = [1], parameter_indices = [1]
+// CHECK: @with_hidden_argument{{.*}}parameter_kinds = [0, 2], parameter_indices = [0, 2]
+// CHECK: @zero{{.*}}parameter_kinds = [], parameter_indices = []

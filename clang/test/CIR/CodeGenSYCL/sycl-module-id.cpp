@@ -26,8 +26,8 @@ void use() { kernel_single_task<KN>(K{}); }
 // Both the kernel and the sycl_external function must carry sycl-module-id
 // with a value equal to the module identifier (the source file path).
 // CIR: module @"[[MODID:.*]]" attributes
-// CIR-DAG: cir.func {{.*}}@_Z3exti({{.*}} attributes {{{.*}}"sycl-module-id" = "[[MODID]]"}
-// CIR-DAG: cir.func {{.*}}@_ZTS2KN({{.*}} attributes {{{.*}}"sycl-module-id" = "[[MODID]]"}
+// CIR-DAG: cir.func {{.*}}@_Z3exti({{.*}} attributes {{{.*}}"sycl-module-id" = "[[MODID]]"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
+// CIR-DAG: cir.func {{.*}}@_ZTS2KN({{.*}} attributes {{{.*}}"sycl-module-id" = "[[MODID]]"{{(, lifetime = #cir[.]lifetime_function<[^>]*>)?}}}
 
 // LLVM: source_filename = "[[MODID:.*]]"
 // LLVM-DAG: define {{.*}}spir_kernel {{.*}}@{{.*}}2KN{{.*}} #[[SATTR:[0-9]+]]

@@ -2,7 +2,8 @@
 
 CIR provides an experimental, opt-in analysis of pointer and owner lifetimes.
 It diagnoses supported uses of uninitialized, null, and dangling pointers,
-owner invalidation, and returned lambdas that capture local variables by reference.
+owner invalidation, returned lambdas that capture local variables by reference,
+and uses of tracked values after a move.
 It is not a complete proof of lifetime safety.
 
 Build Clang with `CLANG_ENABLE_CIR=ON` and LLVM projects `clang;mlir`. For example:
@@ -35,6 +36,33 @@ uses the existing ClangIR diagnostic group.
 | `remarks` | `all`, `pset-invalid`, `pset-always` | No remarks |
 
 ## Coverage and limitations
+
+The move checks track arguments passed to rvalue-reference parameters, scalar
+initialization from moved values, and move construction and assignment of
+supported owner and pointer types. Function metadata maps source parameters to
+CIR operands, including the implicit object argument of an instance method.
+The checker skips argument-based move tracking when that mapping is unavailable.
+
+For example, with history notes enabled:
+
+```cpp
+void consume(int &&);
+int example() {
+  int value = 42;
+  consume(static_cast<int &&>(value)); // note: moved here via std::move or rvalue reference
+  return value; // warning: use of moved-from value 'value'
+}
+```
+
+For recognized `std::unique_ptr` and `std::shared_ptr` owners, dereferencing a
+moved-from object is diagnosed. Calls to `get`, `release`, `reset`, and
+`operator bool` are treated as safe observations or operations. Calling
+`reset(new T)` does not yet restore the tracked state for later dereferences.
+
+This reviewed move model has known precision limits. A plain scalar copy into
+another local can incorrectly mark the source as moved-from, and assignment
+does not fully model reinitialization. Temporary suppression uses the existing
+`ref.tmp` naming convention and applies only to the reviewed move paths.
 
 The analysis tracks local pointer and owner state through supported structured
 scopes, branches, switches, and a bounded loop approximation. It recognizes

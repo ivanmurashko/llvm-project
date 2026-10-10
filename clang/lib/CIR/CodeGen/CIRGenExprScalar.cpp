@@ -17,6 +17,7 @@
 
 #include "clang/AST/Expr.h"
 #include "clang/AST/StmtVisitor.h"
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/MissingFeatures.h"
 #include "clang/CodeGenUtils/ExprUtils.h"
@@ -2784,10 +2785,20 @@ mlir::Value ScalarExprEmitter::VisitCastExpr(CastExpr *ce) {
                                          offsetAttr);
   }
 
-  case CK_LValueToRValue:
+  case CK_LValueToRValue: {
     assert(cgf.getContext().hasSameUnqualifiedType(subExpr->getType(), destTy));
     assert(subExpr->isGLValue() && "lvalue-to-rvalue applied to r-value!");
-    return Visit(const_cast<Expr *>(subExpr));
+    mlir::Value value = Visit(const_cast<Expr *>(subExpr));
+    if (value && cgf.cgm.shouldPreserveLifetimeScopes() &&
+        subExpr->isXValue()) {
+      // Preserve explicit move intent at the scalar read. A plain load/store
+      // has the same IR shape for both lvalue copies and xvalue reads, while
+      // merely forming an xvalue or binding a reference does not consume it.
+      if (auto load = value.getDefiningOp<cir::LoadOp>())
+        load.setSourceIsXvalue(true);
+    }
+    return value;
+  }
 
   case CK_IntegralCast: {
     ScalarConversionOpts opts;
