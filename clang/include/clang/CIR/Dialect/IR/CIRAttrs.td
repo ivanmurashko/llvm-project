@@ -243,6 +243,10 @@ def CIR_LifetimeRecordAttr : CIR_Attr<"LifetimeRecord", "lifetime_record"> {
     nested record named `promise_type`, as used by the coroutine lifetime
     model. It does not represent arbitrary coroutine-traits lookup.
 
+    `smart_pointer` identifies `std::unique_ptr` and `std::shared_ptr`, whose
+    moved-from state has a specific null-pointer contract. This identity
+    does not imply `owner`; ownership still follows the GSL classification.
+
     These facts are independent of ABI layout and survive textual CIR
     round-trips without retaining a Clang AST declaration.
   }];
@@ -251,14 +255,22 @@ def CIR_LifetimeRecordAttr : CIR_Attr<"LifetimeRecord", "lifetime_record"> {
     "bool":$owner,
     "bool":$pointer,
     "bool":$lambda,
-    "bool":$promise_type
+    "bool":$promise_type,
+    DefaultValuedParameter<"bool", "false">:$smart_pointer
   );
   let assemblyFormat = [{
-    `<` struct($owner, $pointer, $lambda, $promise_type) `>`
+    `<` struct($owner, $pointer, $lambda, $promise_type, $smart_pointer) `>`
   }];
   let genVerifyDecl = 1;
   let canHaveIllegalCXXABIType = 0;
 }
+
+def CIR_LifetimeParameterKind : CIR_I32Enum<
+    "LifetimeParameterKind", "source parameter reference category", [
+  I32EnumCase<"Value", 0, "value">,
+  I32EnumCase<"LValueReference", 1, "lvalue_ref">,
+  I32EnumCase<"RValueReference", 2, "rvalue_ref">
+]>;
 
 def CIR_LifetimeFunctionAttr : CIR_Attr<"LifetimeFunction", "lifetime_function"> {
   let summary = "Function properties used by lifetime analysis";
@@ -269,6 +281,23 @@ def CIR_LifetimeFunctionAttr : CIR_Attr<"LifetimeFunction", "lifetime_function">
     known standard library functions. Both can be present on the same
     `cir.func`.
 
+    `method_name` is the source declaration name, including spellings such as
+    `operator bool`. An empty name means no name is available. The optional
+    `parameter_kinds` and `parameter_indices` arrays describe source parameters
+    in declaration order. Kinds are 0 (value), 1 (lvalue reference), or 2 (rvalue
+    reference); each index names the corresponding CIR formal argument. The
+    array length is the number of source parameters. Indices account for
+    implicit object arguments and hidden arguments such as pass_object_size.
+    `has_implicit_object` identifies a non-static method's implicit argument 0;
+    explicit object parameters instead appear in the source parameter arrays.
+
+    Absent arrays mean that the source-to-CIR mapping is unavailable. Present
+    empty arrays describe a known zero-parameter declaration. CIRGen omits the
+    arrays where it cannot prove the mapping, including inheriting constructors
+    and structors with virtual bases. An absent mapping is not evidence that a
+    call has no rvalue-reference parameters. ABI signature rewriting removes
+    this attribute because source argument indices no longer apply afterward.
+
     All fields are serializable semantic facts; analysis does not require a
     live Clang AST to interpret them.
   }];
@@ -277,10 +306,33 @@ def CIR_LifetimeFunctionAttr : CIR_Attr<"LifetimeFunction", "lifetime_function">
     "bool":$is_method,
     "bool":$is_static,
     "bool":$is_const,
-    "bool":$is_overloaded_operator
+    "bool":$is_overloaded_operator,
+    DefaultValuedParameter<"bool", "false">:$has_implicit_object,
+    StringRefParameter<"source method name", "\"\"">:$method_name,
+    OptionalParameter<"mlir::DenseI32ArrayAttr">:$parameter_kinds,
+    OptionalParameter<"mlir::DenseI32ArrayAttr">:$parameter_indices
   );
   let assemblyFormat = [{
-    `<` struct($is_method, $is_static, $is_const, $is_overloaded_operator) `>`
+    `<` struct($is_method, $is_static, $is_const, $is_overloaded_operator,
+               $has_implicit_object, $method_name, $parameter_kinds,
+               $parameter_indices) `>`
+  }];
+  let extraClassDeclaration = [{
+    bool hasParameterInfo() const {
+      return static_cast<bool>(getParameterKinds());
+    }
+    unsigned getNumParams() const {
+      return hasParameterInfo() ? getParameterKinds().size() : 0;
+    }
+    bool isParamRValueReference(unsigned index) const {
+      return index < getNumParams() &&
+             getParameterKinds()[index] ==
+                 static_cast<int32_t>(LifetimeParameterKind::RValueReference);
+    }
+    unsigned getParamOperandIndex(unsigned index) const {
+      assert(index < getNumParams() && "source parameter index out of range");
+      return static_cast<unsigned>(getParameterIndices()[index]);
+    }
   }];
   let genVerifyDecl = 1;
   let canHaveIllegalCXXABIType = 0;

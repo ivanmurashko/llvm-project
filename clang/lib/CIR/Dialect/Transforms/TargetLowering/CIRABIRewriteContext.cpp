@@ -1338,7 +1338,8 @@ void rewriteIndirectReturnCall(cir::CallOp call,
                                     /*alignment=*/mlir::IntegerAttr(),
                                     /*sync_scope=*/cir::SyncScopeKindAttr(),
                                     /*mem_order=*/cir::MemOrderAttr(),
-                                    /*invariant=*/mlir::UnitAttr());
+                                    /*invariant=*/mlir::UnitAttr(),
+                                    /*source_is_xvalue=*/mlir::UnitAttr());
     call.getResult().replaceAllUsesWith(load);
   }
   call->erase();
@@ -1655,6 +1656,11 @@ mlir::LogicalResult CIRABIRewriteContext::rewriteFunctionDefinition(
   }
 
   mlir::Type newFnTy = funcOp.cloneTypeWith(newArgTypes, newResultTypes);
+  // Lifetime analysis consumes source argument indices before ABI lowering.
+  // A rewritten signature can insert, remove, or expand arguments, so its
+  // source mapping must not be interpreted or verified against the ABI slots.
+  if (newFnTy != funcOp.getFunctionType())
+    funcOp.removeLifetimeAttr();
   funcOp.setFunctionTypeAttr(mlir::TypeAttr::get(newFnTy));
 
   // Rebuild arg_attrs when the function has an sret slot (slot 0 needs the

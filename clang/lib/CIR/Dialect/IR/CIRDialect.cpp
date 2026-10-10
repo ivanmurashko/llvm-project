@@ -3333,6 +3333,27 @@ void cir::FuncOp::print(OpAsmPrinter &p) {
 
 mlir::LogicalResult cir::FuncOp::verify() {
 
+  if (auto lifetime = getLifetimeAttr()) {
+    llvm::ArrayRef<mlir::Type> inputs = getFunctionType().getInputs();
+    if (lifetime.getHasImplicitObject() &&
+        (inputs.empty() || !mlir::isa<cir::PointerType>(inputs.front())))
+      return emitOpError()
+             << "an implicit object must be the first pointer input";
+    if (lifetime.hasParameterInfo()) {
+      for (unsigned i = 0, e = lifetime.getNumParams(); i != e; ++i) {
+        unsigned index = lifetime.getParamOperandIndex(i);
+        if (index >= inputs.size())
+          return emitOpError() << "lifetime parameter index is outside the "
+                                  "function signature";
+        if (lifetime.getParameterKinds()[i] !=
+                static_cast<int32_t>(LifetimeParameterKind::Value) &&
+            !mlir::isa<cir::PointerType>(inputs[index]))
+          return emitOpError() << "a lifetime reference parameter must map to "
+                                  "a pointer input";
+      }
+    }
+  }
+
   if (!isDeclaration() && getCoroutine()) {
     int coroutineOpCount = 0;
     this->walk([&](Operation *op) {

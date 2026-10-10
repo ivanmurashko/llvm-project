@@ -1049,25 +1049,58 @@ RecordLayoutAttr cir::getRecordLayout(mlir::ModuleOp mod,
 // Lifetime metadata
 //===----------------------------------------------------------------------===//
 
-LogicalResult LifetimeRecordAttr::verify(
-    function_ref<InFlightDiagnostic()> emitError, bool owner, bool pointer,
-    bool lambda, bool promiseType) {
+LogicalResult
+LifetimeRecordAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                           bool owner, bool pointer, bool lambda,
+                           bool promiseType, bool smartPointer) {
   if (owner && pointer)
-    return emitError() << "a lifetime record cannot be both an owner and a pointer";
+    return emitError()
+           << "a lifetime record cannot be both an owner and a pointer";
   return success();
 }
 
 LogicalResult LifetimeFunctionAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, bool isMethod, bool isStatic,
-    bool isConst, bool isOverloadedOperator) {
+    bool isConst, bool isOverloadedOperator, bool hasImplicitObject,
+    llvm::StringRef methodName, mlir::DenseI32ArrayAttr parameterKinds,
+    mlir::DenseI32ArrayAttr parameterIndices) {
   if (isStatic && !isMethod)
     return emitError() << "a static lifetime function must be a method";
   if (isConst && (!isMethod || isStatic))
-    return emitError() << "a const lifetime function must be a non-static method";
+    return emitError()
+           << "a const lifetime function must be a non-static method";
+  if (hasImplicitObject && (!isMethod || isStatic))
+    return emitError()
+           << "an implicit object parameter requires a non-static method";
+  if (!methodName.empty() && !isMethod)
+    return emitError() << "a lifetime method name requires a method";
+  if (static_cast<bool>(parameterKinds) != static_cast<bool>(parameterIndices))
+    return emitError()
+           << "lifetime parameter kinds and indices must be present together";
+  if (!parameterKinds)
+    return success();
+  if (parameterKinds.size() != parameterIndices.size())
+    return emitError()
+           << "lifetime parameter kinds and indices must have the same size";
+  for (int32_t kind : parameterKinds.asArrayRef())
+    if (kind < static_cast<int32_t>(LifetimeParameterKind::Value) ||
+        kind > static_cast<int32_t>(LifetimeParameterKind::RValueReference))
+      return emitError() << "invalid lifetime parameter kind";
+  int32_t previous = -1;
+  for (int32_t index : parameterIndices.asArrayRef()) {
+    if (index <= previous)
+      return emitError() << "lifetime parameter indices must be nonnegative "
+                            "and strictly increasing";
+    if (hasImplicitObject && index == 0)
+      return emitError()
+             << "lifetime source parameters cannot map to the implicit object";
+    previous = index;
+  }
   return success();
 }
 
-LifetimeRecordAttr cir::getLifetimeRecord(RecordType record, mlir::ModuleOp mod) {
+LifetimeRecordAttr cir::getLifetimeRecord(RecordType record,
+                                          mlir::ModuleOp mod) {
   if (!record || !record.getName())
     return {};
   auto dict = mod->getAttrOfType<mlir::DictionaryAttr>(

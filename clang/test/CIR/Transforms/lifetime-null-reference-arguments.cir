@@ -1,0 +1,72 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %s --cir-canonicalize --cir-lifetime-check="history=all" --verify-diagnostics --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+// The source parameter mapping controls only null-content checks at calls.
+// No record annotations or special library contracts are involved here.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module {
+  cir.func private @no_lifetime(!pp) attributes {nothrow}
+  cir.func private @no_parameter_mapping(!pp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false>}
+  cir.func private @reference(!pp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [1], parameter_indices = [0]>}
+  cir.func private @reference_then_strict(!pp, !pp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [1, 0], parameter_indices = [0, 1]>}
+  cir.func private @strict_then_reference(!pp, !pp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0, 1], parameter_indices = [0, 1]>}
+
+  // Neither an absent attribute nor absent parameter arrays proves a reference
+  // binding. Retain the existing strict direct-call check in both cases.
+  cir.func @absent_lifetime_metadata() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    // expected-warning @below {{passing invalid pointer 'pointer'}}
+    cir.call @no_lifetime(%pointer) nothrow : (!pp) -> ()
+    cir.return
+  }
+
+  cir.func @absent_parameter_mapping() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    // expected-warning @below {{passing invalid pointer 'pointer'}}
+    cir.call @no_parameter_mapping(%pointer) nothrow : (!pp) -> ()
+    cir.return
+  }
+
+  // Binding the lvalue reference is allowed, but it does not reset null state.
+  cir.func @known_reference_does_not_reinitialize() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    cir.call @reference(%pointer) nothrow : (!pp) -> ()
+    // expected-warning @below {{use of invalid pointer 'pointer'}}
+    %read = cir.load deref %pointer : !pp, !p
+    cir.return
+  }
+
+  // A nullable use of an operand cannot hide its strict use at the same call.
+  // Check both parameter orders, independently of insertion/dedup order.
+  cir.func @same_operand_reference_first() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    // expected-warning @below {{passing invalid pointer 'pointer'}}
+    cir.call @reference_then_strict(%pointer, %pointer) nothrow : (!pp, !pp) -> ()
+    cir.return
+  }
+
+  cir.func @same_operand_reference_last() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    // expected-warning @below {{passing invalid pointer 'pointer'}}
+    cir.call @strict_then_reference(%pointer, %pointer) nothrow : (!pp, !pp) -> ()
+    cir.return
+  }
+}

@@ -1,0 +1,9 @@
+// RUN: cir-opt %s -verify-diagnostics -split-input-file
+
+module {
+  cir.func @wrong_payload(%arg0: !cir.ptr<!cir.int<s, 32>>) {
+    // expected-error @below {{Invalid attribute `source_is_xvalue` in property conversion}}
+    %value = "cir.load"(%arg0) <{source_is_xvalue = false}> : (!cir.ptr<!cir.int<s, 32>>) -> !cir.int<s, 32>
+    cir.return
+  }
+}

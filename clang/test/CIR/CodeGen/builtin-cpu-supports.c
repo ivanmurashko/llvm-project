@@ -9,7 +9,7 @@
 extern void a(const char *);
 
 // CIR-LABEL: cir.func{{.*}} @main() -> !s32i
-// CIR-SAME: attributes {[[ATTRS:.*]]} {
+// CIR-SAME: attributes {[[ATTRS:.*]], lifetime = {{.*}}} {
 // CIR:      cir.call @__cpu_indicator_init() : () -> ()
 // CIR-NEXT: cir.scope {
 // CIR-NEXT:   %[[CPU_MODEL:.*]] = cir.get_global @__cpu_model : !cir.ptr<!rec_anon_struct>
@@ -94,7 +94,7 @@ int main(void) {
 
 
 // CIR-LABEL: cir.func{{.*}} @baseline() -> !s32i
-// CIR-SAME: attributes {[[ATTRS]]} {
+// CIR-SAME: attributes {[[ATTRS]], lifetime = {{.*}}} {
 // CIR-NEXT: %[[RETVAL:.*]] = cir.alloca "__retval" {{.*}} : !cir.ptr<!s32i>
 // CIR-NEXT: %[[CPU_FEAT2:.*]] = cir.get_global @__cpu_features2 : !cir.ptr<!cir.array<!u32i x 3>>
 // CIR-NEXT: %[[ONE:.*]] = cir.const #cir.int<1> : !u32i
@@ -128,7 +128,7 @@ int main(void) {
 int baseline() { return __builtin_cpu_supports("x86-64"); }
 
 // CIR-LABEL: cir.func{{.*}} @v2() -> !s32i
-// CIR-SAME: attributes {[[ATTRS]]} {
+// CIR-SAME: attributes {[[ATTRS]], lifetime = {{.*}}} {
 // CIR-NEXT: %[[RETVAL:.*]] = cir.alloca "__retval" {{.*}} : !cir.ptr<!s32i>
 // CIR-NEXT: %[[CPU_FEAT2:.*]] = cir.get_global @__cpu_features2 : !cir.ptr<!cir.array<!u32i x 3>>
 // CIR-NEXT: %[[TWO:.*]] = cir.const #cir.int<2> : !u32i
@@ -162,7 +162,7 @@ int baseline() { return __builtin_cpu_supports("x86-64"); }
 int v2() { return __builtin_cpu_supports("x86-64-v2"); }
 
 // CIR-LABEL: cir.func{{.*}} @v3() -> !s32i
-// CIR-SAME: attributes {[[ATTRS]]} {
+// CIR-SAME: attributes {[[ATTRS]], lifetime = {{.*}}} {
 // CIR-NEXT: %[[RETVAL:.*]] = cir.alloca "__retval" {{.*}} : !cir.ptr<!s32i>
 // CIR-NEXT: %[[CPU_FEAT2:.*]] = cir.get_global @__cpu_features2 : !cir.ptr<!cir.array<!u32i x 3>>
 // CIR-NEXT: %[[TWO:.*]] = cir.const #cir.int<2> : !u32i
@@ -196,7 +196,7 @@ int v2() { return __builtin_cpu_supports("x86-64-v2"); }
 int v3() { return __builtin_cpu_supports("x86-64-v3"); }
 
 // CIR-LABEL: cir.func{{.*}} @v4() -> !s32i
-// CIR-SAME: attributes {[[ATTRS]]} {
+// CIR-SAME: attributes {[[ATTRS]], lifetime = {{.*}}} {
 // CIR-NEXT: %[[RETVAL:.*]] = cir.alloca "__retval" {{.*}} : !cir.ptr<!s32i>
 // CIR-NEXT: %[[CPU_FEAT2:.*]] = cir.get_global @__cpu_features2 : !cir.ptr<!cir.array<!u32i x 3>>
 // CIR-NEXT: %[[TWO:.*]] = cir.const #cir.int<2> : !u32i
