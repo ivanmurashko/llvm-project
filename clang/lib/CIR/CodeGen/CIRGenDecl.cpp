@@ -814,6 +814,15 @@ void CIRGenFunction::emitScalarInit(const Expr *init, LValue lvalue,
 
   SourceLocRAIIObject locRAII{*this, init->getSourceRange()};
   mlir::Value value = emitScalarExpr(init);
+  // A missing initializer leaves incomplete local object state. Other
+  // recoverable diagnostics can still produce a value and permit generation.
+  if (!value) {
+    hasFailedScalarInit = true;
+    if (!cgm.getDiags().hasErrorOccurred())
+      cgm.error(init->getExprLoc(),
+                "failed to generate CIR for scalar initializer");
+    return;
+  }
   if (capturedByInit) {
     cgm.errorNYI(init->getSourceRange(), "emitScalarInit: captured by init");
     return;

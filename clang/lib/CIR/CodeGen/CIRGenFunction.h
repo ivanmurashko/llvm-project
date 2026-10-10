@@ -357,6 +357,10 @@ public:
   /// inserting cir.stacksave for multiple VLAs in the same scope.
   bool didCallStackSave = false;
 
+  /// A missing scalar initializer leaves incomplete local object state.
+  /// Stop later declarations and statements in this function in that case.
+  bool hasFailedScalarInit = false;
+
   /// Whether or not a Microsoft-style asm block has been processed within
   /// this fuction. These can potentially set the return value.
   bool sawAsmBlock = false;

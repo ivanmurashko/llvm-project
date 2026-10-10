@@ -733,9 +733,9 @@ mlir::LogicalResult CIRGenFunction::emitCXXTryStmt(
     assert(!cir::MissingFeatures::incrementProfileCounter());
 
     // Perform the body of the catch.
-    [[maybe_unused]] mlir::LogicalResult emitResult =
-        emitStmt(catchStmt->getHandlerBlock(), /*useCurrentScope=*/true);
-    assert(emitResult.succeeded() && "failed to emit catch handler block");
+    if (emitStmt(catchStmt->getHandlerBlock(), /*useCurrentScope=*/true)
+            .failed())
+      return mlir::failure();
 
     // [except.handle]p11:
     //   The currently handled exception is rethrown if control

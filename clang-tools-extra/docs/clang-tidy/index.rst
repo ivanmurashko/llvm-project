@@ -71,6 +71,7 @@ Name prefix            Description
 ``boost-``             Checks related to Boost library.
 ``bugprone-``          Checks that target bug-prone code constructs.
 ``cert-``              Checks related to CERT Secure Coding Guidelines.
+``cir-``               Checks using ClangIR (requires ``CLANG_ENABLE_CIR``).
 ``clang-analyzer-``    Clang Static Analyzer checks.
 ``concurrency-``       Checks related to concurrent programming (including
                        threads, fibers, coroutines, etc.).

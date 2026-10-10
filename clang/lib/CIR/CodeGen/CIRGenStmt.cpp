@@ -77,6 +77,8 @@ mlir::LogicalResult CIRGenFunction::emitCompoundStmtWithoutScope(
          "StmtExprResult");
 
   for (const Stmt *curStmt : s.body()) {
+    if (hasFailedScalarInit)
+      return mlir::failure();
     const bool saveResult = lastValue && exprResult == curStmt;
     if (saveResult) {
       if (emitStmtWithResult(*this, exprResult, slot, lastValue).failed())
@@ -173,6 +175,10 @@ void CIRGenFunction::emitStopPoint(const Stmt *s) {
 mlir::LogicalResult CIRGenFunction::emitStmt(const Stmt *s,
                                              bool useCurrentScope,
                                              ArrayRef<const Attr *> attr) {
+  // A missing scalar initializer leaves incomplete local object state. Avoid
+  // subsequent uses while preserving diagnostics from other recoverable errors.
+  if (hasFailedScalarInit)
+    return mlir::failure();
   if (auto result = emitSimpleStmt(s, useCurrentScope))
     return *result;
 
@@ -625,8 +631,11 @@ mlir::LogicalResult CIRGenFunction::emitIfStmt(const IfStmt &s) {
 mlir::LogicalResult CIRGenFunction::emitDeclStmt(const DeclStmt &s) {
   assert(builder.getInsertionBlock() && "expected valid insertion point");
 
-  for (const Decl *i : s.decls())
+  for (const Decl *i : s.decls()) {
     emitDecl(*i, /*evaluateConditionDecl=*/true);
+    if (hasFailedScalarInit)
+      return mlir::failure();
+  }
 
   return mlir::success();
 }
