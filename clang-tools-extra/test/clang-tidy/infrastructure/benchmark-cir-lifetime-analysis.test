@@ -1,0 +1,249 @@
+# RUN: split-file %s %t
+# RUN: %python %t/test.py %S/../../../clang-tidy/tool/analyze-cir-lifetime.py %t
+
+#--- test.py
+import copy
+import importlib.util
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import sys
+import unittest
+
+TOOL = Path(sys.argv.pop(1)).resolve()
+ROOT = Path(sys.argv.pop(1)).resolve()
+spec = importlib.util.spec_from_file_location('analysis', TOOL)
+analysis = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(analysis)
+support_spec = importlib.util.spec_from_file_location('support', TOOL.with_name('cir_lifetime_benchmark_support.py'))
+support = importlib.util.module_from_spec(support_spec)
+support_spec.loader.exec_module(support)
+HAS_YAML = importlib.util.find_spec('yaml') is not None
+
+
+def group(check, file='header.h', offset=8, message=None, notes=None, ranges=None):
+    if notes is None and message is None and check == 'cir-lifetime-check':
+        notes = [{'message': 'moved here via std::move or rvalue reference',
+                  'file': file, 'offset': 0, 'ranges': []}]
+    return {'check': check, 'level': 'warning',
+            'primary': {'file': file, 'offset': offset, 'ranges': ranges or [],
+                        'message': message or ('use of moved-from value' if check == 'cir-lifetime-check' else 'used after move')},
+            'notes': notes or []}
+
+
+def report(units=2):
+    selected = [{'id': str(i), 'relative_file': ('clang/' if i % 2 == 0 else 'llvm/') + str(i) + '.cpp',
+                 'project': 'clang' if i % 2 == 0 else 'llvm',
+                 'command': {'file': '/source/' + str(i) + '.cpp', 'directory': '/build', 'arguments': ['clang++', '-c', str(i) + '.cpp']}}
+                for i in range(units)]
+    runs = []
+    for unit in selected:
+        for variant, check in [('baseline', 'bugprone-use-after-move'), ('candidate', 'cir-lifetime-check')]:
+            for repeat in [1, 2]:
+                runs.append({'unit_id': unit['id'], 'relative_file': unit['relative_file'], 'variant': variant,
+                             'phase': 'measured', 'repetition': repeat, 'status': 'success',
+                             'eligibility': {'eligible': True}, 'check': check,
+                             'diagnostic_export': {'status': 'parsed'}, 'diagnostic_groups': [group(check)],
+                             'stdout_log': 'out', 'stderr_log': 'err', 'diagnostics_yaml': 'fixes'})
+    return {'complete': True, 'input_freeze': {'final_verified': True}, 'source': {'revision': 'a'*40},
+            'binaries': {'baseline': {'check': 'bugprone-use-after-move'}, 'candidate': {'check': 'cir-lifetime-check'}},
+            'measurement': {'repetitions': 2}, 'selection': {'units': selected}, 'runs': runs}
+
+
+class AnalysisTest(unittest.TestCase):
+    def test_moved_from_wording_requires_move_history(self):
+        for notes in ([], [{'message': "'nullptr' invalidated here"}]):
+            diagnostic = group('cir-lifetime-check', notes=notes)
+            self.assertEqual(analysis.group_kind(diagnostic), 'ambiguous_cause')
+        self.assertEqual(analysis.group_kind(group('cir-lifetime-check')), 'uam')
+
+    def test_deduplicates_headers_and_repetitions_preserving_provenance(self):
+        result = analysis.compare_report(report())
+        self.assertEqual(len(result['buckets']['shared']), 1)
+        site = result['buckets']['shared'][0]
+        self.assertEqual(set(site['claims']), {'baseline', 'candidate'})
+        self.assertEqual(len(site['claims']['baseline']['provenance']), 2)
+        self.assertTrue(site['clang_observed'])
+        self.assertEqual(result['common_eligible_successful_units'], ['0', '1'])
+
+    def test_move_notes_must_belong_to_same_yaml_group(self):
+        data = report(1)
+        for run in data['runs']:
+            if run['variant'] == 'candidate':
+                run['diagnostic_groups'] = [group('cir-lifetime-check', message='use of invalid pointer'),
+                    group('cir-lifetime-check', offset=30, message='use of invalid pointer', notes=[
+                        {'message': 'moved here via std::move or rvalue reference', 'file': 'header.h', 'offset': 20, 'ranges': []}])]
+        result = analysis.compare_report(data, sources={'header.h': b' ' * 10 + b';' + b' ' * 20 + b';'})
+        self.assertEqual(len(result['buckets']['shared']), 0)
+        self.assertEqual(len(result['buckets']['cir_only']), 1)
+        self.assertEqual(len(result['other_lifetime_sites']), 0)
+        self.assertEqual(len(result['cause_ambiguous_sites']), 1)
+        self.assertEqual(len(result['ambiguous_matches']), 1)
+        self.assertEqual(len(result['buckets']['bugprone_only']), 0)
+
+    def test_coverage_ineligibility_missing_yaml_and_instability_stay_separate(self):
+        data = report(5)
+        for run in data['runs']:
+            if run['unit_id'] == '0' and run['variant'] == 'candidate': run['status'] = 'pass_failure'
+            if run['unit_id'] == '1' and run['variant'] == 'baseline': run['eligibility']['eligible'] = False
+            if run['unit_id'] == '2': run['diagnostic_export']['status'] = 'missing'
+            if run['unit_id'] == '3' and run['repetition'] == 2: run['diagnostic_groups'] = []
+        result = analysis.compare_report(data)
+        self.assertEqual(result['diagnostic_cohort_units'], ['4'])
+        self.assertEqual(len(result['coverage_exclusive']), 1)
+        self.assertEqual(set(result['diagnostic_exclusions']), {'0', '1', '2', '3'})
+        self.assertEqual(result['common_eligible_successful_units'], ['2', '3', '4'])
+
+    def test_overlapping_ranges_require_unique_matching(self):
+        data = report(1)
+        for run in data['runs']:
+            if run['variant'] == 'baseline':
+                run['diagnostic_groups'] = [group(run['check'], offset=n) for n in [5, 7]]
+            else:
+                run['diagnostic_groups'] = [group(run['check'], offset=6, ranges=[{'file': 'header.h', 'offset': 4, 'length': 5}])]
+        result = analysis.compare_report(data)
+        self.assertEqual(len(result['ambiguous_matches']), 1)
+        self.assertTrue(all(not v for v in result['buckets'].values()))
+
+    def test_different_points_in_same_call_are_ambiguous_not_exclusive(self):
+        source = b'consume(std::move(x)); use(x);'
+        data = report(1)
+        for run in data['runs']:
+            run['diagnostic_groups'] = [group(run['check'], offset=source.index(b'x);') if run['variant'] == 'baseline' else source.rindex(b')'))]
+        result = analysis.compare_report(data, sources={'header.h': source})
+        self.assertTrue(all(not bucket for bucket in result['buckets'].values()))
+        self.assertEqual(len(result['ambiguous_matches']), 1)
+        self.assertIn('statement', result['ambiguous_matches'][0]['reason'])
+
+    def test_multiple_variables_in_statement_do_not_get_guessed_matches(self):
+        source = b'use(x, y);'
+        data = report(1)
+        for run in data['runs']:
+            positions = [source.index(b'x'), source.index(b'y')] if run['variant'] == 'baseline' else [source.index(b')')]
+            run['diagnostic_groups'] = [group(run['check'], offset=position) for position in positions]
+        result = analysis.compare_report(data, sources={'header.h': source})
+        self.assertEqual(len(result['ambiguous_matches']), 1)
+        self.assertEqual(len(result['ambiguous_matches'][0]['bugprone_sites']), 2)
+        self.assertTrue(all(not bucket for bucket in result['buckets'].values()))
+
+    def test_source_statements_ignore_strings_comments_and_for_header_semicolons(self):
+        source = b'for (int i=0; i<2; ++i) use(x, "a;b", /* ; */ y); other(z);'
+        data = report(1)
+        for run in data['runs']:
+            positions = [source.index(b'x,')] if run['variant'] == 'baseline' else [source.index(b'y)'), source.index(b'z)')]
+            run['diagnostic_groups'] = [group(run['check'], offset=position) for position in positions]
+        result = analysis.compare_report(data, sources={'header.h': source})
+        self.assertEqual(len(result['ambiguous_matches']), 1)
+        self.assertEqual(len(result['buckets']['cir_only']), 1)
+        self.assertEqual(len(result['buckets']['bugprone_only']), 0)
+
+    def test_unavailable_frozen_source_is_not_evidence_of_exclusive_uses(self):
+        data = report(1)
+        for run in data['runs']:
+            run['diagnostic_groups'][0]['primary']['offset'] = 1 if run['variant'] == 'baseline' else 50
+        result = analysis.compare_report(data)
+        self.assertEqual(len(result['ambiguous_matches']), 1)
+        self.assertIn('unavailable', result['ambiguous_matches'][0]['reason'])
+        self.assertTrue(all(not bucket for bucket in result['buckets'].values()))
+
+    def test_frozen_source_provider_rejects_changed_bytes_or_manifest(self):
+        work = ROOT / 'frozen-source'; work.mkdir(exist_ok=True)
+        file = work / 'source.cpp'; file.write_bytes(b'use(x);')
+        manifest = work / 'inputs.json'
+        manifest.write_text(json.dumps([{'path': str(file), 'sha256': hashlib.sha256(file.read_bytes()).hexdigest()}]))
+        data = report(1)
+        data['input_freeze'].update(manifest='inputs.json', manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest())
+        sources = analysis.FrozenSources(data, work)
+        self.assertEqual(sources.get(str(file)), b'use(x);')
+        file.write_bytes(b'changed(x);')
+        sources = analysis.FrozenSources(data, work)
+        self.assertIsNone(sources.get(str(file)))
+        self.assertIn('differs', sources.audit[str(file)]['reason'])
+        manifest.write_text('[]')
+        with self.assertRaisesRegex(ValueError, 'manifest changed'):
+            analysis.FrozenSources(data, work)
+
+    def test_stratified_samples_weights_shortages_and_seed_are_reproducible(self):
+        buckets = {}
+        for bucket in ['shared', 'cir_only', 'bugprone_only']:
+            buckets[bucket] = [{'id': bucket + str(i), 'clang_observed': i < 30, 'claims': {}}
+                               for i in range(130)]
+        result = analysis.review_sample({'buckets': buckets}, seed=20261010)
+        self.assertEqual(len(result['sites']), 300)
+        self.assertEqual(result, analysis.review_sample({'buckets': buckets}, seed=20261010))
+        self.assertTrue(all(site['verdicts'] == {} for site in result['sites']))
+        self.assertEqual(result['strata']['shared/clang'], {'population': 30, 'sampled': 30, 'weight': 1.0})
+        self.assertEqual(result['strata']['shared/other']['sampled'], 70)
+        self.assertAlmostEqual(result['strata']['shared/other']['weight'], 100/70)
+        empty = analysis.review_sample({'buckets': {k: [] for k in buckets}})
+        self.assertEqual(empty['sites'], [])
+
+    def test_timing_sample_is_warning_independent_and_excludes_ineligible(self):
+        data = report(600)
+        first = analysis.timing_sample(data, seed=20261010)
+        self.assertEqual(len(first['units']), 300)
+        self.assertEqual(first['counts'], {'clang': 100, 'other': 200})
+        for run in data['runs']: run['diagnostic_groups'] = []
+        self.assertEqual(first, analysis.timing_sample(data, seed=20261010))
+        for run in data['runs']: run['eligibility']['eligible'] = False
+        self.assertEqual(analysis.timing_sample(data)['units'], [])
+
+    def test_manual_reviews_are_not_assumed_and_weighted_by_checker(self):
+        sample = {'sites': [{'id': 'one', 'weight': 2, 'claims': {'candidate': {}, 'baseline': {}},
+                             'verdicts': {'candidate': 'false_positive', 'baseline': 'actual_defect'}},
+                            {'id': 'two', 'weight': 3, 'claims': {'candidate': {}}, 'verdicts': {}}]}
+        result = analysis.review_totals(sample)
+        self.assertEqual(result['candidate']['weighted']['false_positive'], 2)
+        self.assertEqual(result['candidate']['weighted']['unresolved'], 3)
+        self.assertEqual(result['baseline']['weighted']['actual_defect'], 2)
+        sample['sites'][0]['verdicts']['candidate'] = 'looks_ok'
+        with self.assertRaisesRegex(ValueError, 'verdict'): analysis.review_totals(sample)
+
+    @unittest.skipUnless(HAS_YAML, 'optional PyYAML dependency')
+    def test_real_yaml_relative_paths_and_malformed_payloads(self):
+        file = ROOT / 'diagnostics.yaml'
+        file.write_text("""---
+MainSourceFile: main.cpp
+Diagnostics:
+  - DiagnosticName: cir-lifetime-check
+    Level: Warning
+    BuildDirectory: /build
+    DiagnosticMessage:
+      Message: 'use of invalid pointer'
+      FilePath: ../source/header.h
+      FileOffset: 11
+      Ranges:
+        - {FilePath: ../source/header.h, FileOffset: 10, Length: 3}
+    Notes:
+      - Message: >-
+          moved here via std::move
+          or rvalue reference
+        FilePath: ../source/header.h
+        FileOffset: 3
+...
+""")
+        parsed = support.parse_yaml_diagnostics(file, '/other', 1)
+        self.assertEqual(parsed['status'], 'parsed')
+        self.assertEqual(parsed['groups'][0]['primary']['file'], '/source/header.h')
+        self.assertEqual(analysis.group_kind(parsed['groups'][0]), 'uam')
+        self.assertEqual(support.parse_yaml_diagnostics(file, '/other', 2)['status'], 'incomplete')
+        file.write_text('Diagnostics: [')
+        self.assertEqual(support.parse_yaml_diagnostics(file, '/other')['status'], 'invalid')
+        file.write_text('!!python/object/apply:os.system ["echo unsafe"]')
+        self.assertEqual(support.parse_yaml_diagnostics(file, '/other')['status'], 'invalid')
+        file.unlink()
+        self.assertEqual(support.parse_yaml_diagnostics(file, '/other', 1)['status'], 'missing')
+        self.assertEqual(support.parse_yaml_diagnostics(file, '/other', 0)['status'], 'empty')
+
+    def test_incomplete_or_duplicate_runs_are_rejected(self):
+        data = report()
+        data['runs'].append(copy.deepcopy(data['runs'][0]))
+        with self.assertRaisesRegex(ValueError, 'duplicate'): analysis.compare_report(data)
+        data = report(); data['runs'].pop()
+        with self.assertRaisesRegex(ValueError, 'incomplete'): analysis.compare_report(data)
+        data = report(); data['complete'] = False
+        with self.assertRaisesRegex(ValueError, 'complete'): analysis.compare_report(data)
+
+
+unittest.main()
