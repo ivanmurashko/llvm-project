@@ -1,0 +1,43 @@
+// RUN: cir-opt %s --verify-diagnostics --split-input-file
+
+// expected-error @below {{the tuple_get contract requires a free function}}
+module attributes {facts = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [2], parameter_indices = [1], library_function = tuple_get>} {}
+
+// -----
+
+// expected-error @below {{tuple_get requires one source reference parameter}}
+module attributes {facts = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [], parameter_indices = [], library_function = tuple_get>} {}
+
+// -----
+
+// expected-error @below {{tuple_get requires one source reference parameter}}
+module attributes {facts = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0], parameter_indices = [0], library_function = tuple_get>} {}
+
+// -----
+
+module {
+  // expected-error @below {{lifetime parameter index is outside the function signature}}
+  cir.func private @outside(!cir.ptr<!cir.int<s, 32>>) -> !cir.ptr<!cir.int<s, 32>> attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = [1], library_function = tuple_get>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{a lifetime reference parameter must map to a pointer input}}
+  cir.func private @not_pointer(!cir.int<s, 32>) -> !cir.ptr<!cir.int<s, 32>> attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = [0], library_function = tuple_get>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{tuple_get requires a record reference and a reference result}}
+  cir.func private @not_record(!cir.ptr<!cir.int<s, 32>>) -> !cir.ptr<!cir.int<s, 32>> attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = [0], library_function = tuple_get>}
+}
+
+// -----
+
+!Tuple = !cir.struct<"Tuple" {data !cir.int<s, 32>}>
+module {
+  // expected-error @below {{tuple_get requires a record reference and a reference result}}
+  cir.func private @not_reference(!cir.ptr<!Tuple>) -> !cir.int<s, 32> attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [1], parameter_indices = [0], library_function = tuple_get>}
+}

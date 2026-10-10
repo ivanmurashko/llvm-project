@@ -3920,6 +3920,356 @@ CIRGenModule::getMLIRVisibilityFromCIRLinkage(cir::GlobalLinkageKind glk) {
   llvm_unreachable("linkage should be handled above!");
 }
 
+static cir::LifetimeLibraryKind
+getLifetimeLibraryKind(const clang::RecordDecl *record) {
+  using Kind = cir::LifetimeLibraryKind;
+  if (!record || !record->getIdentifier() ||
+      !record->getDeclContext()->isStdNamespace())
+    return Kind::None;
+  return llvm::StringSwitch<Kind>(record->getName())
+      .Case("unique_ptr", Kind::UniquePointer)
+      .Case("shared_ptr", Kind::SharedPointer)
+      .Case("weak_ptr", Kind::WeakPointer)
+      .Case("optional", Kind::Optional)
+      .Case("any", Kind::Any)
+      .Case("tuple", Kind::Tuple)
+      .Cases({"basic_string", "vector", "deque"}, Kind::Container)
+      .Cases({"forward_list", "list", "set", "map"}, Kind::Container)
+      .Cases({"multiset", "multimap", "unordered_set"}, Kind::Container)
+      .Cases({"unordered_map", "unordered_multiset", "unordered_multimap"},
+             Kind::Container)
+      .Default(Kind::None);
+}
+
+static std::optional<llvm::SmallVector<QualType>>
+getLifetimeTupleElementTypes(const clang::RecordDecl *record) {
+  if (getLifetimeLibraryKind(record) != cir::LifetimeLibraryKind::Tuple)
+    return std::nullopt;
+  const auto *specialization =
+      dyn_cast<ClassTemplateSpecializationDecl>(record);
+  if (!specialization)
+    return std::nullopt;
+  llvm::SmallVector<QualType> elements;
+  auto append = [&](const TemplateArgument &argument, auto &append) -> bool {
+    if (argument.getKind() == TemplateArgument::Type) {
+      elements.push_back(argument.getAsType());
+      return true;
+    }
+    if (argument.getKind() != TemplateArgument::Pack)
+      return false;
+    return llvm::all_of(argument.pack_elements(),
+                        [&](const TemplateArgument &element) {
+                          return append(element, append);
+                        });
+  };
+  for (const TemplateArgument &argument :
+       specialization->getTemplateArgs().asArray())
+    if (!append(argument, append))
+      return std::nullopt;
+  return elements;
+}
+
+static std::optional<llvm::SmallVector<int32_t>>
+getLifetimeTupleElementParameters(const clang::FunctionDecl *function,
+                                  const clang::RecordDecl *record) {
+  auto elements = getLifetimeTupleElementTypes(record);
+  if (!elements || elements->size() != function->getNumParams())
+    return std::nullopt;
+  if (const auto *constructor = dyn_cast<CXXConstructorDecl>(function))
+    if (constructor->isCopyOrMoveConstructor())
+      return std::nullopt;
+  llvm::SmallVector<int32_t> parameters;
+  for (auto [index, element] : llvm::enumerate(*elements)) {
+    QualType source = function->getParamDecl(index)->getType();
+    // Match logical elements, not private implementation fields or a guessed
+    // allocator offset. Reference elements must have an addressable source.
+    if ((element->isReferenceType() && !source->isReferenceType()) ||
+        !function->getASTContext().hasSameType(
+            element.getNonReferenceType().getUnqualifiedType(),
+            source.getNonReferenceType().getUnqualifiedType()))
+      return std::nullopt;
+    parameters.push_back(index);
+  }
+  return parameters;
+}
+
+// std::get projects an element without consuming its containing pair/tuple.
+// Validate the instantiated overload, including reference collapsing, rather
+// than granting that contract to arbitrary functions with the same name.
+static bool isLifetimeTupleGet(const clang::FunctionDecl *function) {
+  if (!function->getIdentifier() || function->getName() != "get" ||
+      !function->getDeclContext()->isStdNamespace() ||
+      function->getNumParams() != 1 || function->isVariadic() ||
+      !function->getParamDecl(0)->getType()->isReferenceType() ||
+      !function->getReturnType()->isReferenceType())
+    return false;
+  QualType parameter = function->getParamDecl(0)->getType();
+  QualType objectType = parameter.getNonReferenceType();
+  if (objectType.isVolatileQualified())
+    return false;
+  const auto *record = dyn_cast_or_null<ClassTemplateSpecializationDecl>(
+      objectType->getAsCXXRecordDecl());
+  if (!record || !record->getIdentifier() ||
+      !record->getDeclContext()->isStdNamespace())
+    return false;
+  llvm::SmallVector<QualType> elements;
+  if (record->getName() == "tuple") {
+    auto types = getLifetimeTupleElementTypes(record);
+    if (!types)
+      return false;
+    elements = std::move(*types);
+  } else if (record->getName() == "pair") {
+    auto types = record->getTemplateArgs().asArray();
+    if (types.size() != 2 || types[0].getKind() != TemplateArgument::Type ||
+        types[1].getKind() != TemplateArgument::Type)
+      return false;
+    elements = {types[0].getAsType(), types[1].getAsType()};
+  } else {
+    return false;
+  }
+  const auto *arguments = function->getTemplateSpecializationArgs();
+  if (!arguments || arguments->size() == 0)
+    return false;
+  const auto &selection = arguments->get(0);
+  QualType element;
+  ASTContext &context = function->getASTContext();
+  if (selection.getKind() == TemplateArgument::Integral) {
+    const auto &index = selection.getAsIntegral();
+    if (index.isNegative() ||
+        index.getLimitedValue(elements.size()) >= elements.size())
+      return false;
+    element = elements[index.getZExtValue()];
+  } else if (selection.getKind() == TemplateArgument::Type) {
+    for (QualType type : elements)
+      if (context.hasSameType(type, selection.getAsType())) {
+        if (!element.isNull())
+          return false;
+        element = type;
+      }
+    if (element.isNull())
+      return false;
+  } else {
+    return false;
+  }
+  if (!element->isReferenceType())
+    element = context.getQualifiedType(element, objectType.getQualifiers());
+  bool lvalue =
+      parameter->isLValueReferenceType() || element->isLValueReferenceType();
+  element = element.getNonReferenceType();
+  QualType result = lvalue ? context.getLValueReferenceType(element)
+                           : context.getRValueReferenceType(element);
+  return context.hasSameType(result, function->getReturnType());
+}
+
+static cir::LifetimeLibraryFunction
+getLifetimeLibraryFunction(const clang::FunctionDecl *function) {
+  using Kind = cir::LifetimeLibraryKind;
+  using Effect = cir::LifetimeLibraryFunction;
+  const auto *method = dyn_cast<CXXMethodDecl>(function);
+  const unsigned numParams = function->getNumParams();
+  if (!method) {
+    if (isLifetimeTupleGet(function))
+      return Effect::TupleGet;
+    // A tuple of lvalue references is a projection of its arguments. The
+    // declaration identity and types matter; an unrelated function named tie
+    // does not establish these semantics.
+    if (function->getIdentifier() && function->getName() == "tie" &&
+        function->getDeclContext()->isStdNamespace() &&
+        getLifetimeLibraryKind(
+            function->getReturnType()->getAsCXXRecordDecl()) == Kind::Tuple &&
+        llvm::all_of(function->parameters(), [](const ParmVarDecl *parameter) {
+          return parameter->getType()->isLValueReferenceType();
+        }))
+      return Effect::Tie;
+    if (function->getIdentifier() && function->getName() == "make_tuple" &&
+        function->getDeclContext()->isStdNamespace() &&
+        getLifetimeTupleElementParameters(
+            function, function->getReturnType()->getAsCXXRecordDecl()))
+      return Effect::MakeTuple;
+    return Effect::None;
+  }
+  if (!method->isImplicitObjectMemberFunction())
+    return Effect::None;
+  const Kind kind = getLifetimeLibraryKind(method->getParent());
+  if (kind == Kind::None)
+    return Effect::None;
+  // nullopt constructs or assigns an empty optional. Preserve the tag's
+  // canonical declaration identity, rather than interpreting a CIR spelling.
+  if (kind == Kind::Optional && numParams == 1 &&
+      (isa<CXXConstructorDecl>(method) ||
+       (method->isOverloadedOperator() &&
+        method->getOverloadedOperator() == OO_Equal))) {
+    const auto *tag = method->getParamDecl(0)
+                          ->getType()
+                          .getNonReferenceType()
+                          ->getAsCXXRecordDecl();
+    if (tag && tag->getIdentifier() && tag->getName() == "nullopt_t" &&
+        tag->getDeclContext()->isStdNamespace())
+      return Effect::Disengage;
+  }
+  if (isa<CXXConstructorDecl>(method) && kind == Kind::SharedPointer &&
+      numParams == 2 &&
+      method->getParamDecl(0)->getType()->isReferenceType() &&
+      getLifetimeLibraryKind(method->getParamDecl(0)
+                                 ->getType()
+                                 .getNonReferenceType()
+                                 ->getAsCXXRecordDecl()) == Kind::SharedPointer &&
+      method->getParamDecl(1)->getType()->isPointerType())
+    return Effect::SharedAliasConstruct;
+  if (isa<CXXConstructorDecl>(method))
+    return Effect::Construct;
+  if (isa<CXXDestructorDecl>(method))
+    return Effect::Destroy;
+  if (method->isCopyAssignmentOperator() || method->isMoveAssignmentOperator())
+    return kind == Kind::Tuple ? Effect::TupleAssign : Effect::Assign;
+  if (auto *conversion = dyn_cast<CXXConversionDecl>(method))
+    return conversion->getConversionType()->isBooleanType() ? Effect::Bool
+                                                            : Effect::None;
+  if (method->isOverloadedOperator()) {
+    switch (method->getOverloadedOperator()) {
+    case OO_Equal:
+      return numParams == 1
+                 ? (kind == Kind::Tuple ? Effect::TupleAssign : Effect::Assign)
+                 : Effect::None;
+    case OO_Star:
+      return numParams == 0 && method->getReturnType()->isReferenceType()
+                 ? Effect::Dereference
+                 : Effect::None;
+    case OO_Arrow:
+      return numParams == 0 && method->getReturnType()->isPointerType()
+                 ? Effect::Dereference
+                 : Effect::None;
+    case OO_Subscript:
+      if (numParams == 1) {
+        if (!method->isConst() &&
+            (method->getParent()->getName() == "map" ||
+             method->getParent()->getName() == "unordered_map"))
+          return Effect::MapSubscript;
+        return kind == Kind::UniquePointer || kind == Kind::SharedPointer
+                   ? Effect::Dereference
+                   : Effect::Access;
+      }
+      return Effect::None;
+    default:
+      return Effect::None;
+    }
+  }
+  if (!method->getIdentifier())
+    return Effect::None;
+  const StringRef name = method->getName();
+  const bool smart = kind == Kind::UniquePointer || kind == Kind::SharedPointer;
+  if (name == "reset" && !method->isConst()) {
+    if (smart &&
+        (numParams == 0 || method->getParamDecl(0)->getType()->isPointerType()))
+      return Effect::Reset;
+    if ((kind == Kind::WeakPointer || kind == Kind::Optional ||
+         kind == Kind::Any) &&
+        numParams == 0)
+      return Effect::Reset;
+  }
+  if (smart && numParams == 0 && method->getReturnType()->isPointerType()) {
+    if (name == "get")
+      return Effect::Get;
+    if (name == "release" && kind == Kind::UniquePointer && !method->isConst())
+      return Effect::Release;
+  }
+  if ((kind == Kind::Optional || kind == Kind::Any) && name == "has_value" &&
+      numParams == 0 && method->getReturnType()->isBooleanType())
+    return Effect::HasValue;
+  if (kind == Kind::WeakPointer && numParams == 0) {
+    if (name == "expired" && method->getReturnType()->isBooleanType())
+      return Effect::Expired;
+    if (name == "lock" &&
+        getLifetimeLibraryKind(method->getReturnType()->getAsCXXRecordDecl()) ==
+            Kind::SharedPointer)
+      return Effect::Lock;
+  }
+  if (kind != Kind::Container)
+    return Effect::None;
+  if (name == "clear" && !method->isConst() && numParams == 0)
+    return Effect::Clear;
+  if (name == "assign" && !method->isConst() && numParams != 0)
+    return Effect::Assign;
+  if (name == "empty" && numParams == 0 &&
+      method->getReturnType()->isBooleanType())
+    return Effect::Empty;
+  if (name == "size" && numParams == 0 &&
+      method->getReturnType()->isIntegerType())
+    return Effect::Size;
+  if (name == "data" && numParams == 0 &&
+      method->getReturnType()->isPointerType())
+    return Effect::Data;
+  if ((name == "front" || name == "back") && numParams == 0)
+    return Effect::Access;
+  if (name == "at" && numParams == 1)
+    return Effect::Access;
+  if (name == "try_emplace" && !method->isConst() && numParams != 0 &&
+      (method->getParent()->getName() == "map" ||
+       method->getParent()->getName() == "unordered_map")) {
+    // Only non-hint overloads return pair<iterator, bool>. A field in the
+    // iterator returned by a hint overload is not an insertion predicate.
+    const auto *result = method->getReturnType()->getAsCXXRecordDecl();
+    if (result && result->getIdentifier() && result->getName() == "pair" &&
+        result->getDeclContext()->isStdNamespace()) {
+      const auto *definition = result->getDefinition();
+      if (definition &&
+          std::distance(definition->field_begin(), definition->field_end()) ==
+              2 &&
+          std::next(definition->field_begin())->getType()->isBooleanType())
+        return Effect::TryEmplace;
+    }
+    return Effect::TryEmplaceHint;
+  }
+  return Effect::None;
+}
+
+static llvm::SmallVector<int32_t> getGuaranteedLifetimeMoveParameters(
+    const clang::FunctionDecl *function,
+    cir::LifetimeLibraryFunction effect) {
+  using Effect = cir::LifetimeLibraryFunction;
+  using Kind = cir::LifetimeLibraryKind;
+  if (effect != Effect::TryEmplace && effect != Effect::TryEmplaceHint)
+    return {};
+  const auto *method = cast<CXXMethodDecl>(function);
+  const auto *specialization =
+      dyn_cast<ClassTemplateSpecializationDecl>(method->getParent());
+  if (!specialization || specialization->getTemplateArgs().size() < 2)
+    return {};
+  const auto &arguments = specialization->getTemplateArgs();
+  if (arguments[0].getKind() != TemplateArgument::Type ||
+      arguments[1].getKind() != TemplateArgument::Type)
+    return {};
+
+  // Hint overloads take the iterator by value; non-hint key parameters are
+  // references. Do not infer a shifted mapping merely from an unknown result
+  // shape being conservatively tagged as TryEmplaceHint.
+  const unsigned keyIndex = effect == Effect::TryEmplaceHint ? 1 : 0;
+  if (method->getNumParams() <= keyIndex ||
+      (keyIndex == 1 &&
+       method->getParamDecl(0)->getType()->isReferenceType()))
+    return {};
+  auto isGuaranteedTransfer = [&](unsigned index, QualType destination) {
+    QualType parameter = method->getParamDecl(index)->getType();
+    if (!parameter->isRValueReferenceType())
+      return false;
+    QualType source = parameter.getNonReferenceType();
+    if (source.isConstQualified() || source.isVolatileQualified() ||
+        !function->getASTContext().hasSameType(source, destination))
+      return false;
+    Kind kind = getLifetimeLibraryKind(destination->getAsCXXRecordDecl());
+    return kind == Kind::UniquePointer || kind == Kind::SharedPointer ||
+           kind == Kind::WeakPointer;
+  };
+  llvm::SmallVector<int32_t> result;
+  if (isGuaranteedTransfer(keyIndex, arguments[0].getAsType()))
+    result.push_back(keyIndex);
+  const unsigned mappedIndex = keyIndex + 1;
+  if (method->getNumParams() == mappedIndex + 1 &&
+      isGuaranteedTransfer(mappedIndex, arguments[1].getAsType()))
+    result.push_back(mappedIndex);
+  return result;
+}
+
 void CIRGenModule::setLifetimeFunctionAttr(
     cir::FuncOp funcOp, const clang::FunctionDecl *funcDecl) {
   if (!funcDecl)
@@ -3961,11 +4311,54 @@ void CIRGenModule::setLifetimeFunctionAttr(
       parameterIndices = builder.getDenseI32ArrayAttr(indices);
     }
   }
+  bool reinitializes = false, returnsNonnull = false;
+  auto libraryFunction = cir::LifetimeLibraryFunction::None;
+  mlir::DenseI32ArrayAttr guaranteedMoveParams, tupleElementParams;
+  int32_t insertionResultIndex = -1;
+  if (shouldPreserveLifetimeScopes()) {
+    reinitializes = funcDecl->hasAttr<ReinitializesAttr>();
+    returnsNonnull = funcDecl->hasAttr<ReturnsNonNullAttr>() &&
+                     funcDecl->getReturnType()->isPointerType();
+    bool nothrowAllocation = false;
+    if (funcDecl->isReplaceableGlobalAllocationFunction(nullptr,
+                                                        &nothrowAllocation) &&
+        !nothrowAllocation &&
+        (funcDecl->getOverloadedOperator() == OO_New ||
+         funcDecl->getOverloadedOperator() == OO_Array_New))
+      returnsNonnull = true;
+    if (parameterKinds) {
+      libraryFunction = getLifetimeLibraryFunction(funcDecl);
+      if (libraryFunction == cir::LifetimeLibraryFunction::TryEmplace) {
+        // The standard specifies pair::second, not its index in the lowered
+        // record. Implementations may have base subobjects and tail padding.
+        const auto *result =
+            funcDecl->getReturnType()->getAsCXXRecordDecl()->getDefinition();
+        const FieldDecl *second = *std::next(result->field_begin());
+        insertionResultIndex =
+            getTypes().getCIRGenRecordLayout(result).getCIRFieldNo(second);
+      }
+      auto guaranteed =
+          getGuaranteedLifetimeMoveParameters(funcDecl, libraryFunction);
+      if (!guaranteed.empty())
+        guaranteedMoveParams = builder.getDenseI32ArrayAttr(guaranteed);
+      const RecordDecl *tupleRecord = nullptr;
+      if (libraryFunction == cir::LifetimeLibraryFunction::MakeTuple)
+        tupleRecord = funcDecl->getReturnType()->getAsCXXRecordDecl();
+      else if (libraryFunction == cir::LifetimeLibraryFunction::Construct &&
+               method)
+        tupleRecord = method->getParent();
+      if (auto elements =
+              getLifetimeTupleElementParameters(funcDecl, tupleRecord))
+        tupleElementParams = builder.getDenseI32ArrayAttr(*elements);
+    }
+  }
   funcOp.setLifetimeAttr(cir::LifetimeFunctionAttr::get(
       &getMLIRContext(), /*isMethod=*/method != nullptr,
       /*isStatic=*/method && method->isStatic(),
       /*isConst=*/method && method->isConst(), funcDecl->isOverloadedOperator(),
-      hasImplicitObject, methodName, parameterKinds, parameterIndices));
+      hasImplicitObject, methodName, parameterKinds, parameterIndices,
+      reinitializes, returnsNonnull, libraryFunction, guaranteedMoveParams,
+      tupleElementParams, insertionResultIndex));
 }
 
 void CIRGenModule::emitLifetimeRecords() {
@@ -3980,6 +4373,23 @@ void CIRGenModule::emitLifetimeRecords() {
                         record->getIdentifier() &&
                         (record->getName() == "unique_ptr" ||
                          record->getName() == "shared_ptr");
+    auto libraryKind = shouldPreserveLifetimeScopes()
+                           ? getLifetimeLibraryKind(record)
+                           : cir::LifetimeLibraryKind::None;
+    mlir::DenseI32ArrayAttr tupleElementKinds;
+    if (libraryKind == cir::LifetimeLibraryKind::Tuple)
+      if (auto elements = getLifetimeTupleElementTypes(record)) {
+        llvm::SmallVector<int32_t> kinds;
+        for (QualType element : *elements) {
+          auto kind = cir::LifetimeParameterKind::Value;
+          if (element->isLValueReferenceType())
+            kind = cir::LifetimeParameterKind::LValueReference;
+          else if (element->isRValueReferenceType())
+            kind = cir::LifetimeParameterKind::RValueReference;
+          kinds.push_back(static_cast<int32_t>(kind));
+        }
+        tupleElementKinds = builder.getDenseI32ArrayAttr(kinds);
+      }
     const auto *cxxRecord = dyn_cast<CXXRecordDecl>(record);
     bool lambda = cxxRecord && cxxRecord->isLambda();
     bool promiseType = false;
@@ -3993,11 +4403,13 @@ void CIRGenModule::emitLifetimeRecords() {
         }
       }
     }
-    if (!owner && !pointer && !lambda && !promiseType && !smartPointer)
+    if (!owner && !pointer && !lambda && !promiseType && !smartPointer &&
+        libraryKind == cir::LifetimeLibraryKind::None)
       continue;
-    entries.emplace_back(
-        name, cir::LifetimeRecordAttr::get(&getMLIRContext(), owner, pointer,
-                                           lambda, promiseType, smartPointer));
+    entries.emplace_back(name, cir::LifetimeRecordAttr::get(
+                                   &getMLIRContext(), owner, pointer, lambda,
+                                   promiseType, smartPointer, libraryKind,
+                                   tupleElementKinds));
   }
   if (!entries.empty())
     theModule->setAttr(cir::CIRDialect::getLifetimeRecordsAttrName(),

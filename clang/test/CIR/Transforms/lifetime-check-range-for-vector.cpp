@@ -11,7 +11,7 @@ typedef enum SType {
   INFO_ENUM_1 = 2020,
 } SType;
 
-typedef struct InfoRaw { // expected-note {{invalidated here}}
+typedef struct InfoRaw { // expected-note 2 {{invalidated here}}
     SType type;
     const void* __attribute__((__may_alias__)) next;
     unsigned u;
@@ -20,7 +20,7 @@ typedef struct InfoRaw { // expected-note {{invalidated here}}
 void swappy(unsigned c) {
   std::vector<InfoRaw> images(c);
   for (auto& image : images) {
-    image = {INFO_ENUM_1};
+    image = {INFO_ENUM_1}; // expected-warning {{passing aggregate containing invalid pointer member}}
   }
 
   std::vector<InfoRaw> images2(c);

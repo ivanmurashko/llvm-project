@@ -25,7 +25,7 @@ void loop_basic_while() {
 }
 
 void loop_basic_dowhile() {
-  int *p = nullptr; // expected-note {{invalidated here}}
+  int *p = nullptr;
   int i = 0;
   do {
     int x = 0;
@@ -34,7 +34,7 @@ void loop_basic_dowhile() {
     i = i + 1;
   } while (i < 10); // expected-note {{pointee 'x' invalidated at end of scope}}
   *p = 42;          // expected-warning {{use of invalid pointer 'p'}}
-                    // expected-remark@-1 {{pset => { nullptr, invalid }}}
+                    // expected-remark@-1 {{pset => { invalid }}}
 }
 
 // p1179r1: 2.4.9.3
@@ -44,7 +44,7 @@ void loop0(bool b, int j) {
   while (j) {
     // This access is invalidated after the first iteration
     *p = 42;     // expected-warning {{use of invalid pointer 'p'}}
-                 // expected-remark@-1 {{pset => { c, nullptr }}}
+                 // expected-remark@-1 {{pset => { a, c, nullptr }}}
     p = nullptr; // expected-note 2 {{invalidated here}}
     if (b) {
       p = &c[j];

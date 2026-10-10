@@ -1,0 +1,55 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %s --cir-canonicalize --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+// Unknown calls forget stored boolean certainty, but cannot change a value
+// already loaded into SSA. Atomic reads do not reuse ordinary stored values.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!bp = !cir.ptr<!cir.bool>
+module {
+  cir.func private @opaque()
+  cir.func @loaded_before_call() {
+    %flag = cir.alloca "flag" align(1) : !bp
+    %true = cir.const #cir.bool<true> : !cir.bool
+    cir.store %true, %flag : !cir.bool, !bp
+    %snapshot = cir.load %flag : !bp, !cir.bool
+    cir.call @opaque() : () -> ()
+    %negated = cir.not %snapshot : !cir.bool
+    cir.if %negated {
+      %null = cir.const #cir.ptr<null> : !p
+      %invalid = cir.load %null : !p, !i
+    }
+    cir.return
+  }
+  cir.func @atomic_read_is_unknown() {
+    %flag = cir.alloca "flag" align(1) : !bp
+    %true = cir.const #cir.bool<true> : !cir.bool
+    cir.store %true, %flag : !cir.bool, !bp
+    %snapshot = cir.load atomic(seq_cst) %flag : !bp, !cir.bool
+    %negated = cir.not %snapshot : !cir.bool
+    cir.if %negated {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      // expected-warning @below {{use of invalid pointer}}
+      %invalid = cir.load %null : !p, !i
+    }
+    cir.return
+  }
+  cir.func @missing_store_alternative(%choice: !cir.bool) {
+    %flag = cir.alloca "flag" align(1) : !bp
+    %true = cir.const #cir.bool<true> : !cir.bool
+    cir.if %choice {
+      cir.store %true, %flag : !cir.bool, !bp
+    }
+    %snapshot = cir.load %flag : !bp, !cir.bool
+    %negated = cir.not %snapshot : !cir.bool
+    cir.if %negated {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      // expected-warning @below {{use of invalid pointer}}
+      %invalid = cir.load %null : !p, !i
+    }
+    cir.return
+  }
+}

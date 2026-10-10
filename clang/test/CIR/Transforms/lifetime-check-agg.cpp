@@ -62,12 +62,12 @@ void exploded_fields1(bool cond, unsigned t) {
       InfoPriv privTmp = {INFO_ENUM_1};
       privTmp.flags = PrivBit;
       info.next = &privTmp;
-    }
+    } // expected-note {{pointee 'privTmp' invalidated at end of scope}}
 
-    // A warning is not emitted here, lack of context for inferring
-    // anything about `cond` would make it too noisy given `info.next`
-    // wasn't null initialized.
+    // The branch can replace the initially valid pointer with one whose
+    // pointee expires before the call. Keep both possible pointer states.
 
-    escape_info(&info); // expected-remark {{pset => { t }}}
+    escape_info(&info); // expected-remark {{pset => { invalid, t }}}
+                       // expected-warning@-1 {{passing aggregate containing invalid pointer member 'info.next'}}
   }
 }

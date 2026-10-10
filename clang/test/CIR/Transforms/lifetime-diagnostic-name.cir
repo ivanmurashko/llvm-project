@@ -17,7 +17,7 @@ module {
     cir.return
   }
 
-  // get_element records this unnamed non-entry array base in p's pointee set.
+  // Forwarding a block argument preserves the incoming array's identity.
   cir.func @non_entry_array_base(%array: !arrayptr) {
     cir.br ^body(%array : !arrayptr)
   ^body(%base: !arrayptr):
@@ -25,7 +25,7 @@ module {
     %zero = cir.const #cir.int<0> : !s32i
     %element = cir.get_element %base[%zero : !s32i] : !arrayptr -> !ptr
     cir.store %element, %p : !ptr, !slot
-    // expected-remark @below {{pset => { <unnamed> }}}
+    // expected-remark @below {{pset => { fn_arg:0 }}}
     %value = cir.load deref %p : !slot, !ptr
     cir.return
   }

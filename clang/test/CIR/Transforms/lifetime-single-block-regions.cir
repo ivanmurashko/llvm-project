@@ -1,0 +1,78 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module {
+  cir.func private @observe(!i) attributes {nothrow}
+
+  // A symbolic goto can re-enter a single block without a BranchOp successor.
+  // A one-block fast path must reject the direct LabelOp and retain its entry.
+  cir.func @single_block_symbolic_backedge(%repeat: !cir.bool) {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %x : !i, !p
+    cir.store %x, %p : !p, !pp
+    cir.scope {
+      cir.label "retry"
+      %address = cir.load %p : !pp, !p
+      // expected-warning @below {{use of invalid pointer}}
+      %use = cir.load %address : !p, !i
+      cir.call @observe(%use) nothrow : (!i) -> ()
+      cir.if %repeat {
+        // expected-note @below {{'nullptr' invalidated here}}
+        %null = cir.const #cir.ptr<null> : !p
+        cir.store %null, %p : !p, !pp
+        cir.goto "retry"
+      }
+      cir.yield
+    }
+    cir.return
+  }
+
+  // A label-free single-block body may propagate an outward goto. Its normal
+  // cleanup still executes before the enclosing region resumes at the label.
+  cir.func @outward_goto_runs_cleanup() {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %x : !i, !p
+    cir.store %x, %p : !p, !pp
+    cir.cleanup.scope {
+      cir.goto "out"
+    } cleanup normal {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %p : !p, !pp
+      cir.yield
+    }
+    cir.return
+  ^out:
+    cir.label "out"
+    %address = cir.load %p : !pp, !p
+    // expected-warning @below {{use of invalid pointer}}
+    %use = cir.load %address : !p, !i
+    cir.call @observe(%use) nothrow : (!i) -> ()
+    cir.return
+  }
+  // Explicit block edges retain the worklist and propagate backedge state.
+  cir.func @explicit_branch_backedge() {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    cir.store %x, %p : !p, !pp
+    cir.scope {
+      cir.br ^body
+    ^body:
+      %address = cir.load %p : !pp, !p
+      // expected-warning @below {{use of invalid pointer}}
+      %use = cir.load %address : !p, !i
+      cir.call @observe(%use) nothrow : (!i) -> ()
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %p : !p, !pp
+      cir.br ^body
+    }
+    cir.return
+  }
+
+}

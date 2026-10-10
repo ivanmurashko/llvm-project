@@ -9,13 +9,16 @@
 #include "PassDetail.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "clang/Basic/Stack.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/Passes.h"
 
 #include "clang/CIR/Interfaces/CIRLoopOpInterface.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
@@ -25,12 +28,16 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/ADT/TinyPtrVector.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 #include <algorithm>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace mlir;
 using namespace cir;
@@ -53,31 +60,13 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   LifetimeCheckPass() = default;
   void runOnOperation() override;
 
-  void checkOperation(Operation *op);
   void checkFunc(cir::FuncOp fnOp);
-  void checkBlock(Block &block);
-
-  void checkRegionWithScope(Region &region);
-  void checkRegion(Region &region);
-
-  void checkIf(IfOp op);
-  void checkCleanupScope(CleanupScopeOp op);
-  void checkSwitch(SwitchOp op);
-  void checkLoop(LoopOpInterface op);
-  void checkAlloca(AllocaOp op);
-  void checkStore(StoreOp op);
-  void forgetAggregateCallFields(mlir::Value address);
-  void checkLoad(LoadOp op);
   void checkCall(CallOp callOp);
-  void checkCoroutine(CoroutineOp coroutineOp);
-  void checkAwait(AwaitOp awaitOp);
   void checkReturn(ReturnOp retOp);
 
   bool isOwnerType(mlir::Type type);
   bool isPointerType(mlir::Type type);
 
-  void classifyAndInitTypeCategories(mlir::Value addr, mlir::Type t,
-                                     mlir::Location loc, unsigned nestLevel);
   void updatePointsTo(mlir::Value addr, mlir::Value data, mlir::Location loc);
   void updatePointsToForConstRecord(mlir::Value addr,
                                     cir::ConstRecordAttr value,
@@ -98,33 +87,11 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
                          DerefStyle derefStyle = DerefStyle::Direct);
   void checkCoroTaskStore(StoreOp storeOp);
   void checkLambdaCaptureStore(StoreOp storeOp);
-  // Checks and tracks moved-from values in store operations.
-  // Handles two scenarios:
-  // 1. Detects use-after-move: Reports diagnostic if storing value loaded from
-  // moved-from source
-  // 2. Tracks rvalue initialization: Marks source as moved-from (e.g., int
-  // b(std::move(a))) Only applies to value types; only marks AllocaOp
-  // destinations; skips dereference operations.
-  void checkMovedFromValue(StoreOp storeOp);
   void trackCallToCoroutine(CallOp callOp);
 
   void checkCtor(CallOp callOp, cir::CXXCtorAttr ctor);
   void checkMoveCtor(CallOp callOp, cir::CXXCtorAttr ctor);
   void checkMoveAssignment(CallOp callOp, cir::LifetimeFunctionAttr m);
-  // Checks function call arguments for moves via rvalue references and tracks
-  // their moved-from state.
-  //
-  // For each argument passed to an rvalue reference parameter (T&&), this
-  // function:
-  // 1. Checks if the argument is currently in a valid state (not already moved)
-  // 2. Marks the argument as moved-from after the call
-  //
-  // This performs both checking (detecting use-after-move) and tracking
-  // (updating program state) for function call arguments.
-  void
-  checkMoveInCallArgs(CallOp callOp,
-                      std::optional<unsigned> transferredArg = std::nullopt);
-  void checkArgForRValueRef(CallOp callOp, unsigned argIdx);
   void checkCopyAssignment(CallOp callOp, cir::LifetimeFunctionAttr m);
   void checkNonConstUseOfOwner(mlir::Value ownerAddr, mlir::Location loc);
   void markOwnerAsMovedFrom(mlir::Value addr, mlir::Location loc);
@@ -143,7 +110,6 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   // Helper methods for checking value states and tracking moved-from values
   bool isValueType(mlir::Value addr);
   bool hasInvalidState(mlir::Value addr);
-  bool isValueTypeMovedFrom(mlir::Value addr);
   void markPointerOrValueTypeAsMovedFrom(mlir::Value addr, mlir::Location loc);
 
   bool isSmartPointerType(mlir::Type type);
@@ -296,17 +262,15 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
 
     /// Provide less/equal than operator for sorting / set ops.
     bool operator<(const State &RHS) const {
-      // FIXME: note that this makes the ordering non-deterministic, do
-      // we really care?
-      if (hasValue() && RHS.hasValue())
-        return val.getPointer().getAsOpaquePointer() <
-               RHS.val.getPointer().getAsOpaquePointer();
-      return val.getInt() < RHS.val.getInt();
+      if (val.getInt() != RHS.val.getInt())
+        return val.getInt() < RHS.val.getInt();
+      return hasValue() && std::less<const void *>()(
+                               val.getPointer().getAsOpaquePointer(),
+                               RHS.val.getPointer().getAsOpaquePointer());
     }
     bool operator==(const State &RHS) const {
-      if (hasValue() && RHS.hasValue())
-        return val.getPointer() == RHS.val.getPointer();
-      return val.getInt() == RHS.val.getInt();
+      return val.getInt() == RHS.val.getInt() &&
+             (!hasValue() || val.getPointer() == RHS.val.getPointer());
     }
 
     bool isLocalValue() const { return val.getInt() == LocalValue; }
@@ -346,13 +310,24 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
     InvalidHistEntry(InvalidStyle s, std::optional<mlir::Location> l,
                      std::optional<mlir::Value> v)
         : style(s), loc(l), val(v) {}
+    bool operator==(const InvalidHistEntry &other) const {
+      return style == other.style && loc == other.loc && val == other.val;
+    }
   };
 
   struct InvalidHist {
-    llvm::SmallVector<InvalidHistEntry, 8> entries;
+    llvm::SmallVector<InvalidHistEntry, 0> entries;
     void add(mlir::Value ptr, InvalidStyle invalidStyle, mlir::Location loc,
              std::optional<mlir::Value> val = {}) {
-      entries.emplace_back(InvalidHistEntry(invalidStyle, loc, val));
+      InvalidHistEntry entry(invalidStyle, loc, val);
+      if (!llvm::is_contained(entries, entry))
+        entries.push_back(entry);
+    }
+    bool operator==(const InvalidHist &other) const {
+      return entries == other.entries;
+    }
+    bool operator!=(const InvalidHist &other) const {
+      return !(*this == other);
     }
   };
 
@@ -363,7 +338,8 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   PMapNullHistType pmapNullHist;
 
   // Track emitted diagnostics, and do not repeat them.
-  llvm::SmallSet<mlir::Location, 8, LocOrdering> emittedDiagnostics;
+  DenseMap<Value, llvm::SmallSet<Location, 8, LocOrdering>>
+      emittedObjectDiagnostics;
 
   ///
   /// Pointer Map and Pointer Set
@@ -372,6 +348,360 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   using PSetType = llvm::SmallSet<State, 4>;
   // FIXME: this should be a ScopedHashTable for consistency.
   using PMapType = llvm::DenseMap<mlir::Value, PSetType>;
+
+  // Object identities are stable for the duration of a function analysis. In
+  // particular, a load of an address is a value, not a new storage identity.
+  using ObjectId = mlir::Value;
+  struct ObjectTargets {
+    llvm::TinyPtrVector<ObjectId> objects;
+    bool unknown = false;
+    bool mayBeNull = false;
+    bool mayBeInvalid = false;
+    bool isDefinite() const {
+      return objects.size() == 1 && !unknown && !mayBeNull && !mayBeInvalid;
+    }
+    bool operator==(const ObjectTargets &other) const {
+      return ArrayRef<ObjectId>(objects) == ArrayRef<ObjectId>(other.objects) &&
+             unknown == other.unknown && mayBeNull == other.mayBeNull &&
+             mayBeInvalid == other.mayBeInvalid;
+    }
+    bool operator!=(const ObjectTargets &other) const {
+      return !(*this == other);
+    }
+  };
+  struct PointerValueSummary {
+    ObjectTargets targets;
+    bool mayBeNonNull = false;
+    bool unknownNullness = false;
+    llvm::TinyPtrVector<ObjectId> borrowedOwners;
+    InvalidHist invalidHistory;
+    std::optional<Location> nullOrigin;
+    bool operator==(const PointerValueSummary &other) const {
+      return targets == other.targets && mayBeNonNull == other.mayBeNonNull &&
+             unknownNullness == other.unknownNullness &&
+             ArrayRef<ObjectId>(borrowedOwners) ==
+                 ArrayRef<ObjectId>(other.borrowedOwners) &&
+             invalidHistory == other.invalidHistory &&
+             nullOrigin == other.nullOrigin;
+    }
+    bool operator!=(const PointerValueSummary &other) const {
+      return !(*this == other);
+    }
+  };
+  struct OccupancySummary {
+    bool mayBeEmpty = false;
+    bool mayBePresent = false;
+    bool unknown = true;
+    SmallVector<Location, 0> emptyOrigins;
+    bool operator==(const OccupancySummary &other) const {
+      return mayBeEmpty == other.mayBeEmpty &&
+             mayBePresent == other.mayBePresent && unknown == other.unknown &&
+             emptyOrigins == other.emptyOrigins;
+    }
+    bool operator!=(const OccupancySummary &other) const {
+      return !(*this == other);
+    }
+  };
+  struct ValuePredicate {
+    enum Domain {
+      PointerNullness,
+      OwnerOccupancy,
+      OptionalEngagement,
+      ConditionalMove
+    };
+    struct ObjectSnapshot {
+      ObjectId object;
+      PSetType pset;
+      InvalidHist history;
+      std::optional<Location> nullOrigin;
+      std::optional<PointerValueSummary> pointer;
+      OccupancySummary occupancy;
+      std::optional<OccupancySummary> valueOccupancy;
+      SmallVector<ObjectId, 2> ownershipGroup;
+      bool valid = true;
+      bool ownershipValid = true;
+      Operation *expectedWrite = nullptr;
+      bool operator==(const ObjectSnapshot &other) const {
+        return object == other.object && pset == other.pset &&
+               history == other.history && nullOrigin == other.nullOrigin &&
+               pointer == other.pointer && occupancy == other.occupancy &&
+               valueOccupancy == other.valueOccupancy &&
+               ownershipGroup == other.ownershipGroup && valid == other.valid &&
+               ownershipValid == other.ownershipValid &&
+               expectedWrite == other.expectedWrite;
+      }
+    };
+    // Pointer values loaded before an insertion also participate in the
+    // conditional resource transfer. Keep their payloads separately from
+    // storage facts, so refinement cannot undo an intervening assignment.
+    struct PointerSnapshot {
+      Value value;
+      SmallVector<unsigned, 0> tuplePath;
+      std::optional<PointerValueSummary> pointer;
+      bool stored = false;
+      bool valid = true;
+      Operation *expectedWrite = nullptr;
+      bool operator==(const PointerSnapshot &other) const {
+        return value == other.value && tuplePath == other.tuplePath &&
+               pointer == other.pointer && stored == other.stored &&
+               valid == other.valid && expectedWrite == other.expectedWrite;
+      }
+    };
+    Domain domain = PointerNullness;
+    ObjectTargets objects;
+    bool trueMeansPresent = true;
+    Operation *conditionSite = nullptr;
+    SmallVector<ObjectSnapshot, 0> before;
+    SmallVector<ObjectSnapshot, 0> after;
+    SmallVector<PointerSnapshot, 0> pointersBefore;
+    SmallVector<PointerSnapshot, 0> pointersAfter;
+    bool operator==(const ValuePredicate &other) const {
+      return domain == other.domain && objects == other.objects &&
+             trueMeansPresent == other.trueMeansPresent &&
+             conditionSite == other.conditionSite && before == other.before &&
+             after == other.after && pointersBefore == other.pointersBefore &&
+             pointersAfter == other.pointersAfter;
+    }
+    bool operator!=(const ValuePredicate &other) const {
+      return !(*this == other);
+    }
+  };
+  using PredicatePtr = std::shared_ptr<const ValuePredicate>;
+  static bool equalPredicates(const PredicatePtr &a, const PredicatePtr &b) {
+    return a == b || (a && b && *a == *b);
+  }
+  struct ValueSummary {
+    std::optional<PointerValueSummary> pointer;
+    llvm::TinyPtrVector<ObjectId> readOrigins;
+    llvm::TinyPtrVector<ObjectId> xvalueOrigins;
+    SmallVector<ObjectTargets, 0> tupleElements;
+    std::vector<ValueSummary> tupleValues;
+    // Path copies share immutable predicates. Mutation creates a new payload,
+    // keeping snapshots independent without reserving one in every SSA value.
+    PredicatePtr predicate;
+    // A known scalar value is separate from a library predicate: it remains
+    // the value of this SSA evaluation even if the observed object changes.
+    std::optional<bool> booleanValue;
+    std::optional<OccupancySummary> objectOccupancy;
+    SmallVector<std::optional<ValuePredicate>, 0> elementPredicates;
+    bool externallyAliasedPointer = false;
+    bool unknown = false;
+    bool operator==(const ValueSummary &other) const {
+      return pointer == other.pointer &&
+             ArrayRef<ObjectId>(readOrigins) ==
+                 ArrayRef<ObjectId>(other.readOrigins) &&
+             ArrayRef<ObjectId>(xvalueOrigins) ==
+                 ArrayRef<ObjectId>(other.xvalueOrigins) &&
+             tupleElements == other.tupleElements &&
+             tupleValues == other.tupleValues &&
+             equalPredicates(predicate, other.predicate) &&
+             booleanValue == other.booleanValue &&
+             objectOccupancy == other.objectOccupancy &&
+             elementPredicates == other.elementPredicates &&
+             externallyAliasedPointer == other.externallyAliasedPointer &&
+             unknown == other.unknown;
+    }
+    bool operator!=(const ValueSummary &other) const {
+      return !(*this == other);
+    }
+  };
+  struct DiagnosticWitness {
+    Operation *operation = nullptr;
+    ObjectId object;
+    Location location;
+    DerefStyle style = Direct;
+    PSetType pset;
+    InvalidHist history;
+    std::optional<Location> nullOrigin;
+    DenseMap<ObjectId, unsigned> ownerGenerations;
+    DiagnosticWitness(Operation *operation, ObjectId object, Location location,
+                      DerefStyle style)
+        : operation(operation), object(object), location(location),
+          style(style) {}
+  };
+  struct PathState {
+    PMapType pmap;
+    DenseMap<ObjectId, InvalidHist> invalidHist;
+    PMapNullHistType nullHist;
+    DenseMap<Value, ValueSummary> values;
+    DenseMap<ObjectId, ValueSummary> storedValues;
+    DenseMap<ObjectId, OccupancySummary> occupancy;
+    SmallVector<ObjectId, 16> liveObjects;
+    SmallVector<DiagnosticWitness, 0> diagnostics;
+    DenseMap<ObjectId, Operation *> lastWrites;
+    DenseMap<ObjectId, SmallVector<Operation *, 2>> ownerMutations;
+    // An entry records holders proven to own the same resource on every path.
+    // Pointer occupancy is independent: an aliasing shared_ptr can own a
+    // resource while its stored pointer is null.
+    DenseMap<ObjectId, SmallVector<ObjectId, 2>> ownershipGroups;
+  };
+  struct ExceptionalState {
+    PathState state;
+    Type thrownType;
+    FlatSymbolRefAttr typeInfo;
+    ExceptionalState(PathState state, Type thrownType = {},
+                     FlatSymbolRefAttr typeInfo = {})
+        : state(std::move(state)), thrownType(thrownType), typeInfo(typeInfo) {}
+  };
+  struct GotoState {
+    PathState state;
+    StringAttr label;
+  };
+  struct FlowResult {
+    std::optional<PathState> normal;
+    SmallVector<PathState, 0> breaks;
+    SmallVector<PathState, 0> continues;
+    SmallVector<PathState, 0> returns;
+    SmallVector<ExceptionalState, 0> exceptions;
+    SmallVector<GotoState, 0> gotos;
+    FlowResult() = default;
+    FlowResult(PathState state) : normal(std::move(state)) {}
+  };
+  struct CallInfo {
+    Operation *op = nullptr;
+    FuncOp callee;
+    LifetimeFunctionAttr lifetime;
+    SmallVector<Value> args;
+    SmallVector<ValueSummary, 0> argValues;
+    ObjectTargets receiver;
+    bool mayThrow = false;
+  };
+  struct ObjectInfo {
+    enum Category { Scalar, Pointer, Owner, Aggregate, Record };
+    Type type;
+    Category category = Scalar;
+    bool callerOwned = false;
+    unsigned fieldDepth = 0;
+    ObjectId storageRoot;
+    bool unknownIncomingNullness = false;
+  };
+
+  DenseMap<ObjectId, ObjectInfo> objectInfo;
+  DenseMap<Value, ObjectId> canonicalObjects;
+  PathState *activeState = nullptr;
+  Operation *activeOperation = nullptr;
+  bool emittingWitnesses = false;
+  SmallVector<DiagnosticWitness, 16> functionWitnesses;
+  FlatSymbolRefAttr currentExceptionType;
+  Type currentExceptionIRType;
+
+  ObjectTargets resolveAddress(Value, const PathState &) const;
+  ValueSummary summarizeValue(Value, const PathState &) const;
+  void setValueSummary(PathState &, Value, ValueSummary);
+  void storeSummary(PathState &, const ObjectTargets &, const ValueSummary &);
+  OccupancySummary getOccupancy(const PathState &, const ObjectTargets &) const;
+  void setOccupancy(PathState &, const ObjectTargets &,
+                    const OccupancySummary &, Location);
+  void reinitializeObjects(PathState &, const ObjectTargets &, Location);
+  void invalidateOwnerContents(PathState &, const ObjectTargets &, Location);
+  void transferOwnerContents(PathState &, const ObjectTargets &,
+                             const ObjectTargets &, bool sharedCopy);
+  void releaseOwnerContents(PathState &, const ObjectTargets &, Location);
+  void endOwnerContents(PathState &, const ObjectTargets &, Location,
+                        InvalidStyle);
+  void retargetOwnerContents(PathState &, ObjectId, ObjectId,
+                             bool retainSource = false);
+  void detachOwner(PathState &, ObjectId);
+  void replaceOwnerContents(PathState &, const ObjectTargets &,
+                            const OccupancySummary &, Operation *);
+  void markMoved(PathState &, const ObjectTargets &, Location);
+  bool checkUse(PathState &, const ObjectTargets &, Location,
+                DerefStyle = Direct);
+  std::optional<ObjectInfo> getObjectInfo(ObjectId) const;
+  // A rejected model leaves state unchanged. A recognized model transfers
+  // it into the returned flow, so the caller must not use it again.
+  std::optional<FlowResult> modelLibraryCall(const CallInfo &, PathState &);
+  ValuePredicate makeConditionalMovePredicate(const PathState &,
+                                              const PathState &,
+                                              const ObjectTargets &,
+                                              Operation *);
+  void setConditionalMoveSite(PathState &, const ValuePredicate &);
+  void invalidatePredicates(PathState &, const ObjectTargets &);
+  void invalidateConditionalDependencies(PathState &, ObjectId, bool storage);
+  void invalidateConditionalOwnership(PathState &, ObjectId);
+  void copyConditionalPointerSnapshots(PathState &, Value source,
+                                       bool sourceStored, Value destination,
+                                       bool destinationStored);
+  static void
+  visitPredicates(PathState &,
+                  llvm::function_ref<void(std::optional<ValuePredicate> &)>);
+
+  void joinStateInto(PathState &, const PathState &);
+  PathState joinStates(ArrayRef<const PathState *>);
+  bool equivalentStates(const PathState &, const PathState &);
+  void mergeFlow(FlowResult &, FlowResult);
+  std::optional<bool> evaluateCondition(Value, const PathState &);
+  PathState refineCondition(Value, bool, PathState);
+  FlowResult transferOperation(Operation *, PathState);
+  LLVM_ATTRIBUTE_NOINLINE FlowResult transferOtherOperation(Operation *,
+                                                            PathState);
+  FlowResult analyzeRegion(Region &, PathState, bool scoped = false);
+  LLVM_ATTRIBUTE_NOINLINE FlowResult analyzeRegionImpl(Region &, PathState,
+                                                       bool scoped);
+  FlowResult analyzeBlock(Block &, PathState);
+  FlowResult analyzeLoop(LoopOpInterface, PathState);
+  FlowResult analyzeCall(Operation *, PathState);
+  FlowResult leaveScope(FlowResult, ArrayRef<ObjectId>, Location);
+  PathState finishRegionOperation(Operation *, ValueRange, PathState);
+  FlowResult leaveOperationScope(Operation *, FlowResult);
+  void indexObjects(FuncOp);
+  void emitWitnesses(const FlowResult &);
+  void recordWitness(PathState &, DiagnosticWitness);
+  void initializeObject(PathState &, ObjectId, Location);
+  void transferLoad(LoadOp, PathState &);
+  void transferStore(StoreOp, PathState &);
+  void forgetAggregateCallFields(PathState &, const ObjectTargets &);
+  void transferCopy(CopyOp, PathState &);
+  void checkAddressUse(Value, Location, PathState &);
+  void synchronizeSummaries(PathState &);
+  ValueSummary joinValues(const ValueSummary &, const ValueSummary &) const;
+  static void
+  visitValueSummary(ValueSummary &summary,
+                    llvm::function_ref<void(ValueSummary &)> visit) {
+    visit(summary);
+    for (auto &element : summary.tupleValues)
+      visitValueSummary(element, visit);
+  }
+  static void clearBooleanValues(ValueSummary &summary) {
+    visitValueSummary(summary, [](ValueSummary &value) {
+      value.booleanValue.reset();
+    });
+  }
+  static void clearStoredBooleanValues(PathState &state) {
+    for (auto &entry : state.storedValues)
+      clearBooleanValues(entry.second);
+  }
+  ObjectTargets joinTargets(const ObjectTargets &, const ObjectTargets &) const;
+
+  // The legacy lifetime rules operate on the currently installed map. Install
+  // all path-dependent maps together while applying one of those rules.
+  class StateGuard {
+    LifetimeCheckPass &pass;
+    PathState &state;
+    PMapType *oldMap;
+    PathState *oldState;
+    DenseMap<ObjectId, InvalidHist> oldHistory;
+    PMapNullHistType oldNullHistory;
+
+  public:
+    StateGuard(LifetimeCheckPass &pass, PathState &state)
+        : pass(pass), state(state), oldMap(pass.currPmap),
+          oldState(pass.activeState), oldHistory(std::move(pass.invalidHist)),
+          oldNullHistory(std::move(pass.pmapNullHist)) {
+      pass.currPmap = &state.pmap;
+      pass.activeState = &state;
+      pass.invalidHist = std::move(state.invalidHist);
+      pass.pmapNullHist = std::move(state.nullHist);
+    }
+    ~StateGuard() {
+      state.invalidHist = std::move(pass.invalidHist);
+      state.nullHist = std::move(pass.pmapNullHist);
+      pass.invalidHist = std::move(oldHistory);
+      pass.pmapNullHist = std::move(oldNullHistory);
+      pass.currPmap = oldMap;
+      pass.activeState = oldState;
+    }
+  };
 
   // FIXME: we probably don't need to track it at this level, perhaps
   // just tracking at the scope level should be enough?
@@ -395,13 +725,13 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
                     InvalidStyle invalidStyle = InvalidStyle::Unknown) {
     getPmap()[addr].clear();
     getPmap()[addr].insert(State::getNullPtr());
+    invalidHist.erase(addr);
     pmapNullHist[addr] = loc;
     // Also record in invalidHist for diagnostic history
     if (invalidStyle != InvalidStyle::Unknown)
       invalidHist[addr].add(addr, invalidStyle, loc);
   }
 
-  void joinPmaps(SmallVectorImpl<PMapType> &pmaps);
   void copyPset(mlir::Value dst, mlir::Value src);
 
   // Provides p1179's 'KILL' functionality. See implementation for more
@@ -417,23 +747,22 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   // for this owner type internal pointee's. For instance, this allows tracking
   // subsequent reuse of owner storage when a non-const use happens.
   DenseMap<mlir::Value, unsigned> owners;
-  void addOwner(mlir::Value o) {
-    assert(!owners.count(o) && "already tracked");
-    owners[o] = 0;
-  }
+  void addOwner(mlir::Value o) { owners.try_emplace(o, 0); }
   void incOwner(mlir::Value o) {
     assert(owners.count(o) && "entry expected");
-    owners[o]++;
+    if (activeState) {
+      auto &sites = activeState->ownerMutations[o];
+      if (!llvm::is_contained(sites, activeOperation))
+        sites.push_back(activeOperation);
+      owners[o] = sites.size();
+    } else {
+      ++owners[o];
+    }
   }
 
   // Aggregates and exploded fields.
   using ExplodedFieldsTy = llvm::SmallVector<mlir::Value, 4>;
   DenseMap<mlir::Value, ExplodedFieldsTy> aggregates;
-  void addAggregate(mlir::Value a, SmallVectorImpl<mlir::Value> &fields) {
-    assert(!aggregates.count(a) && "already tracked");
-    aggregates[a].swap(fields);
-  }
-
   // Useful helpers for debugging
   void printPset(PSetType &pset, llvm::raw_ostream &OS = llvm::errs());
   LLVM_DUMP_METHOD void dumpPmap(PMapType &pmap);
@@ -472,7 +801,6 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   // then/else regions, etc). Tracks the declaration of variables in the current
   // local scope.
   struct LexicalScopeContext {
-    unsigned Depth = 0;
     LexicalScopeContext() = delete;
 
     llvm::PointerUnion<mlir::Region *, mlir::Operation *> parent;
@@ -497,51 +825,6 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
     LLVM_DUMP_METHOD void dumpLocalValues();
   };
 
-  class LexicalScopeGuard {
-    LifetimeCheckPass &Pass;
-    LexicalScopeContext *OldVal = nullptr;
-
-  public:
-    LexicalScopeGuard(LifetimeCheckPass &p, LexicalScopeContext *L) : Pass(p) {
-      if (Pass.currScope) {
-        OldVal = Pass.currScope;
-        L->Depth++;
-      }
-      Pass.currScope = L;
-    }
-
-    LexicalScopeGuard(const LexicalScopeGuard &) = delete;
-    LexicalScopeGuard &operator=(const LexicalScopeGuard &) = delete;
-    LexicalScopeGuard &operator=(LexicalScopeGuard &&other) = delete;
-
-    void cleanup();
-    void restore() { Pass.currScope = OldVal; }
-    ~LexicalScopeGuard() {
-      cleanup();
-      restore();
-    }
-  };
-
-  class PmapGuard {
-    LifetimeCheckPass &Pass;
-    PMapType *OldVal = nullptr;
-
-  public:
-    PmapGuard(LifetimeCheckPass &lcp, PMapType *L) : Pass(lcp) {
-      if (Pass.currPmap) {
-        OldVal = Pass.currPmap;
-      }
-      Pass.currPmap = L;
-    }
-
-    PmapGuard(const PmapGuard &) = delete;
-    PmapGuard &operator=(const PmapGuard &) = delete;
-    PmapGuard &operator=(PmapGuard &&other) = delete;
-
-    void restore() { Pass.currPmap = OldVal; }
-    ~PmapGuard() { restore(); }
-  };
-
   LexicalScopeContext *currScope = nullptr;
 };
 } // namespace
@@ -552,6 +835,21 @@ static std::string getVarNameFromValue(mlir::Value v) {
     auto blockArg = cast<BlockArgument>(v);
     if (!blockArg.getOwner()->isEntryBlock())
       return "<unnamed>";
+    bool isReferenceParameter = false;
+    if (auto function = dyn_cast<FuncOp>(blockArg.getOwner()->getParentOp())) {
+      auto metadata = function.getLifetimeAttr();
+      if (metadata && metadata.hasParameterInfo())
+        for (unsigned i = 0; i < metadata.getNumParams(); ++i)
+          isReferenceParameter |=
+              metadata.getParamOperandIndex(i) == blockArg.getArgNumber() &&
+              metadata.getParameterKinds().asArrayRef()[i] != 0;
+    }
+    if (isReferenceParameter)
+      for (Operation *user : v.getUsers())
+        if (auto store = dyn_cast<StoreOp>(user))
+          if (store.getValue() == v)
+            if (auto slot = store.getAddr().getDefiningOp<AllocaOp>())
+              return slot.getName().str();
     llvm::SmallString<128> finalName;
     llvm::raw_svector_ostream Out(finalName);
     Out << "fn_arg:" << blockArg.getArgNumber();
@@ -594,31 +892,6 @@ static Location getEndLocForHist(Operation *op) {
   return op->getLoc();
 }
 
-static Location getEndLocIf(IfOp ifOp, Region *R) {
-  assert(ifOp && "what other regions create their own scope?");
-  if (&ifOp.getThenRegion() == R)
-    return getEndLoc(ifOp.getLoc());
-  return getEndLoc(ifOp.getLoc(), /*idx=*/3);
-}
-
-static Location getEndLocForHist(Region *R) {
-  auto parentOp = R->getParentOp();
-  if (isa<IfOp>(parentOp))
-    return getEndLocIf(cast<IfOp>(parentOp), R);
-  if (isa<FuncOp>(parentOp))
-    return getEndLoc(parentOp->getLoc());
-  llvm_unreachable("what other regions create their own scope?");
-}
-
-static Location getEndLocForHist(LifetimeCheckPass::LexicalScopeContext &lsc) {
-  assert(!lsc.parent.isNull() && "shouldn't be null");
-  if (auto r = mlir::dyn_cast<Region *>(lsc.parent))
-    return getEndLocForHist(r);
-  assert(mlir::isa<Operation *>(lsc.parent) &&
-         "Only support operation beyond this point");
-  return getEndLocForHist(mlir::cast<Operation *>(lsc.parent));
-}
-
 void LifetimeCheckPass::killInPset(mlir::Value ptrKey, const State &s,
                                    InvalidStyle invalidStyle,
                                    mlir::Location loc,
@@ -642,6 +915,34 @@ void LifetimeCheckPass::kill(const State &s, InvalidStyle invalidStyle,
   if (invalidStyle == InvalidStyle::EndOfScope)
     extraVal = v;
 
+  // Ending the holder's storage does not end a shared resource while another
+  // proven holder remains alive. Retarget its borrowers before killing the
+  // storage itself; the recursive OwnedBy kill cannot re-enter this branch.
+  if (activeState && s.isLocalValue() && owners.count(v))
+    endOwnerContents(*activeState, ObjectTargets{{v}}, loc, invalidStyle);
+
+  // Captured SSA pointer values continue to refer to the same storage even
+  // after their source slot changes. Invalidate these snapshots along with
+  // the pointer map, including values loaded before an owner mutation.
+  if (activeState) {
+    invalidateConditionalDependencies(*activeState, v, s.isLocalValue());
+    auto invalidate = [&](ValueSummary &value) {
+      if (!value.pointer)
+        return;
+      bool affected = llvm::is_contained(value.pointer->borrowedOwners, v) ||
+                      (s.isLocalValue() &&
+                       llvm::is_contained(value.pointer->targets.objects, v));
+      if (affected) {
+        value.pointer->targets.mayBeInvalid = true;
+        value.pointer->invalidHistory.add(v, invalidStyle, loc, extraVal);
+      }
+    };
+    for (auto &entry : activeState->values)
+      visitValueSummary(entry.second, invalidate);
+    for (auto &entry : activeState->storedValues)
+      visitValueSummary(entry.second, invalidate);
+  }
+
   for (auto &mapEntry : getPmap()) {
     auto ptr = mapEntry.first;
 
@@ -660,85 +961,34 @@ void LifetimeCheckPass::kill(const State &s, InvalidStyle invalidStyle,
 
   // Delete the local value from pmap, since its scope has ended.
   if (invalidStyle == InvalidStyle::EndOfScope) {
-    owners.erase(v);
-    ptrs.erase(v);
-    tasks.erase(v);
-    aggregates.erase(v);
+    if (activeState)
+      llvm::erase(activeState->liveObjects, v);
   }
-}
-
-void LifetimeCheckPass::LexicalScopeGuard::cleanup() {
-  auto *localScope = Pass.currScope;
-  for (auto pointee : localScope->localValues)
-    Pass.kill(State::getLocalValue(pointee), InvalidStyle::EndOfScope,
-              getEndLocForHist(*localScope));
-
-  // Catch interesting dangling references out of returns.
-  for (auto l : localScope->localRetLambdas)
-    Pass.checkPointerDeref(l.first, l.second, DerefStyle::RetLambda);
-}
-
-void LifetimeCheckPass::checkBlock(Block &block) {
-  // Block main role is to hold a list of Operations.
-  for (Operation &op : block.getOperations())
-    checkOperation(&op);
-}
-
-void LifetimeCheckPass::checkRegion(Region &region) {
-  for (Block &block : region.getBlocks())
-    checkBlock(block);
-}
-
-void LifetimeCheckPass::checkRegionWithScope(Region &region) {
-  // Add a new scope. Note that as part of the scope cleanup process
-  // we apply section 2.3 KILL(x) functionality, turning relevant
-  // references invalid.
-  LexicalScopeContext lexScope{&region};
-  LexicalScopeGuard scopeGuard{*this, &lexScope};
-  for (Block &block : region.getBlocks())
-    checkBlock(block);
 }
 
 void LifetimeCheckPass::checkFunc(cir::FuncOp fnOp) {
   currFunc = fnOp;
-  // FIXME: perhaps this should be a function pass, but for now make
-  // sure we reset the state before looking at other functions.
-  if (currPmap)
-    getPmap().clear();
   pmapNullHist.clear();
   invalidHist.clear();
-  emittedDiagnostics.clear();
-
-  // Create a new pmap for this function.
-  PMapType localPmap{};
-  PmapGuard pmapGuard{*this, &localPmap};
-
-  // Add a new scope. Note that as part of the scope cleanup process
-  // we apply section 2.3 KILL(x) functionality, turning relevant
-  // references invalid.
-  for (Region &region : fnOp->getRegions())
-    checkRegionWithScope(region);
-
-  // FIXME: store the pmap result for this function, we
-  // could do some interesting IPA stuff using this info.
-  currFunc.reset();
-}
-
-// The join operation between pmap as described in section 2.3.
-//
-//  JOIN({pmap1,...,pmapN}) =>
-//  { (p, pset1(p) U ... U psetN(p) | (p,*) U pmap1 U ... U pmapN }.
-//
-void LifetimeCheckPass::joinPmaps(SmallVectorImpl<PMapType> &pmaps) {
-  for (auto &mapEntry : getPmap()) {
-    auto &val = mapEntry.first;
-
-    PSetType joinPset;
-    for (auto &pmapOp : pmaps)
-      llvm::set_union(joinPset, pmapOp[val]);
-
-    getPmap()[val] = joinPset;
+  emittedObjectDiagnostics.clear();
+  functionWitnesses.clear();
+  indexObjects(fnOp);
+  PathState initial;
+  LexicalScopeContext scope{fnOp.getOperation()};
+  llvm::SaveAndRestore<LexicalScopeContext *> scopeGuard(currScope, &scope);
+  for (auto entry : objectInfo)
+    if (entry.second.callerOwned)
+      initializeObject(initial, entry.first, fnOp.getLoc());
+  auto result = analyzeRegion(fnOp.getBody(), std::move(initial));
+  if (!result.gotos.empty()) {
+    mlir::emitError(
+        fnOp.getLoc(),
+        "unsupported jump into a nested region in lifetime analysis");
+    signalPassFailure();
   }
+  result = leaveOperationScope(fnOp, std::move(result));
+  emitWitnesses(result);
+  currFunc.reset();
 }
 
 void LifetimeCheckPass::copyPset(mlir::Value dst, mlir::Value src) {
@@ -766,114 +1016,6 @@ void LifetimeCheckPass::copyPset(mlir::Value dst, mlir::Value src) {
   getPmap()[dst] = std::move(pset);
 }
 
-void LifetimeCheckPass::checkLoop(LoopOpInterface loopOp) {
-  // 2.4.9. Loops
-  //
-  // A loop is treated as if it were the first two loop iterations unrolled
-  // using an if. For example:
-  //
-  //  for (/*init*/; /*cond*/; /*incr*/)
-  //   { /*body*/ }
-  //
-  // is treated as:
-  //
-  //  if (/*init*/; /*cond*/)
-  //   { /*body*/; /*incr*/ }
-  //  if (/*cond*/)
-  //   { /*body*/ }
-  //
-  // See checkIf for additional explanations.
-  llvm::SmallVector<PMapType, 4> pmapOps;
-  llvm::SmallVector<Region *, 4> regionsToCheck;
-
-  auto setupLoopRegionsToCheck = [&](bool isSubsequentTaken = false) {
-    regionsToCheck = loopOp.getRegionsInExecutionOrder();
-    // Drop step if it exists and we are not checking the subsequent taken.
-    if (auto *step = loopOp.maybeGetStep(); step && !isSubsequentTaken)
-      llvm::erase(regionsToCheck, step);
-    // Current CIR may append a per-iteration cleanup after the step. Preserve
-    // that cleanup on normal paths instead of accidentally dropping it.
-    if (auto *cleanup = loopOp.maybeGetCleanup()) {
-      auto kind = loopOp.maybeGetCleanupKind();
-      if (kind && !kind.isNormal())
-        llvm::erase(regionsToCheck, cleanup);
-    }
-  };
-
-  // From 2.4.9 "Note":
-  //
-  // There are only three paths to analyze:
-  // (1) never taken (the loop body was not entered)
-  pmapOps.push_back(getPmap());
-
-  // (2) first taken (the first pass through the loop body, which begins
-  // with the loop entry pmap)
-  PMapType loopExitPmap;
-  {
-    // Intentional copy from loop entry map
-    loopExitPmap = getPmap();
-    PmapGuard pmapGuard{*this, &loopExitPmap};
-    setupLoopRegionsToCheck();
-    for (auto *r : regionsToCheck)
-      checkRegion(*r);
-    pmapOps.push_back(loopExitPmap);
-  }
-
-  // (3) and subsequent taken (second or later iteration, which begins with the
-  // loop body exit pmap and so takes into account any invalidations performed
-  // in the loop body on any path that could affect the next loop).
-  //
-  // This ensures that a subsequent loop iteration does not use a Pointer that
-  // was invalidated during a previous loop iteration.
-  //
-  // Because this analysis gives the same answer for each block of code (always
-  // converges), all loop iterations after the first get the same answer and
-  // so we only need to consider the second iteration, and so the analysis
-  // algorithm remains linear, single-pass. As an optimization, if the loop
-  // entry pmap is the same as the first loop body exit pmap, there is no need
-  // to perform the analysis on the second loop iteration; the answer will be
-  // the same.
-  if (getPmap() != loopExitPmap) {
-    // Intentional copy from first taken loop exit pmap
-    PMapType otherTakenPmap = loopExitPmap;
-    PmapGuard pmapGuard{*this, &otherTakenPmap};
-    setupLoopRegionsToCheck(/*isSubsequentTaken=*/true);
-    for (auto *r : regionsToCheck)
-      checkRegion(*r);
-    pmapOps.push_back(otherTakenPmap);
-  }
-
-  joinPmaps(pmapOps);
-}
-
-void LifetimeCheckPass::checkCoroutine(CoroutineOp coroutineOp) {
-  // Current CIR separates coroutine setup and the user body into regions.
-  // Preserve the donor's normal-execution approximation across these regions;
-  // the destroy region is a separate suspended-frame destruction path.
-  checkRegion(coroutineOp.getInitialSuspend());
-  checkRegion(coroutineOp.getBody());
-  checkRegion(coroutineOp.getFinalSuspend());
-  checkRegion(coroutineOp.getExit());
-}
-
-void LifetimeCheckPass::checkAwait(AwaitOp awaitOp) {
-  // Pretty conservative: assume all regions execute
-  // sequencially.
-  //
-  // FIXME: use branch interface here and only tackle
-  // the necessary regions.
-  llvm::SmallVector<PMapType, 4> pmapOps;
-
-  for (Region &r : awaitOp->getRegions()) {
-    PMapType regionPmap = getPmap();
-    PmapGuard pmapGuard{*this, &regionPmap};
-    checkRegion(r);
-    pmapOps.push_back(regionPmap);
-  }
-
-  joinPmaps(pmapOps);
-}
-
 void LifetimeCheckPass::checkReturn(ReturnOp retOp) {
   // Upon return invalidate all local values. Since some return
   // values might depend on other local address, check for the
@@ -894,188 +1036,9 @@ void LifetimeCheckPass::checkReturn(ReturnOp retOp) {
   if (!loadOp.getAddr().getDefiningOp<cir::AllocaOp>())
     return;
 
-  // Keep track of interesting lambda.
-  assert(!currScope->localRetLambdas.count(loadOp.getAddr()) &&
-         "lambda already returned?");
-  currScope->localRetLambdas.insert(
-      std::make_pair(loadOp.getAddr(), loadOp.getLoc()));
-}
-
-// Find whether a path can reach a case's yield. Scope and if operations can
-// contain a return, break, or continue that also leaves the enclosing case.
-// Do not descend into nested loops or switches: their breaks are local.
-static bool canReachCaseFallthrough(Region &region) {
-  if (region.empty())
-    return true;
-  Block *block = &region.front();
-  while (true) {
-    for (Operation &op : *block) {
-      if (isa<ReturnOp, BreakOp, ContinueOp>(op))
-        return false;
-      if (auto scope = dyn_cast<ScopeOp>(op)) {
-        if (!canReachCaseFallthrough(scope.getRegion()))
-          return false;
-      } else if (auto cleanup = dyn_cast<CleanupScopeOp>(op)) {
-        if (!canReachCaseFallthrough(cleanup.getBodyRegion()) ||
-            (cleanup.getCleanupKindAttr().isNormal() &&
-             !canReachCaseFallthrough(cleanup.getCleanupRegion())))
-          return false;
-      } else if (auto ifOp = dyn_cast<IfOp>(op)) {
-        if (!canReachCaseFallthrough(ifOp.getThenRegion()) &&
-            !canReachCaseFallthrough(ifOp.getElseRegion()))
-          return false;
-      }
-    }
-    if (auto branch = dyn_cast<cir::BrOp>(block->getTerminator())) {
-      block = branch.getDest();
-      continue;
-    }
-    return isa<YieldOp>(block->getTerminator());
-  }
-}
-
-void LifetimeCheckPass::checkSwitch(SwitchOp switchOp) {
-  // 2.4.7. A switch(cond) is treated as if it were an equivalent series of
-  // non-nested if statements with single evaluation of cond; for example:
-  //
-  //    switch (a) {
-  //      case 1:/*1*/
-  //      case 2:/*2*/ break;
-  //      default:/*3*/
-  //    }
-  //
-  // is treated as:
-  //
-  //    if (auto& a=a; a==1) {/*1*/}
-  //    else if (a==1 || a==2) {/*2*/}
-  //    else {/*3*/}.
-  //
-  // See checkIf for additional explanations.
-  llvm::SmallVector<PMapType, 2> pmapOps;
-
-  // Control flow is validated before analysis. An empty switch leaves the
-  // incoming pmap unchanged.
-  llvm::SmallVector<CaseOp> cases;
-  if (!switchOp.isSimpleForm(cases))
-    return;
-
-  // Without a default, the condition may match none of the cases.
-  if (llvm::none_of(cases, [](CaseOp caseOp) {
-        return caseOp.getKind() == CaseOpKind::Default;
-      }))
-    pmapOps.push_back(getPmap());
-
-  for (unsigned regionCurrent = 0, regionPastEnd = cases.size();
-       regionCurrent != regionPastEnd; ++regionCurrent) {
-    // Intentional pmap copy, basis to start new path.
-    PMapType locaCasePmap = getPmap();
-    PmapGuard pmapGuard{*this, &locaCasePmap};
-
-    // At any given point, fallbacks (if not empty) will increase the
-    // number of control-flow possibilities. For each region ending up
-    // with a fallback, keep computing the pmap until we hit a region
-    // that has a non-fallback terminator for the region.
-    unsigned idx = regionCurrent;
-    while (idx < regionPastEnd) {
-      // Note that for 'if' regions we use checkRegionWithScope, since
-      // there are lexical scopes associated with each region, this is
-      // not the case for switch's.
-      checkRegion(cases[idx].getRegion());
-      if (!canReachCaseFallthrough(cases[idx].getRegion()))
-        break;
-      idx++;
-    }
-    pmapOps.push_back(locaCasePmap);
-  }
-
-  joinPmaps(pmapOps);
-}
-
-// Only discard branch state when structured control flow proves that it returns
-// from the function. Break/continue still contribute to the surrounding loop's
-// state, and arbitrary CFG or symbolic jumps require a more complete analysis.
-enum class RegionExit { Fallthrough, Return, Unknown };
-
-static RegionExit getRegionExit(Region &region) {
-  if (region.empty())
-    return RegionExit::Fallthrough;
-
-  // CIRGen can leave an empty, unreachable continuation after a return in a
-  // cleanup scope. Other multi-block regions are outside this approximation.
-  for (Block &block : llvm::drop_begin(region))
-    if (!block.hasNoPredecessors() || !llvm::hasSingleElement(block) ||
-        !isa<YieldOp>(block.front()))
-      return RegionExit::Unknown;
-
-  for (Operation &op : region.front()) {
-    if (isa<ReturnOp>(op))
-      return RegionExit::Return;
-    if (isa<YieldOp>(op))
-      return RegionExit::Fallthrough;
-
-    RegionExit exit = RegionExit::Fallthrough;
-    if (auto scope = dyn_cast<ScopeOp>(op)) {
-      exit = getRegionExit(scope.getRegion());
-    } else if (auto cleanup = dyn_cast<CleanupScopeOp>(op)) {
-      exit = getRegionExit(cleanup.getBodyRegion());
-      if (exit != RegionExit::Unknown &&
-          cleanup.getCleanupKindAttr().isNormal()) {
-        auto cleanupExit = getRegionExit(cleanup.getCleanupRegion());
-        if (cleanupExit != RegionExit::Fallthrough)
-          exit = cleanupExit;
-      }
-    } else if (auto nestedIf = dyn_cast<IfOp>(op)) {
-      auto thenExit = getRegionExit(nestedIf.getThenRegion());
-      auto elseExit = getRegionExit(nestedIf.getElseRegion());
-      if (thenExit == RegionExit::Unknown || elseExit == RegionExit::Unknown)
-        exit = RegionExit::Unknown;
-      else if (thenExit == RegionExit::Return && elseExit == RegionExit::Return)
-        exit = RegionExit::Return;
-    } else if (op.hasTrait<OpTrait::IsTerminator>() || op.getNumRegions() ||
-               isa<LabelOp>(op)) {
-      return RegionExit::Unknown;
-    }
-    if (exit != RegionExit::Fallthrough)
-      return exit;
-  }
-  return RegionExit::Fallthrough;
-}
-
-void LifetimeCheckPass::checkIf(IfOp ifOp) {
-  // Both then and else create their own lexical scopes, take that into account
-  // while checking then/else.
-  //
-  // This is also the moment where pmaps are joined because flow forks:
-  //    pmap(ifOp) = JOIN( pmap(then), pmap(else) )
-  //
-  // To that intent the pmap is copied out before checking each region and
-  // pmap(ifOp) computed after analysing both paths.
-  llvm::SmallVector<PMapType, 2> pmapOps;
-
-  {
-    PMapType localThenPmap = getPmap();
-    PmapGuard pmapGuard{*this, &localThenPmap};
-    checkRegionWithScope(ifOp.getThenRegion());
-    if (getRegionExit(ifOp.getThenRegion()) != RegionExit::Return)
-      pmapOps.push_back(localThenPmap);
-  }
-
-  // In case there's no 'else' branch, the 'else' pmap is the same as
-  // prior to the if condition.
-  if (!ifOp.getElseRegion().empty()) {
-    PMapType localElsePmap = getPmap();
-    PmapGuard pmapGuard{*this, &localElsePmap};
-    checkRegionWithScope(ifOp.getElseRegion());
-    if (getRegionExit(ifOp.getElseRegion()) != RegionExit::Return)
-      pmapOps.push_back(localElsePmap);
-  } else {
-    pmapOps.push_back(getPmap());
-  }
-
-  // There is no reachable continuation if both arms return. Keep the incoming
-  // map for the current region traversal instead of producing empty psets.
-  if (!pmapOps.empty())
-    joinPmaps(pmapOps);
+  // A fixed point can revisit the same return slot. Its static source site
+  // remains the same, while each path carries its own captured lifetimes.
+  currScope->localRetLambdas.try_emplace(loadOp.getAddr(), loadOp.getLoc());
 }
 
 bool LifetimeCheckPass::isOwnerType(mlir::Type ty) {
@@ -1209,103 +1172,6 @@ bool LifetimeCheckPass::isPointerType(mlir::Type t) {
     return false;
   auto lifetime = cir::getLifetimeRecord(recordType, theModule);
   return lifetime && lifetime.getPointer();
-}
-
-void LifetimeCheckPass::classifyAndInitTypeCategories(mlir::Value addr,
-                                                      mlir::Type t,
-                                                      mlir::Location loc,
-                                                      unsigned nestLevel) {
-  getPmap()[addr] = {};
-
-  enum TypeCategory {
-    Unknown = 0,
-    SharedOwner = 1,
-    Owner = 1 << 2,
-    Pointer = 1 << 3,
-    Indirection = 1 << 4,
-    Aggregate = 1 << 5,
-    Value = 1 << 6,
-  };
-
-  auto localStyle = [&]() {
-    if (isPointerType(t))
-      return TypeCategory::Pointer;
-    if (isOwnerType(t))
-      return TypeCategory::Owner;
-    if (isAggregateType(this, t))
-      return TypeCategory::Aggregate;
-    return TypeCategory::Value;
-  }();
-
-  switch (localStyle) {
-  case TypeCategory::Pointer:
-    // 2.4.2 - When a non-parameter non-member Pointer p is declared, add
-    // (p, {invalid}) to pmap.
-    ptrs.insert(addr);
-    markPsetInvalid(addr, InvalidStyle::NotInitialized, loc);
-    break;
-  case TypeCategory::Owner:
-    // 2.4.2 - When a local Owner x is declared, add (x, {x__1'}) to pmap.
-    addOwner(addr);
-    getPmap()[addr].insert(State::getOwnedBy(addr));
-    currScope->localValues.insert(addr);
-    break;
-  case TypeCategory::Aggregate: {
-    // 2.1 - Aggregates are types we will “explode” (consider memberwise) at
-    // local scopes, because the function can operate on the members directly.
-
-    // TODO: only track first level of aggregates subobjects for now, get some
-    // data before we increase this.
-    if (nestLevel > 1)
-      break;
-
-    // Map values for members to it's index in the aggregate.
-    auto members = mlir::cast<cir::RecordType>(t).getMembers();
-    llvm::SmallVector<mlir::Value, 4> fieldVals;
-    fieldVals.assign(members.size(), {});
-
-    // Go through uses of the alloca via `cir.record_element_addr`, and
-    // track only the fields that are actually used.
-    std::for_each(addr.use_begin(), addr.use_end(), [&](mlir::OpOperand &use) {
-      auto op = dyn_cast<cir::GetMemberOp>(use.getOwner());
-      if (!op)
-        return;
-
-      auto eltAddr = op.getResult();
-      // If nothing is using this GetMemberOp, don't bother since
-      // it could lead to even more noisy outcomes.
-      if (eltAddr.use_empty())
-        return;
-
-      auto eltTy = eltAddr.getType().getPointee();
-
-      // Classify exploded types. Keep alloca original location.
-      classifyAndInitTypeCategories(eltAddr, eltTy, loc, ++nestLevel);
-      fieldVals[op.getIndex()] = eltAddr;
-    });
-
-    // In case this aggregate gets initialized at once, the fields need
-    // to be mapped to the elements values.
-    addAggregate(addr, fieldVals);
-
-    // There might be pointers to this aggregate, so also make a value
-    // for it.
-    LLVM_FALLTHROUGH;
-  }
-  case TypeCategory::Value: {
-    // 2.4.2 - When a local Value x is declared, add (x, {x}) to pmap.
-    getPmap()[addr].insert(State::getLocalValue(addr));
-    currScope->localValues.insert(addr);
-    break;
-  }
-  default:
-    llvm_unreachable("NYI");
-  }
-}
-
-void LifetimeCheckPass::checkAlloca(AllocaOp allocaOp) {
-  classifyAndInitTypeCategories(allocaOp.getAddr(), allocaOp.getAllocaType(),
-                                allocaOp.getLoc(), /*nestLevel=*/0);
 }
 
 void LifetimeCheckPass::checkCoroTaskStore(StoreOp storeOp) {
@@ -1545,119 +1411,6 @@ void LifetimeCheckPass::updatePointsTo(mlir::Value addr, mlir::Value data,
   // What should we add next?
 }
 
-void LifetimeCheckPass::forgetAggregateCallFields(mlir::Value address) {
-  if (!aggregates.count(address))
-    return;
-  // The baseline may index several get_member operations for one field.
-  // Refresh every already-tracked identity of the overwritten storage.
-  for (mlir::OpOperand &use : address.getUses()) {
-    auto member = dyn_cast<cir::GetMemberOp>(use.getOwner());
-    if (!member)
-      continue;
-    mlir::Value field = member.getResult();
-    if (ptrs.count(field)) {
-      // Empty means unknown contents, not a non-null or global pointer.
-      getPmap()[field].clear();
-      invalidHist.erase(field);
-      pmapNullHist.erase(field);
-    } else {
-      forgetAggregateCallFields(field);
-    }
-  }
-}
-
-void LifetimeCheckPass::checkStore(StoreOp storeOp) {
-  auto addr = storeOp.getAddr();
-
-  // Decompose store's to aggregates into multiple updates to individual fields.
-  if (aggregates.count(addr)) {
-    auto data = storeOp.getValue();
-    if (data.getDefiningOp<cir::ConstantOp>()) {
-      // Keep the known pointer contents supplied by a constant record.
-      updatePointsTo(addr, data, data.getLoc());
-    } else if (data.getDefiningOp<cir::CallOp>()) {
-      forgetAggregateCallFields(addr);
-    }
-    return;
-  }
-
-  // Check if storing a moved-from value
-  checkMovedFromValue(storeOp);
-
-  // The bulk of the check is done on top of store to pointer categories,
-  // which usually represent the most common case.
-  //
-  // We handle some special local values, like coroutine tasks and lambdas,
-  // which could be holding references to things with dangling lifetime.
-  if (!ptrs.count(addr)) {
-    if (currScope->localTempTasks.count(storeOp.getValue()))
-      checkCoroTaskStore(storeOp);
-    else
-      checkLambdaCaptureStore(storeOp);
-    return;
-  }
-
-  // Only handle ptrs from here on.
-  updatePointsTo(addr, storeOp.getValue(), storeOp.getValue().getLoc());
-}
-
-void LifetimeCheckPass::checkMovedFromValue(StoreOp storeOp) {
-  auto data = storeOp.getValue();
-  auto loadOp = data.getDefiningOp<cir::LoadOp>();
-  if (!loadOp)
-    return;
-
-  auto srcAddr = loadOp.getAddr();
-
-  // Check if source is moved-from
-  if (isValueTypeMovedFrom(srcAddr)) {
-    // Diagnose the read at the same location as checkLoad. A return-slot store
-    // can have a different location and must not diagnose the same read twice.
-    checkPointerDeref(srcAddr, loadOp.getLoc());
-    return; // Early return for consistency with other checkPointerDeref usages
-  }
-
-  // Only an explicitly recorded xvalue read establishes scalar move intent
-  // (e.g. int b(std::move(a))). Ordinary copies have the same load/store shape.
-  auto destAddr = storeOp.getAddr();
-  auto allocaOp = destAddr.getDefiningOp<cir::AllocaOp>();
-  if (!allocaOp)
-    return;
-
-  if (!isValueType(destAddr) || !getPmap().count(srcAddr) ||
-      !isValueType(srcAddr))
-    return;
-
-  if (!hasInvalidState(srcAddr) && !loadOp.getIsDeref() &&
-      loadOp.getSourceIsXvalue()) {
-    markPointerOrValueTypeAsMovedFrom(
-        srcAddr, storeOp.getLoc()); // Use helper for consistency
-  }
-}
-
-void LifetimeCheckPass::checkLoad(LoadOp loadOp) {
-  auto addr = loadOp.getAddr();
-  // Only interested in checking deference on top of pointer types.
-  // Note that usually the use of the invalid address happens at the
-  // load or store using the result of this loadOp.
-  if (!getPmap().count(addr))
-    return;
-
-  // For pointer types, only check on deref
-  if (ptrs.count(addr)) {
-    if (!loadOp.getIsDeref())
-      return;
-    checkPointerDeref(addr, loadOp.getLoc());
-    return;
-  }
-
-  // For value types (not owners, not pointers), check if moved-from
-  if (isValueTypeMovedFrom(addr)) {
-    checkPointerDeref(addr, loadOp.getLoc());
-    return; // Keep checkPointerDeref at end
-  }
-}
-
 void LifetimeCheckPass::emitInvalidHistory(mlir::InFlightDiagnostic &D,
                                            mlir::Value histKey,
                                            mlir::Location warningLoc,
@@ -1717,6 +1470,26 @@ bool LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
   bool hasInvalid = getPmap()[addr].count(State::getInvalid());
   bool hasNullptr = getPmap()[addr].count(State::getNullPtr());
 
+  if (activeState && !emittingWitnesses) {
+    bool invalid = hasInvalid || hasNullptr;
+    if (derefStyle == UseAfterMove && isSkippableTemporary(addr))
+      invalid = false;
+    if (derefStyle == NullableCallParam && !hasInvalid)
+      invalid = false;
+    if (invalid || opts.emitRemarkPsetAlways()) {
+      DiagnosticWitness witness(activeOperation, addr, loc, derefStyle);
+      witness.pset = getPmap()[addr];
+      witness.history = invalidHist.lookup(addr);
+      witness.nullOrigin = pmapNullHist.lookup(addr);
+      for (const State &fact : witness.pset)
+        if (fact.isOwnedBy())
+          witness.ownerGenerations[fact.getData()] =
+              activeState->ownerMutations.lookup(fact.getData()).size();
+      recordWitness(*activeState, std::move(witness));
+    }
+    return invalid;
+  }
+
   auto emitPsetRemark = [&] {
     llvm::SmallString<128> psetStr;
     llvm::raw_svector_ostream Out(psetStr);
@@ -1749,14 +1522,14 @@ bool LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
 
   // Do not emit the same warning twice or more (check AFTER we know there's an
   // error)
-  if (emittedDiagnostics.count(loc))
+  if (emittedObjectDiagnostics[addr].count(loc))
     return true; // Already reported
 
   // Ok, filtered out questionable warnings, take the bad path leading to this
   // deference point and diagnose it.
   auto varName = getVarNameFromValue(addr);
   auto D = emitWarning(loc);
-  emittedDiagnostics.insert(loc);
+  emittedObjectDiagnostics[addr].insert(loc);
 
   bool isValueType = this->isValueType(
       addr); // Use helper method, keep lowerCamel style for locals
@@ -1784,9 +1557,8 @@ bool LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
     emitInvalidHistory(D, addr, loc, derefStyle);
 
   if (hasNullptr && opts.emitHistoryNull()) {
-    assert(pmapNullHist.count(addr) && "expected nullptr hist");
-    auto &note = pmapNullHist[addr];
-    D.attachNote(*note) << "'nullptr' invalidated here";
+    if (auto note = pmapNullHist.lookup(addr))
+      D.attachNote(*note) << "'nullptr' invalidated here";
   }
 
   if (!psetRemarkEmitted && opts.emitRemarkPsetInvalid())
@@ -1819,6 +1591,12 @@ mlir::Value LifetimeCheckPass::getThisParamPointerCategory(CallOp callOp) {
   if (callOp.getNumArgOperands() == 0)
     return {};
   auto thisptr = callOp.getArgOperand(0);
+  if (activeState) {
+    auto targets = resolveAddress(thisptr, *activeState);
+    if (targets.isDefinite() && ptrs.count(targets.objects.front()))
+      return targets.objects.front();
+    return {};
+  }
   if (ptrs.count(thisptr))
     return thisptr;
   if (auto loadOp = thisptr.getDefiningOp<cir::LoadOp>()) {
@@ -1833,6 +1611,12 @@ mlir::Value LifetimeCheckPass::getThisParamOwnerCategory(CallOp callOp) {
   if (callOp.getNumArgOperands() == 0)
     return {};
   auto thisptr = callOp.getArgOperand(0);
+  if (activeState) {
+    auto targets = resolveAddress(thisptr, *activeState);
+    if (targets.isDefinite() && owners.count(targets.objects.front()))
+      return targets.objects.front();
+    return {};
+  }
   if (owners.count(thisptr))
     return thisptr;
   if (auto loadOp = thisptr.getDefiningOp<cir::LoadOp>()) {
@@ -1881,103 +1665,6 @@ void LifetimeCheckPass::checkMoveAssignment(CallOp callOp,
     // 2.4.2 - It is an error to use a moved-from object.
     markOwnerAsMovedFrom(src, callOp.getLoc());
   }
-}
-
-void LifetimeCheckPass::checkMoveInCallArgs(
-    CallOp callOp, std::optional<unsigned> transferredArg) {
-  if (!callOp.getCallee())
-    return;
-
-  auto calleeFuncOp = getCalleeFromSymbol(*moduleSymbols, *callOp.getCallee());
-  if (!calleeFuncOp)
-    return;
-  auto lifetime = calleeFuncOp.getLifetimeAttr();
-  if (!lifetime || !lifetime.hasParameterInfo())
-    return;
-
-  // Source parameters need not occupy consecutive CIR operands: an implicit
-  // object or a pass_object_size argument can precede the next parameter.
-  // Only use mappings that CIRGen could prove, and allow variadic operands
-  // beyond the mapped source parameters.
-  for (unsigned paramIdx = 0; paramIdx < lifetime.getNumParams(); ++paramIdx) {
-    if (!lifetime.isParamRValueReference(paramIdx))
-      continue;
-    unsigned argIdx = lifetime.getParamOperandIndex(paramIdx);
-    // A move special member must inspect and transfer its source state before
-    // invalidating it. Other rvalue-reference parameters still use this path.
-    if (transferredArg && argIdx == *transferredArg)
-      continue;
-    if (argIdx < callOp.getNumArgOperands())
-      checkArgForRValueRef(callOp, argIdx);
-  }
-}
-
-void LifetimeCheckPass::checkArgForRValueRef(CallOp callOp, unsigned argIdx) {
-  auto arg = callOp.getArgOperand(argIdx);
-
-  // Case 1: LoadOp (by-value argument loaded from memory)
-  // Detects use of moved-from VALUE TYPES passed by rvalue ref.
-  //   FAIL: int a = 42; int b = std::move(a);
-  //         foo(std::move(a)); // 'a' is moved-from
-  //   OK:   int a = 42;
-  //         foo(std::move(a)); // 'a' valid before move
-  if (auto loadOp = arg.getDefiningOp<cir::LoadOp>()) {
-    auto srcAddr = loadOp.getAddr();
-    if (isValueTypeMovedFrom(srcAddr)) {
-      checkPointerDeref(srcAddr, callOp.getLoc(), DerefStyle::UseAfterMove);
-    }
-    return;
-  }
-
-  // Handle move semantics for address arguments
-  mlir::Value addr = arg;
-  if (!addr.getDefiningOp<cir::AllocaOp>())
-    return;
-
-  if (!getPmap().count(addr))
-    return;
-
-  // Case 2: Owner types (unique_ptr, vector, string, etc.)
-  // Detects use of moved-from OWNER objects.
-  //   FAIL: unique_ptr<int> x = ...;
-  //         auto y = std::move(x);
-  //         bar(std::move(x)); // 'x' is moved-from
-  //   OK:   unique_ptr<int> x = ...;
-  //         bar(std::move(x)); // 'x' valid before move
-  if (owners.count(addr)) {
-    if (checkPointerDeref(addr, callOp.getLoc(), DerefStyle::UseAfterMove))
-      return; // Already reported error
-    markOwnerAsMovedFrom(addr, callOp.getLoc());
-    return;
-  }
-
-  // Case 3: Pointer types (T*, T&, iterators)
-  // Detects use of UNINITIALIZED/INVALID pointers (not null).
-  //   FAIL: int* ptr;
-  //         baz(std::move(ptr)); // 'ptr' uninitialized
-  //   OK:   int x; int* ptr = &x;
-  //         baz(std::move(ptr)); // 'ptr' is initialized
-  if (ptrs.count(addr)) {
-    if (getPmap()[addr].count(State::getInvalid())) {
-      checkPointerDeref(addr, callOp.getLoc(), DerefStyle::UseAfterMove);
-      return;
-    }
-    markPointerOrValueTypeAsMovedFrom(addr, callOp.getLoc());
-    return;
-  }
-
-  // Case 4: Value types (structs, classes without Owner semantics)
-  // Detects use of INVALID value type objects (rare - addresses
-  // passed as rvalue refs).
-  //   FAIL: MyStruct obj; /* obj becomes invalid */;
-  //         qux(std::move(obj)); // 'obj' is invalid
-  //   OK:   MyStruct obj;
-  //         qux(std::move(obj)); // 'obj' valid before move
-  if (getPmap()[addr].count(State::getInvalid())) {
-    checkPointerDeref(addr, callOp.getLoc(), DerefStyle::UseAfterMove);
-    return;
-  }
-  markPointerOrValueTypeAsMovedFrom(addr, callOp.getLoc());
 }
 
 void LifetimeCheckPass::checkCopyAssignment(CallOp callOp,
@@ -2167,10 +1854,6 @@ bool LifetimeCheckPass::isValueType(mlir::Value addr) {
 
 bool LifetimeCheckPass::hasInvalidState(mlir::Value addr) {
   return getPmap().count(addr) && getPmap()[addr].count(State::getInvalid());
-}
-
-bool LifetimeCheckPass::isValueTypeMovedFrom(mlir::Value addr) {
-  return isValueType(addr) && hasInvalidState(addr);
 }
 
 void LifetimeCheckPass::markPointerOrValueTypeAsMovedFrom(mlir::Value addr,
@@ -2413,20 +2096,6 @@ void LifetimeCheckPass::checkCall(CallOp callOp) {
     }
   }
 
-  std::optional<unsigned> transferredArg;
-  if (auto ctor = dyn_cast_if_present<cir::CXXCtorAttr>(cxxSpecialMember)) {
-    if (ctor.getCtorKind() == cir::CtorKind::Move)
-      transferredArg = 1;
-  } else if (auto assign =
-                 dyn_cast_if_present<cir::CXXAssignAttr>(cxxSpecialMember)) {
-    if (assign.getAssignKind() == cir::AssignKind::Move)
-      transferredArg = 1;
-  }
-
-  // Track rvalue-reference arguments, leaving a move special member's source
-  // for its dedicated handler so pointer assignments copy the valid state.
-  checkMoveInCallArgs(callOp, transferredArg);
-
   if (!isOwnerOrPointerMethod)
     return checkOtherMethodsAndFunctions(callOp, methodDecl);
 
@@ -2459,74 +2128,6 @@ void LifetimeCheckPass::checkCall(CallOp callOp) {
   auto addr = getThisParamPointerCategory(callOp);
   if (addr)
     checkPointerDeref(addr, callOp.getLoc());
-}
-
-void LifetimeCheckPass::checkCleanupScope(CleanupScopeOp op) {
-  // A cleanup scope is an allocation boundary, not a pair of alternative
-  // branches. Keep its locals alive while the normal cleanup executes, then
-  // apply the same KILL operation used at the end of a source scope.
-  LexicalScopeContext lexScope{op.getOperation()};
-  LexicalScopeGuard scopeGuard{*this, &lexScope};
-  checkRegion(op.getBodyRegion());
-  if (op.getCleanupKindAttr().isNormal())
-    checkRegion(op.getCleanupRegion());
-  // Exception-only cleanup is not part of this pass's normal-flow model.
-}
-
-void LifetimeCheckPass::checkOperation(Operation *op) {
-  if (isa<::mlir::ModuleOp>(op)) {
-    theModule = cast<::mlir::ModuleOp>(op);
-    mlir::SymbolTable symbols(theModule);
-    llvm::SaveAndRestore<mlir::SymbolTable *> symbolGuard(moduleSymbols,
-                                                          &symbols);
-    for (Region &region : op->getRegions())
-      checkRegion(region);
-    return;
-  }
-
-  if (isa<ScopeOp>(op)) {
-    // Add a new scope. Note that as part of the scope cleanup process
-    // we apply section 2.3 KILL(x) functionality, turning relevant
-    // references invalid.
-    //
-    // No need to create a new pmap when entering a new scope since it
-    // doesn't cause control flow to diverge (as it does in presence
-    // of cir::IfOp or cir::SwitchOp).
-    //
-    // Also note that for dangling pointers coming from if init stmts
-    // should be caught just fine, given that a ScopeOp embraces a IfOp.
-    LexicalScopeContext lexScope{op};
-    LexicalScopeGuard scopeGuard{*this, &lexScope};
-    for (Region &region : op->getRegions())
-      checkRegion(region);
-    return;
-  }
-
-  // FIXME: we can do better than sequence of dyn_casts.
-  if (auto fnOp = dyn_cast<cir::FuncOp>(op))
-    return checkFunc(fnOp);
-  if (auto ifOp = dyn_cast<IfOp>(op))
-    return checkIf(ifOp);
-  if (auto cleanupScope = dyn_cast<CleanupScopeOp>(op))
-    return checkCleanupScope(cleanupScope);
-  if (auto switchOp = dyn_cast<SwitchOp>(op))
-    return checkSwitch(switchOp);
-  if (auto loopOp = dyn_cast<LoopOpInterface>(op))
-    return checkLoop(loopOp);
-  if (auto allocaOp = dyn_cast<AllocaOp>(op))
-    return checkAlloca(allocaOp);
-  if (auto storeOp = dyn_cast<StoreOp>(op))
-    return checkStore(storeOp);
-  if (auto loadOp = dyn_cast<LoadOp>(op))
-    return checkLoad(loadOp);
-  if (auto callOp = dyn_cast<CallOp>(op))
-    return checkCall(callOp);
-  if (auto coroutineOp = dyn_cast<CoroutineOp>(op))
-    return checkCoroutine(coroutineOp);
-  if (auto awaitOp = dyn_cast<AwaitOp>(op))
-    return checkAwait(awaitOp);
-  if (auto returnOp = dyn_cast<ReturnOp>(op))
-    return checkReturn(returnOp);
 }
 
 // Labels can split a case into several blocks even without a goto. Walking
@@ -2601,7 +2202,2434 @@ static LogicalResult validateSwitchControlFlow(Operation *op) {
   return failure(result.wasInterrupted());
 }
 
+//===----------------------------------------------------------------------===//
+// Path-sensitive storage and value transfer
+//===----------------------------------------------------------------------===//
+
+template <class T, unsigned N>
+static void appendUnique(SmallVector<T, N> &to, ArrayRef<T> from) {
+  for (const T &value : from)
+    if (!llvm::is_contained(to, value))
+      to.push_back(value);
+}
+
+template <class T>
+static void appendUnique(llvm::TinyPtrVector<T> &to, ArrayRef<T> from) {
+  for (T value : from)
+    if (!llvm::is_contained(to, value))
+      to.push_back(value);
+}
+
+// These object lists can grow with the function. Keep their established
+// order while avoiding a full destination scan for every incoming object.
+static void appendUnique(SmallVector<Value, 16> &to, ArrayRef<Value> from) {
+  if (from.empty())
+    return;
+  llvm::SmallDenseSet<Value, 16> seen(to.begin(), to.end());
+  for (Value value : from)
+    if (seen.insert(value).second)
+      to.push_back(value);
+}
+
+LifetimeCheckPass::ObjectTargets
+LifetimeCheckPass::joinTargets(const ObjectTargets &a,
+                               const ObjectTargets &b) const {
+  ObjectTargets result = a;
+  appendUnique(result.objects, ArrayRef<ObjectId>(b.objects));
+  llvm::sort(result.objects, [](Value a, Value b) {
+    return std::less<const void *>()(a.getAsOpaquePointer(),
+                                     b.getAsOpaquePointer());
+  });
+  result.unknown |= b.unknown;
+  result.mayBeNull |= b.mayBeNull;
+  result.mayBeInvalid |= b.mayBeInvalid;
+  return result;
+}
+
+LifetimeCheckPass::ValueSummary
+LifetimeCheckPass::joinValues(const ValueSummary &a,
+                              const ValueSummary &b) const {
+  ValueSummary result = a;
+  if (a.pointer && b.pointer) {
+    result.pointer->targets =
+        joinTargets(a.pointer->targets, b.pointer->targets);
+    result.pointer->mayBeNonNull |= b.pointer->mayBeNonNull;
+    result.pointer->unknownNullness |= b.pointer->unknownNullness;
+    appendUnique(result.pointer->borrowedOwners,
+                 ArrayRef<ObjectId>(b.pointer->borrowedOwners));
+    appendUnique(result.pointer->invalidHistory.entries,
+                 ArrayRef<InvalidHistEntry>(b.pointer->invalidHistory.entries));
+    if (!result.pointer->nullOrigin)
+      result.pointer->nullOrigin = b.pointer->nullOrigin;
+  } else if (b.pointer) {
+    result.pointer = b.pointer;
+    result.pointer->targets.unknown = true;
+    result.pointer->unknownNullness = true;
+  } else if (a.pointer) {
+    result.pointer->targets.unknown = true;
+    result.pointer->unknownNullness = true;
+  }
+  appendUnique(result.readOrigins, ArrayRef<ObjectId>(b.readOrigins));
+  appendUnique(result.xvalueOrigins, ArrayRef<ObjectId>(b.xvalueOrigins));
+  if (a.tupleElements.size() == b.tupleElements.size()) {
+    for (unsigned i = 0; i < result.tupleElements.size(); ++i)
+      result.tupleElements[i] =
+          joinTargets(a.tupleElements[i], b.tupleElements[i]);
+  } else {
+    result.tupleElements.clear();
+  }
+  if (a.tupleValues.size() == b.tupleValues.size()) {
+    for (unsigned i = 0; i < result.tupleValues.size(); ++i)
+      result.tupleValues[i] = joinValues(a.tupleValues[i], b.tupleValues[i]);
+  } else {
+    result.tupleValues.clear();
+  }
+  if (!equalPredicates(a.predicate, b.predicate))
+    result.predicate.reset();
+  if (a.booleanValue != b.booleanValue)
+    result.booleanValue.reset();
+  if (!(a.objectOccupancy == b.objectOccupancy)) {
+    if (a.objectOccupancy && b.objectOccupancy) {
+      auto occupancy = *a.objectOccupancy;
+      occupancy.mayBeEmpty |= b.objectOccupancy->mayBeEmpty;
+      occupancy.mayBePresent |= b.objectOccupancy->mayBePresent;
+      occupancy.unknown |= b.objectOccupancy->unknown;
+      appendUnique(occupancy.emptyOrigins,
+                   ArrayRef<Location>(b.objectOccupancy->emptyOrigins));
+      result.objectOccupancy = std::move(occupancy);
+    } else {
+      result.objectOccupancy.reset();
+    }
+  }
+  if (a.elementPredicates.size() == b.elementPredicates.size()) {
+    for (unsigned i = 0; i < result.elementPredicates.size(); ++i)
+      if (!(a.elementPredicates[i] == b.elementPredicates[i]))
+        result.elementPredicates[i].reset();
+  } else {
+    result.elementPredicates.clear();
+  }
+  result.externallyAliasedPointer |= b.externallyAliasedPointer;
+  result.unknown |= b.unknown;
+  return result;
+}
+
+std::optional<LifetimeCheckPass::ObjectInfo>
+LifetimeCheckPass::getObjectInfo(ObjectId object) const {
+  auto found = objectInfo.find(object);
+  if (found == objectInfo.end())
+    return std::nullopt;
+  return found->second;
+}
+
+LifetimeCheckPass::ObjectTargets
+LifetimeCheckPass::resolveAddress(Value address, const PathState &state) const {
+  auto canonical = canonicalObjects.find(address);
+  if (canonical != canonicalObjects.end())
+    return {{canonical->second}};
+  if (auto found = state.values.find(address); found != state.values.end()) {
+    if (found->second.pointer)
+      return found->second.pointer->targets;
+  }
+  if (auto cast = address.getDefiningOp<CastOp>()) {
+    if (isa<cir::PointerType>(cast.getSrc().getType()) &&
+        isa<cir::PointerType>(address.getType()))
+      return resolveAddress(cast.getSrc(), state);
+  }
+  if (auto stride = address.getDefiningOp<PtrStrideOp>())
+    return resolveAddress(stride.getBase(), state);
+  if (auto element = address.getDefiningOp<GetElementOp>())
+    return resolveAddress(element.getBase(), state);
+  // Never peel a load here: its pointer value was captured when it executed.
+  auto summary = summarizeValue(address, state);
+  if (summary.pointer)
+    return summary.pointer->targets;
+  ObjectTargets result;
+  result.unknown = true;
+  return result;
+}
+
+LifetimeCheckPass::ValueSummary
+LifetimeCheckPass::summarizeValue(Value value, const PathState &state) const {
+  if (auto found = state.values.find(value); found != state.values.end())
+    return found->second;
+  ValueSummary summary;
+  if (auto found = canonicalObjects.find(value);
+      found != canonicalObjects.end()) {
+    summary.pointer.emplace();
+    summary.pointer->targets.objects.push_back(found->second);
+    // A symbolic incoming referent establishes identity, not nullness. Keep
+    // it definite for alias/write-through tracking without pruning null
+    // branches of an owner constructed from an ordinary pointer parameter.
+    summary.pointer->mayBeNonNull =
+        !objectInfo.lookup(found->second).unknownIncomingNullness;
+    summary.pointer->unknownNullness =
+        objectInfo.lookup(found->second).unknownIncomingNullness;
+    return summary;
+  }
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    if (isa<FuncOp>(argument.getOwner()->getParentOp())) {
+      if (auto record = dyn_cast<RecordType>(value.getType())) {
+        auto properties = cir::getLifetimeRecord(record, theModule);
+        if (properties && properties.getPointer()) {
+          // A pointer-like record arrives as an initialized by-value object.
+          // Its conceptual pointee is caller-owned; this does not turn the
+          // record SSA value into an address or prove non-null contents.
+          summary.pointer.emplace();
+          summary.pointer->targets.objects.push_back(value);
+          summary.pointer->unknownNullness = true;
+          return summary;
+        }
+      }
+    }
+  }
+  if (auto constant = value.getDefiningOp<ConstantOp>()) {
+    if (auto boolean = dyn_cast<cir::BoolAttr>(constant.getValue())) {
+      summary.booleanValue = boolean.getValue();
+      return summary;
+    }
+    if (auto pointer = dyn_cast<ConstPtrAttr>(constant.getValue())) {
+      summary.pointer.emplace();
+      summary.pointer->targets.mayBeNull = pointer.isNullValue();
+      summary.pointer->mayBeNonNull = !pointer.isNullValue();
+      summary.pointer->targets.unknown = !pointer.isNullValue();
+      if (pointer.isNullValue())
+        summary.pointer->nullOrigin = constant.getLoc();
+      return summary;
+    }
+    if (isa<cir::PointerType>(value.getType())) {
+      summary.pointer.emplace();
+      if (isa<UndefAttr, PoisonAttr>(constant.getValue())) {
+        summary.pointer->targets.mayBeInvalid = true;
+        summary.pointer->invalidHistory.add(value, NotInitialized,
+                                            constant.getLoc());
+      } else {
+        summary.pointer->mayBeNonNull = true;
+        summary.pointer->targets.unknown = true;
+      }
+      return summary;
+    }
+  }
+  if (value.getDefiningOp<GetGlobalOp>()) {
+    summary.pointer.emplace();
+    summary.pointer->mayBeNonNull = true;
+    // This is a real alternative to a local address, even though globals do
+    // not need automatic-storage lifetime tracking. Without the unknown
+    // identity bit, joining &local with &global would become a definite local.
+    summary.pointer->targets.unknown = true;
+    return summary;
+  }
+  if (isa<cir::PointerType>(value.getType())) {
+    summary.pointer.emplace();
+    summary.pointer->targets.unknown = true;
+    summary.pointer->unknownNullness = true;
+  }
+  summary.unknown = true;
+  return summary;
+}
+
+void LifetimeCheckPass::setValueSummary(PathState &state, Value value,
+                                        ValueSummary summary) {
+  // An SSA operation can execute again in a loop. A predicate from an older
+  // iteration must not restore the old execution's value at the same SSA ID.
+  visitPredicates(state, [&](std::optional<ValuePredicate> &predicate) {
+    if (!predicate || predicate->domain != ValuePredicate::ConditionalMove)
+      return;
+    for (auto *snapshots :
+         {&predicate->pointersBefore, &predicate->pointersAfter})
+      for (auto &snapshot : *snapshots)
+        if (!snapshot.stored && snapshot.value == value)
+          snapshot.valid = false;
+  });
+  state.values[value] = std::move(summary);
+}
+
+void LifetimeCheckPass::storeSummary(PathState &state,
+                                     const ObjectTargets &targets,
+                                     const ValueSummary &summary) {
+  invalidatePredicates(state, targets);
+  for (ObjectId object : targets.objects) {
+    if (targets.isDefinite())
+      state.storedValues[object] = summary;
+    else
+      state.storedValues[object] =
+          joinValues(state.storedValues[object], summary);
+  }
+}
+
+LifetimeCheckPass::OccupancySummary
+LifetimeCheckPass::getOccupancy(const PathState &state,
+                                const ObjectTargets &targets) const {
+  OccupancySummary result;
+  result.unknown = targets.unknown || targets.mayBeInvalid || targets.mayBeNull;
+  if (targets.objects.empty())
+    result.unknown = true;
+  for (ObjectId object : targets.objects) {
+    auto found = state.occupancy.find(object);
+    if (found == state.occupancy.end()) {
+      result.unknown = true;
+      continue;
+    }
+    result.unknown |= found->second.unknown;
+    result.mayBeEmpty |= found->second.mayBeEmpty;
+    result.mayBePresent |= found->second.mayBePresent;
+    appendUnique(result.emptyOrigins,
+                 ArrayRef<Location>(found->second.emptyOrigins));
+  }
+  return result;
+}
+
+void LifetimeCheckPass::setOccupancy(PathState &state,
+                                     const ObjectTargets &targets,
+                                     const OccupancySummary &occupancy,
+                                     Location loc) {
+  invalidatePredicates(state, targets);
+  for (ObjectId object : targets.objects) {
+    auto value = occupancy;
+    if (value.mayBeEmpty && value.emptyOrigins.empty())
+      value.emptyOrigins.push_back(loc);
+    if (!targets.isDefinite()) {
+      auto old = getOccupancy(state, ObjectTargets{{object}});
+      value.mayBeEmpty |= old.mayBeEmpty;
+      value.mayBePresent |= old.mayBePresent;
+      value.unknown |= old.unknown;
+      appendUnique(value.emptyOrigins, ArrayRef<Location>(old.emptyOrigins));
+    }
+    state.occupancy[object] = std::move(value);
+  }
+}
+
+void LifetimeCheckPass::reinitializeObjects(PathState &state,
+                                            const ObjectTargets &targets,
+                                            Location loc) {
+  invalidatePredicates(state, targets);
+  for (ObjectId object : targets.objects) {
+    auto info = getObjectInfo(object);
+    if (!info ||
+        (!info->callerOwned && !llvm::is_contained(state.liveObjects, object)))
+      continue;
+    PSetType initialized;
+    if (info->category == ObjectInfo::Owner)
+      initialized.insert(State::getOwnedBy(object));
+    else if (info->category != ObjectInfo::Pointer)
+      initialized.insert(State::getLocalValue(object));
+    if (targets.isDefinite()) {
+      state.pmap[object] = std::move(initialized);
+      (activeState == &state ? invalidHist : state.invalidHist).erase(object);
+      (activeState == &state ? pmapNullHist : state.nullHist).erase(object);
+    } else {
+      llvm::set_union(state.pmap[object], initialized);
+    }
+  }
+}
+
+void LifetimeCheckPass::detachOwner(PathState &state, ObjectId owner) {
+  invalidateConditionalOwnership(state, owner);
+  state.ownershipGroups.erase(owner);
+  for (auto &entry : state.ownershipGroups)
+    llvm::erase(entry.second, owner);
+  SmallVector<ObjectId, 4> singletons;
+  for (const auto &entry : state.ownershipGroups)
+    if (entry.second.size() < 2)
+      singletons.push_back(entry.first);
+  for (ObjectId object : singletons)
+    state.ownershipGroups.erase(object);
+}
+
+void LifetimeCheckPass::retargetOwnerContents(PathState &state, ObjectId source,
+                                              ObjectId destination,
+                                              bool retainSource) {
+  invalidateConditionalDependencies(state, source, false);
+  for (auto &entry : state.pmap) {
+    // The holder's own initializedness is separate from pointers borrowing its
+    // resource. In particular, a transfer must not make its storage an alias
+    // of the destination's storage.
+    if (entry.first == source || !entry.second.count(State::getOwnedBy(source)))
+      continue;
+    if (!retainSource)
+      entry.second.erase(State::getOwnedBy(source));
+    entry.second.insert(destination ? State::getOwnedBy(destination)
+                                    : State::getGlobal());
+  }
+  auto retarget = [&](ValueSummary &summary) {
+    if (!summary.pointer ||
+        !llvm::is_contained(summary.pointer->borrowedOwners, source))
+      return;
+    auto &holders = summary.pointer->borrowedOwners;
+    if (!retainSource)
+      llvm::erase(holders, source);
+    if (destination && !llvm::is_contained(holders, destination))
+      holders.push_back(destination);
+    // Detaching ownership preserves the already observed pointer value. It
+    // does not prove that an unknown or nullable pointer is non-null.
+  };
+  for (auto &entry : state.values)
+    visitValueSummary(entry.second, retarget);
+  for (auto &entry : state.storedValues)
+    visitValueSummary(entry.second, retarget);
+}
+
+void LifetimeCheckPass::transferOwnerContents(PathState &state,
+                                              const ObjectTargets &destinations,
+                                              const ObjectTargets &sources,
+                                              bool sharedCopy) {
+  if (!destinations.isDefinite() || !sources.isDefinite()) {
+    // An uncertain move can associate a borrower with either holder. Retain
+    // both possible dependencies; neither is a guaranteed co-owner.
+    for (ObjectId destination : destinations.objects) {
+      detachOwner(state, destination);
+      for (ObjectId source : sources.objects) {
+        if (source == destination)
+          continue;
+        if (!sharedCopy)
+          retargetOwnerContents(state, source, destination, true);
+      }
+    }
+    return;
+  }
+  ObjectId source = sources.objects.front();
+  ObjectId destination = destinations.objects.front();
+  if (source == destination)
+    return;
+  SmallVector<ObjectId, 2> holders = state.ownershipGroups.lookup(source);
+  if (holders.empty())
+    holders.push_back(source);
+  detachOwner(state, destination);
+  if (!sharedCopy) {
+    retargetOwnerContents(state, source, destination);
+    detachOwner(state, source);
+    llvm::erase(holders, source);
+  }
+  if (!llvm::is_contained(holders, destination))
+    holders.push_back(destination);
+  llvm::sort(holders, [](ObjectId a, ObjectId b) {
+    return std::less<const void *>()(a.getAsOpaquePointer(),
+                                     b.getAsOpaquePointer());
+  });
+  if (holders.size() > 1)
+    for (ObjectId holder : holders)
+      state.ownershipGroups[holder] = holders;
+}
+
+void LifetimeCheckPass::endOwnerContents(PathState &state,
+                                         const ObjectTargets &targets,
+                                         Location loc, InvalidStyle style) {
+  auto end = [&] {
+    for (ObjectId owner : targets.objects) {
+      ObjectId survivor;
+      // With a may-target write, all listed holders might lose their resource;
+      // only a holder outside that set can justify keeping borrowers alive.
+      for (ObjectId candidate : state.ownershipGroups.lookup(owner)) {
+        auto info = getObjectInfo(candidate);
+        if (candidate != owner &&
+            !llvm::is_contained(targets.objects, candidate) &&
+            ((info && info->callerOwned) ||
+             llvm::is_contained(state.liveObjects, candidate))) {
+          survivor = candidate;
+          break;
+        }
+      }
+      detachOwner(state, owner);
+      if (survivor)
+        retargetOwnerContents(state, owner, survivor);
+      else
+        kill(State::getOwnedBy(owner), style, loc);
+    }
+  };
+  if (activeState == &state)
+    end();
+  else {
+    StateGuard guard(*this, state);
+    end();
+  }
+}
+
+void LifetimeCheckPass::releaseOwnerContents(PathState &state,
+                                             const ObjectTargets &targets,
+                                             Location loc) {
+  invalidatePredicates(state, targets);
+  // Only a definite release can remove a dependency. A may-release leaves the
+  // original dependency because the resource may still belong to that holder.
+  if (!targets.isDefinite())
+    return;
+  ObjectId owner = targets.objects.front();
+  ObjectId survivor;
+  for (ObjectId candidate : state.ownershipGroups.lookup(owner))
+    if (candidate != owner &&
+        llvm::is_contained(state.liveObjects, candidate)) {
+      survivor = candidate;
+      break;
+    }
+  detachOwner(state, owner);
+  retargetOwnerContents(state, owner, survivor);
+}
+
+void LifetimeCheckPass::invalidateOwnerContents(PathState &state,
+                                                const ObjectTargets &targets,
+                                                Location loc) {
+  endOwnerContents(state, targets, loc, InvalidStyle::NonConstUseOfOwner);
+  auto advance = [&] {
+    for (ObjectId owner : targets.objects)
+      if (owners.count(owner))
+        incOwner(owner);
+  };
+  if (activeState == &state)
+    advance();
+  else {
+    StateGuard guard(*this, state);
+    advance();
+  }
+}
+
+void LifetimeCheckPass::replaceOwnerContents(PathState &state,
+                                             const ObjectTargets &targets,
+                                             const OccupancySummary &occupancy,
+                                             Operation *operation) {
+  invalidateOwnerContents(state, targets, operation->getLoc());
+  reinitializeObjects(state, targets, operation->getLoc());
+  setOccupancy(state, targets, occupancy, operation->getLoc());
+}
+
+void LifetimeCheckPass::markMoved(PathState &state,
+                                  const ObjectTargets &targets, Location loc) {
+  invalidatePredicates(state, targets);
+  auto &history = activeState == &state ? invalidHist : state.invalidHist;
+  for (ObjectId object : targets.objects) {
+    if (isSkippableTemporary(object))
+      continue;
+    auto info = getObjectInfo(object);
+    // Whole-object moves and local capture initialization are modeled here;
+    // moving arbitrary class subobjects is outside this analysis.
+    if (!info || info->fieldDepth)
+      continue;
+    // An opaque consuming call can take this holder away. A later reset must
+    // not rely on the moved-from object to keep a shared resource alive.
+    // Modeled owner transfers already detached their source before this step.
+    if (state.ownershipGroups.count(object))
+      endOwnerContents(state, ObjectTargets{{object}}, loc, MovedFrom);
+    // Retain the reviewed policy for repeated owner/pointer moves. Smart
+    // pointer empty-state facts are maintained by the library model.
+    state.pmap[object].insert(State::getInvalid());
+    if (info->category == ObjectInfo::Pointer) {
+      auto stored = state.storedValues.find(object);
+      if (stored != state.storedValues.end() && stored->second.pointer) {
+        stored->second.pointer->targets.mayBeInvalid = true;
+        stored->second.pointer->invalidHistory.add(object, MovedFrom, loc);
+      }
+    }
+    history[object].add(object, InvalidStyle::MovedFrom, loc);
+  }
+}
+
+bool LifetimeCheckPass::checkUse(PathState &state, const ObjectTargets &targets,
+                                 Location loc, DerefStyle style) {
+  auto check = [&] {
+    bool invalid = false;
+    for (ObjectId object : targets.objects)
+      invalid |= checkPointerDeref(object, loc, style);
+    return invalid;
+  };
+  if (activeState == &state)
+    return check();
+  StateGuard guard(*this, state);
+  return check();
+}
+
+void LifetimeCheckPass::indexObjects(FuncOp function) {
+  objectInfo.clear();
+  canonicalObjects.clear();
+  ptrs.clear();
+  owners.clear();
+  aggregates.clear();
+  tasks.clear();
+  auto classify = [&](ObjectId object, Type type, bool callerOwned = false) {
+    ObjectInfo info{type, ObjectInfo::Scalar, callerOwned, 0, object};
+    if (isPointerType(type)) {
+      info.category = ObjectInfo::Pointer;
+      ptrs.insert(object);
+    } else if (isOwnerType(type)) {
+      info.category = ObjectInfo::Owner;
+      addOwner(object);
+    } else if (isAggregateType(this, type)) {
+      info.category = ObjectInfo::Aggregate;
+    } else if (isa<RecordType>(type)) {
+      info.category = ObjectInfo::Record;
+    }
+    objectInfo.try_emplace(object, info);
+    canonicalObjects[object] = object;
+  };
+  function.walk([&](AllocaOp alloca) {
+    classify(alloca.getAddr(), alloca.getAllocaType());
+  });
+  // Retain the baseline nested aggregate pointer-lifetime model and give
+  // direct local lambda captures distinct slots. These identities do not
+  // enable compound move tracking: markMoved excludes all subobjects.
+  function.walk([&](GetMemberOp member) {
+    auto found = canonicalObjects.find(member.getAddr());
+    if (found == canonicalObjects.end())
+      return;
+    auto parent = objectInfo.find(found->second);
+    if (parent == objectInfo.end() ||
+        (parent->second.category != ObjectInfo::Aggregate &&
+         !isLambdaType(parent->second.type)))
+      return;
+    auto record = dyn_cast<RecordType>(parent->second.type);
+    if (!record || member.getIndex() >= record.getMembers().size())
+      return;
+    auto &fields = aggregates[found->second];
+    fields.resize(record.getMembers().size());
+    ObjectId &field = fields[member.getIndex()];
+    if (!field) {
+      unsigned depth = parent->second.fieldDepth + 1;
+      ObjectId storageRoot = parent->second.storageRoot;
+      field = member.getResult();
+      classify(field, member.getType().getPointee());
+      objectInfo[field].fieldDepth = depth;
+      objectInfo[field].storageRoot = storageRoot;
+    }
+    canonicalObjects[member.getResult()] = field;
+  });
+  if (function.getBody().empty())
+    return;
+  // Pointer entry arguments denote caller-owned storage. Only a reference
+  // binding or an implicit object parameter also guarantees a non-null
+  // address. Missing source metadata must not invent that guarantee.
+  auto metadata = function.getLifetimeAttr();
+  for (BlockArgument argument : function.getBody().front().getArguments()) {
+    if (auto pointer = dyn_cast<cir::PointerType>(argument.getType())) {
+      classify(argument, pointer.getPointee(), true);
+      bool nonnull = metadata && metadata.getHasImplicitObject() &&
+                     argument.getArgNumber() == 0;
+      if (metadata && metadata.hasParameterInfo())
+        for (unsigned index = 0; index < metadata.getNumParams(); ++index)
+          if (metadata.getParamOperandIndex(index) == argument.getArgNumber() &&
+              metadata.getParameterKinds().asArrayRef()[index] !=
+                  static_cast<int32_t>(LifetimeParameterKind::Value))
+            nonnull = true;
+      objectInfo[argument].unknownIncomingNullness = !nonnull;
+    }
+  }
+}
+
+void LifetimeCheckPass::initializeObject(PathState &state, ObjectId object,
+                                         Location loc) {
+  auto info = getObjectInfo(object);
+  if (!info)
+    return;
+  invalidatePredicates(state, ObjectTargets{{object}});
+  state.pmap[object].clear();
+  state.invalidHist.erase(object);
+  state.nullHist.erase(object);
+  state.storedValues.erase(object);
+  state.occupancy.erase(object);
+  detachOwner(state, object);
+  if (!llvm::is_contained(state.liveObjects, object))
+    state.liveObjects.push_back(object);
+  if (info->category == ObjectInfo::Pointer && !info->callerOwned) {
+    state.pmap[object].insert(State::getInvalid());
+    state.invalidHist[object].add(object, InvalidStyle::NotInitialized, loc);
+    ValueSummary summary;
+    summary.pointer.emplace();
+    summary.pointer->targets.mayBeInvalid = true;
+    summary.pointer->invalidHistory = state.invalidHist[object];
+    state.storedValues[object] = std::move(summary);
+  } else if (info->category == ObjectInfo::Owner) {
+    state.pmap[object].insert(State::getOwnedBy(object));
+  } else {
+    state.pmap[object].insert(State::getLocalValue(object));
+  }
+  if (currScope && !info->callerOwned)
+    currScope->localValues.insert(object);
+  if (auto fields = aggregates.find(object); fields != aggregates.end())
+    for (ObjectId field : fields->second)
+      if (field)
+        initializeObject(state, field, loc);
+}
+
+void LifetimeCheckPass::synchronizeSummaries(PathState &state) {
+  for (ObjectId pointer : ptrs) {
+    auto found = state.pmap.find(pointer);
+    if (found == state.pmap.end())
+      continue;
+    PointerValueSummary payload;
+    if (auto stored = state.storedValues.find(pointer);
+        stored != state.storedValues.end() && stored->second.pointer)
+      payload.unknownNullness = stored->second.pointer->unknownNullness;
+    for (const State &fact : found->second) {
+      if (fact.isOwnedBy())
+        payload.borrowedOwners.push_back(fact.getData());
+      else if (fact.hasValue())
+        payload.targets.objects.push_back(fact.getData());
+      else if (fact == State::getNullPtr())
+        payload.targets.mayBeNull = true;
+      else if (fact == State::getInvalid())
+        payload.targets.mayBeInvalid = true;
+      else if (fact == State::getGlobal())
+        payload.mayBeNonNull = true;
+    }
+    if (found->second.empty()) {
+      payload.targets.unknown = true;
+      payload.unknownNullness = true;
+    }
+    payload.invalidHistory = state.invalidHist.lookup(pointer);
+    payload.nullOrigin = state.nullHist.lookup(pointer);
+    state.storedValues[pointer].pointer = std::move(payload);
+  }
+}
+
+void LifetimeCheckPass::checkAddressUse(Value address, Location loc,
+                                        PathState &state) {
+  auto summary = summarizeValue(address, state);
+  if (!summary.pointer || (!summary.pointer->targets.mayBeNull &&
+                           !summary.pointer->targets.mayBeInvalid))
+    return;
+  // The SSA payload, not the current value of its source slot, determines
+  // whether this address is usable. A later write cannot repair this snapshot.
+  ObjectId label = address;
+  for (ObjectId origin : summary.readOrigins)
+    if (ptrs.count(origin)) {
+      label = origin;
+      break;
+    }
+  DiagnosticWitness witness(activeOperation, label, loc, Direct);
+  // A dereference-tagged pointer load and its following access describe one
+  // source use. Keep its SSA snapshot, but share the witness identity.
+  if (auto load = address.getDefiningOp<LoadOp>(); load && load.getIsDeref()) {
+    witness.operation = load.getOperation();
+    witness.location = load.getLoc();
+  }
+  witness.history = summary.pointer->invalidHistory;
+  if (summary.pointer->targets.mayBeInvalid) {
+    witness.pset.insert(State::getInvalid());
+    if (witness.history.entries.empty())
+      witness.history.add(label, NotInitialized, address.getLoc());
+  }
+  if (summary.pointer->targets.mayBeNull) {
+    witness.pset.insert(State::getNullPtr());
+    witness.nullOrigin = summary.pointer->nullOrigin.value_or(address.getLoc());
+  }
+  ptrs.insert(label);
+  recordWitness(state, std::move(witness));
+}
+
+void LifetimeCheckPass::transferLoad(LoadOp load, PathState &state) {
+  checkAddressUse(load.getAddr(), load.getLoc(), state);
+  if (auto field = load.getAddr().getDefiningOp<GetMemberOp>()) {
+    auto parents = resolveAddress(field.getAddr(), state);
+    for (ObjectId object : parents.objects) {
+      auto info = getObjectInfo(object);
+      if (info && !tasks.count(object) &&
+          (info->category == ObjectInfo::Record ||
+           info->category == ObjectInfo::Aggregate) &&
+          state.pmap[object].count(State::getInvalid()))
+        checkUse(state, ObjectTargets{{object}}, load.getLoc());
+    }
+    if (parents.isDefinite()) {
+      auto summary = state.storedValues.lookup(parents.objects.front());
+      if (field.getIndex() < summary.elementPredicates.size()) {
+        ValueSummary result;
+        if (const auto &predicate = summary.elementPredicates[field.getIndex()])
+          result.predicate = std::make_shared<const ValuePredicate>(*predicate);
+        setValueSummary(state, load.getResult(), std::move(result));
+        return;
+      }
+    }
+  }
+  ObjectTargets targets = resolveAddress(load.getAddr(), state);
+  ValueSummary summary;
+  bool first = true;
+  for (ObjectId object : targets.objects) {
+    auto info = getObjectInfo(object);
+    bool pointer = info && info->category == ObjectInfo::Pointer;
+    if ((pointer && load.getIsDeref()) ||
+        (!pointer && state.pmap[object].count(State::getInvalid())))
+      checkUse(state, ObjectTargets{{object}}, load.getLoc());
+    auto found = state.storedValues.find(object);
+    ValueSummary value =
+        found == state.storedValues.end() ? ValueSummary{} : found->second;
+    if (first)
+      summary = std::move(value);
+    else
+      summary = joinValues(summary, value);
+    first = false;
+    if (!llvm::is_contained(summary.readOrigins, object))
+      summary.readOrigins.push_back(object);
+    if (load.getSourceIsXvalue() &&
+        !llvm::is_contained(summary.xvalueOrigins, object))
+      summary.xvalueOrigins.push_back(object);
+  }
+  if (isa<cir::PointerType>(load.getType()) && !summary.pointer) {
+    summary.pointer.emplace();
+    summary.pointer->targets.unknown = true;
+    summary.pointer->unknownNullness = true;
+  }
+  summary.unknown |=
+      targets.unknown || targets.mayBeInvalid || targets.mayBeNull;
+  // An unknown address alternative or an observable load can produce a value
+  // other than the constant last stored in one of the known local objects.
+  if (summary.unknown || load.getIsVolatile() || load.getMemOrder())
+    clearBooleanValues(summary);
+  if (summary.pointer) {
+    summary.pointer->targets.unknown |= summary.unknown;
+    summary.pointer->unknownNullness |= summary.unknown;
+  }
+  setValueSummary(state, load.getResult(), std::move(summary));
+  if (targets.isDefinite())
+    copyConditionalPointerSnapshots(state, targets.objects.front(), true,
+                                    load.getResult(), false);
+}
+
+void LifetimeCheckPass::forgetAggregateCallFields(
+    PathState &state, const ObjectTargets &targets) {
+  // A returned record overwrites the destination's old member contents. Only
+  // forget fields already tracked by the pointer-lifetime model; the opaque
+  // callee supplies no proof of non-nullness or of a particular pointee.
+  ValueSummary unknown;
+  unknown.unknown = true;
+  unknown.pointer.emplace();
+  unknown.pointer->targets.unknown = true;
+  unknown.pointer->unknownNullness = true;
+  for (ObjectId object : targets.objects) {
+    auto fields = aggregates.find(object);
+    if (fields == aggregates.end())
+      continue;
+    for (ObjectId field : fields->second) {
+      if (!field)
+        continue;
+      ObjectTargets fieldTargets{{field}, !targets.isDefinite()};
+      auto info = getObjectInfo(field);
+      if (info && info->category == ObjectInfo::Pointer) {
+        storeSummary(state, fieldTargets, unknown);
+        if (fieldTargets.isDefinite()) {
+          state.pmap[field].clear();
+          state.invalidHist.erase(field);
+          state.nullHist.erase(field);
+        }
+      } else if (info && info->category == ObjectInfo::Aggregate) {
+        forgetAggregateCallFields(state, fieldTargets);
+      }
+    }
+  }
+}
+
+void LifetimeCheckPass::transferStore(StoreOp store, PathState &state) {
+  checkAddressUse(store.getAddr(), store.getLoc(), state);
+  ObjectTargets targets = resolveAddress(store.getAddr(), state);
+  ValueSummary summary = summarizeValue(store.getValue(), state);
+  // An unknown pointer may designate previously escaped local storage even
+  // when its target set contains no concrete object for storeSummary to visit.
+  if (targets.unknown)
+    clearStoredBooleanValues(state);
+  bool spill = false;
+  if (targets.isDefinite())
+    if (auto alloca = targets.objects.front().getDefiningOp<AllocaOp>())
+      spill = alloca->hasAttr("lifetime_value_spill");
+  if (spill) {
+    storeSummary(state, targets, summary);
+    copyConditionalPointerSnapshots(state, store.getValue(), false,
+                                    targets.objects.front(), true);
+    return;
+  }
+  // Evaluating the address and RHS precedes replacing the destination. An
+  // overwritten object is not tainted just because the RHS was diagnosed.
+  if (isa<cir::IntType, cir::BoolType, cir::FPTypeInterface>(
+          store.getValue().getType())) {
+    if (!summary.xvalueOrigins.empty())
+      markMoved(state, ObjectTargets{summary.xvalueOrigins}, store.getLoc());
+    reinitializeObjects(state, targets, store.getLoc());
+  }
+  summary.xvalueOrigins.clear();
+  summary.readOrigins.clear();
+  storeSummary(state, targets, summary);
+  if (isa<RecordType>(store.getValue().getType()) &&
+      store.getValue().getDefiningOp<CallOp>())
+    forgetAggregateCallFields(state, targets);
+  for (ObjectId object : targets.objects) {
+    auto info = getObjectInfo(object);
+    if (!info)
+      continue;
+    if (info->category == ObjectInfo::Pointer && summary.pointer) {
+      PSetType replacement;
+      for (ObjectId pointee : summary.pointer->targets.objects)
+        replacement.insert(State::getLocalValue(pointee));
+      for (ObjectId owner : summary.pointer->borrowedOwners)
+        replacement.insert(State::getOwnedBy(owner));
+      if (summary.pointer->targets.mayBeNull)
+        replacement.insert(State::getNullPtr());
+      if (summary.pointer->targets.mayBeInvalid)
+        replacement.insert(State::getInvalid());
+      if (summary.pointer->mayBeNonNull &&
+          summary.pointer->targets.objects.empty() &&
+          summary.pointer->borrowedOwners.empty())
+        replacement.insert(State::getGlobal());
+      if (targets.isDefinite()) {
+        state.pmap[object] = replacement;
+        state.invalidHist.erase(object);
+        state.nullHist.erase(object);
+      } else {
+        llvm::set_union(state.pmap[object], replacement);
+      }
+      if (replacement.count(State::getNullPtr()))
+        state.nullHist[object] =
+            summary.pointer->nullOrigin.value_or(store.getValue().getLoc());
+      if (replacement.count(State::getInvalid()))
+        state.invalidHist[object] = summary.pointer->invalidHistory;
+    }
+  }
+  // Keep the existing aggregate-constant and escaping coroutine/lambda rules.
+  if (targets.isDefinite()) {
+    ObjectId object = targets.objects.front();
+    bool aggregateConstant = aggregates.count(object) &&
+                             store.getValue().getDefiningOp<ConstantOp>();
+    {
+      StateGuard guard(*this, state);
+      if (aggregateConstant)
+        updatePointsTo(object, store.getValue(), store.getValue().getLoc());
+      if (currScope && currScope->localTempTasks.count(store.getValue()))
+        checkCoroTaskStore(store);
+      else if (currScope)
+        checkLambdaCaptureStore(store);
+    }
+    if (aggregateConstant)
+      synchronizeSummaries(state);
+    copyConditionalPointerSnapshots(state, store.getValue(), false, object,
+                                    true);
+  }
+}
+
+void LifetimeCheckPass::transferCopy(CopyOp copy, PathState &state) {
+  // The existing copy model transfers pointer-like record payloads, not
+  // arbitrary boolean subobjects. A bulk write can overwrite those subobjects
+  // or previously escaped storage, including when the copy itself is unmodeled.
+  clearStoredBooleanValues(state);
+  auto record = dyn_cast<RecordType>(copy.getType().getPointee());
+  if (!record)
+    return;
+  checkAddressUse(copy.getSrc(), copy.getLoc(), state);
+  checkAddressUse(copy.getDst(), copy.getLoc(), state);
+  ObjectTargets sources = resolveAddress(copy.getSrc(), state);
+  // A whole-record copy reads the source even when no memberwise transfer is
+  // modeled. Null pointer contents may be copied; invalid source facts retain
+  // the existing move/lifetime diagnostics at the source read.
+  for (ObjectId source : sources.objects)
+    if (state.pmap.lookup(source).count(State::getInvalid()))
+      checkUse(state, ObjectTargets{{source}}, copy.getLoc());
+  // Trivial copies of pointer-like records are lowered to cir.copy, rather
+  // than a copy constructor call. Transfer the existing whole-object pointer
+  // facts; this is not memberwise analysis of an arbitrary aggregate.
+  auto properties = cir::getLifetimeRecord(record, theModule);
+  if (!properties || !properties.getPointer())
+    return;
+  ObjectTargets destinations = resolveAddress(copy.getDst(), state);
+  if (sources.isDefinite() && destinations.isDefinite() &&
+      sources.objects.front() == destinations.objects.front())
+    return;
+  PSetType copiedSet;
+  InvalidHist history;
+  std::optional<Location> nullOrigin;
+  ValueSummary summary;
+  bool first = true;
+  for (ObjectId source : sources.objects) {
+    llvm::set_union(copiedSet, state.pmap.lookup(source));
+    if (auto found = state.invalidHist.find(source);
+        found != state.invalidHist.end())
+      appendUnique(history.entries,
+                   ArrayRef<InvalidHistEntry>(found->second.entries));
+    if (!nullOrigin)
+      nullOrigin = state.nullHist.lookup(source);
+    auto value = state.storedValues.lookup(source);
+    summary = first ? value : joinValues(summary, value);
+    first = false;
+  }
+  if (!summary.pointer) {
+    summary.pointer.emplace();
+    for (const State &fact : copiedSet) {
+      if (fact.isOwnedBy())
+        summary.pointer->borrowedOwners.push_back(fact.getData());
+      else if (fact.hasValue())
+        summary.pointer->targets.objects.push_back(fact.getData());
+      else if (fact == State::getNullPtr())
+        summary.pointer->targets.mayBeNull = true;
+      else if (fact == State::getInvalid())
+        summary.pointer->targets.mayBeInvalid = true;
+      else if (fact == State::getGlobal())
+        summary.pointer->mayBeNonNull = true;
+    }
+    summary.pointer->unknownNullness = true;
+  }
+  // Unknown source storage yields unknown contents. An empty pset is not
+  // evidence of either an invalid object or a non-null conceptual pointee.
+  summary.pointer->targets.unknown |= sources.unknown || first;
+  summary.pointer->unknownNullness |= sources.unknown || first;
+  summary.pointer->targets.mayBeInvalid |= copiedSet.count(State::getInvalid());
+  summary.pointer->targets.mayBeNull |= copiedSet.count(State::getNullPtr());
+  summary.pointer->invalidHistory = history;
+  summary.pointer->nullOrigin = nullOrigin;
+  summary.readOrigins.clear();
+  summary.xvalueOrigins.clear();
+  storeSummary(state, destinations, summary);
+  for (ObjectId destination : destinations.objects) {
+    auto info = getObjectInfo(destination);
+    if (!info || info->category != ObjectInfo::Pointer)
+      continue;
+    if (destinations.isDefinite()) {
+      state.pmap[destination] = copiedSet;
+      state.invalidHist[destination] = history;
+      state.nullHist[destination] = nullOrigin;
+    } else {
+      llvm::set_union(state.pmap[destination], copiedSet);
+      appendUnique(state.invalidHist[destination].entries,
+                   ArrayRef<InvalidHistEntry>(history.entries));
+      if (nullOrigin)
+        state.nullHist[destination] = nullOrigin;
+    }
+  }
+  if (sources.isDefinite() && destinations.isDefinite())
+    copyConditionalPointerSnapshots(state, sources.objects.front(), true,
+                                    destinations.objects.front(), true);
+}
+
+void LifetimeCheckPass::visitPredicates(
+    PathState &state,
+    llvm::function_ref<void(std::optional<ValuePredicate> &)> visit) {
+  auto visitValue = [&](ValueSummary &value) {
+    if (value.predicate) {
+      std::optional<ValuePredicate> predicate = *value.predicate;
+      visit(predicate);
+      if (!predicate)
+        value.predicate.reset();
+      else if (*predicate != *value.predicate)
+        value.predicate =
+            std::make_shared<const ValuePredicate>(std::move(*predicate));
+    }
+    for (auto &predicate : value.elementPredicates)
+      visit(predicate);
+  };
+  for (auto &entry : state.values)
+    visitValueSummary(entry.second, visitValue);
+  for (auto &entry : state.storedValues)
+    visitValueSummary(entry.second, visitValue);
+}
+
+void LifetimeCheckPass::invalidatePredicates(PathState &state,
+                                             const ObjectTargets &targets) {
+  auto affected = [&](ObjectId object) {
+    return targets.unknown || llvm::is_contained(targets.objects, object);
+  };
+  visitPredicates(state, [&](std::optional<ValuePredicate> &predicate) {
+    if (!predicate)
+      return;
+    if (predicate->domain != ValuePredicate::ConditionalMove) {
+      if (llvm::any_of(predicate->objects.objects, affected))
+        predicate.reset();
+      return;
+    }
+    // A write invalidates only facts about the overwritten storage. It need
+    // not invalidate a still-useful result predicate for another object.
+    for (auto *snapshots : {&predicate->before, &predicate->after})
+      for (auto &snapshot : *snapshots) {
+        if (affected(snapshot.object))
+          snapshot.valid = false;
+        if (affected(snapshot.object) ||
+            llvm::any_of(snapshot.ownershipGroup, affected))
+          snapshot.ownershipValid = false;
+      }
+    for (auto *snapshots :
+         {&predicate->pointersBefore, &predicate->pointersAfter})
+      for (auto &snapshot : *snapshots)
+        if (snapshot.stored && affected(snapshot.value))
+          snapshot.valid = false;
+  });
+  for (ObjectId object : targets.objects)
+    state.lastWrites[object] = activeOperation;
+}
+
+void LifetimeCheckPass::invalidateConditionalDependencies(PathState &state,
+                                                          ObjectId object,
+                                                          bool storage) {
+  auto affected = [&](const std::optional<PointerValueSummary> &pointer) {
+    return pointer &&
+           (llvm::is_contained(pointer->borrowedOwners, object) ||
+            (storage && llvm::is_contained(pointer->targets.objects, object)));
+  };
+  visitPredicates(state, [&](std::optional<ValuePredicate> &predicate) {
+    if (!predicate || predicate->domain != ValuePredicate::ConditionalMove)
+      return;
+    // Test dependencies in each saved alternative, not in their joined
+    // current payload. Clearing the container destroys the success-side
+    // resource, but cannot destroy the failure-side source resource.
+    for (auto *snapshots : {&predicate->before, &predicate->after})
+      for (auto &snapshot : *snapshots)
+        if (affected(snapshot.pointer) ||
+            snapshot.pset.count(State::getOwnedBy(object)) ||
+            (storage && (snapshot.object == object ||
+                         snapshot.pset.count(State::getLocalValue(object)))))
+          snapshot.valid = false;
+    for (auto *snapshots :
+         {&predicate->pointersBefore, &predicate->pointersAfter})
+      for (auto &snapshot : *snapshots)
+        if (affected(snapshot.pointer))
+          snapshot.valid = false;
+  });
+}
+
+void LifetimeCheckPass::invalidateConditionalOwnership(PathState &state,
+                                                       ObjectId object) {
+  visitPredicates(state, [&](std::optional<ValuePredicate> &predicate) {
+    if (!predicate || predicate->domain != ValuePredicate::ConditionalMove)
+      return;
+    for (auto *snapshots : {&predicate->before, &predicate->after})
+      for (auto &snapshot : *snapshots)
+        if (snapshot.object == object ||
+            llvm::is_contained(snapshot.ownershipGroup, object))
+          snapshot.ownershipValid = false;
+  });
+}
+
+void LifetimeCheckPass::copyConditionalPointerSnapshots(
+    PathState &state, Value source, bool sourceStored, Value destination,
+    bool destinationStored) {
+  visitPredicates(state, [&](std::optional<ValuePredicate> &predicate) {
+    if (!predicate || predicate->domain != ValuePredicate::ConditionalMove)
+      return;
+    for (bool after : {false, true}) {
+      auto &objects = after ? predicate->after : predicate->before;
+      auto &pointers =
+          after ? predicate->pointersAfter : predicate->pointersBefore;
+      SmallVector<ValuePredicate::PointerSnapshot, 0> copies;
+      if (sourceStored)
+        for (const auto &snapshot : objects)
+          if (snapshot.object == source && snapshot.pointer) {
+            ValuePredicate::PointerSnapshot copy;
+            copy.pointer = snapshot.pointer;
+            copy.valid = snapshot.valid && state.lastWrites.lookup(source) ==
+                                               snapshot.expectedWrite;
+            copies.push_back(std::move(copy));
+          }
+      for (const auto &snapshot : pointers)
+        if (snapshot.value == source && snapshot.stored == sourceStored) {
+          auto copy = snapshot;
+          copy.valid &= !sourceStored || state.lastWrites.lookup(source) ==
+                                             snapshot.expectedWrite;
+          copies.push_back(std::move(copy));
+        }
+      for (auto &copy : copies) {
+        copy.value = destination;
+        copy.stored = destinationStored;
+        copy.expectedWrite =
+            destinationStored ? state.lastWrites.lookup(destination) : nullptr;
+        auto info = getObjectInfo(destination);
+        if (destinationStored && copy.tuplePath.empty() && copy.pointer &&
+            info && info->category == ObjectInfo::Pointer) {
+          // The new slot receives the saved branch payload, not the joined
+          // payload that happened to be copied in the physical CIR order.
+          ValuePredicate::ObjectSnapshot object;
+          object.object = destination;
+          object.pointer = copy.pointer;
+          object.valid = copy.valid;
+          object.expectedWrite = copy.expectedWrite;
+          object.history = copy.pointer->invalidHistory;
+          object.nullOrigin = copy.pointer->nullOrigin;
+          object.occupancy = getOccupancy(state, ObjectTargets{{destination}});
+          for (ObjectId pointee : copy.pointer->targets.objects)
+            object.pset.insert(State::getLocalValue(pointee));
+          for (ObjectId owner : copy.pointer->borrowedOwners)
+            object.pset.insert(State::getOwnedBy(owner));
+          if (copy.pointer->targets.mayBeNull)
+            object.pset.insert(State::getNullPtr());
+          if (copy.pointer->targets.mayBeInvalid)
+            object.pset.insert(State::getInvalid());
+          if (copy.pointer->mayBeNonNull && object.pset.empty())
+            object.pset.insert(State::getGlobal());
+          auto existing = llvm::find_if(objects, [&](const auto &snapshot) {
+            return snapshot.object == destination;
+          });
+          if (existing == objects.end())
+            objects.push_back(std::move(object));
+          else
+            *existing = std::move(object);
+          continue;
+        }
+        auto existing = llvm::find_if(pointers, [&](const auto &snapshot) {
+          return snapshot.value == destination &&
+                 snapshot.stored == destinationStored &&
+                 snapshot.tuplePath == copy.tuplePath;
+        });
+        if (existing == pointers.end())
+          pointers.push_back(std::move(copy));
+        else
+          *existing = std::move(copy);
+      }
+    }
+  });
+}
+
+LifetimeCheckPass::ValuePredicate
+LifetimeCheckPass::makeConditionalMovePredicate(const PathState &before,
+                                                const PathState &after,
+                                                const ObjectTargets &targets,
+                                                Operation *site) {
+  ValuePredicate predicate;
+  predicate.domain = ValuePredicate::ConditionalMove;
+  predicate.objects = targets;
+  predicate.conditionSite = site;
+  auto captureObject = [&](const PathState &state, ObjectId object) {
+    ValuePredicate::ObjectSnapshot snapshot;
+    snapshot.object = object;
+    snapshot.pset = state.pmap.lookup(object);
+    snapshot.history = state.invalidHist.lookup(object);
+    snapshot.nullOrigin = state.nullHist.lookup(object);
+    auto value = state.storedValues.find(object);
+    if (value != state.storedValues.end()) {
+      snapshot.pointer = value->second.pointer;
+      snapshot.valueOccupancy = value->second.objectOccupancy;
+    }
+    snapshot.occupancy = getOccupancy(state, ObjectTargets{{object}});
+    snapshot.ownershipGroup = state.ownershipGroups.lookup(object);
+    snapshot.expectedWrite = site;
+    return snapshot;
+  };
+  SmallVector<ObjectId, 16> objects;
+  for (const auto &entry : before.pmap)
+    objects.push_back(entry.first);
+  for (const auto &entry : after.pmap)
+    if (!llvm::is_contained(objects, entry.first))
+      objects.push_back(entry.first);
+  appendUnique(objects, ArrayRef<ObjectId>(targets.objects));
+  llvm::sort(objects, [](ObjectId a, ObjectId b) {
+    return std::less<const void *>()(a.getAsOpaquePointer(),
+                                     b.getAsOpaquePointer());
+  });
+  for (ObjectId object : objects) {
+    auto first = captureObject(before, object);
+    auto second = captureObject(after, object);
+    if (first == second && !llvm::is_contained(targets.objects, object))
+      continue;
+    predicate.before.push_back(std::move(first));
+    predicate.after.push_back(std::move(second));
+  }
+  // Capture changed SSA pointer payloads and logical tuple elements. The
+  // payloads contain no predicates, avoiding recursively growing snapshots.
+  auto capturePointers = [&](const auto &firstMap, const auto &secondMap,
+                             bool stored) {
+    SmallVector<Value, 16> values;
+    for (const auto &entry : firstMap)
+      if (secondMap.count(entry.first))
+        values.push_back(entry.first);
+    llvm::sort(values, [](Value a, Value b) {
+      return std::less<const void *>()(a.getAsOpaquePointer(),
+                                       b.getAsOpaquePointer());
+    });
+    for (Value value : values) {
+      SmallVector<unsigned, 0> path;
+      auto capture = [&](auto &&self, const ValueSummary &first,
+                         const ValueSummary &second) -> void {
+        // Root stored pointers are already in ObjectSnapshot.
+        if ((!stored || !path.empty()) && first.pointer != second.pointer) {
+          ValuePredicate::PointerSnapshot snapshot;
+          snapshot.value = value;
+          snapshot.tuplePath = path;
+          snapshot.stored = stored;
+          snapshot.expectedWrite = stored ? site : nullptr;
+          snapshot.pointer = first.pointer;
+          predicate.pointersBefore.push_back(snapshot);
+          snapshot.pointer = second.pointer;
+          predicate.pointersAfter.push_back(std::move(snapshot));
+        }
+        for (unsigned index = 0; index < std::min(first.tupleValues.size(),
+                                                  second.tupleValues.size());
+             ++index) {
+          path.push_back(index);
+          self(self, first.tupleValues[index], second.tupleValues[index]);
+          path.pop_back();
+        }
+      };
+      capture(capture, firstMap.find(value)->second,
+              secondMap.find(value)->second);
+    }
+  };
+  capturePointers(before.values, after.values, false);
+  capturePointers(before.storedValues, after.storedValues, true);
+  return predicate;
+}
+
+void LifetimeCheckPass::setConditionalMoveSite(
+    PathState &state, const ValuePredicate &predicate) {
+  for (const auto &snapshot : predicate.before)
+    state.lastWrites[snapshot.object] = predicate.conditionSite;
+  for (const auto &snapshot : predicate.pointersBefore)
+    if (snapshot.stored)
+      state.lastWrites[snapshot.value] = predicate.conditionSite;
+}
+
+void LifetimeCheckPass::joinStateInto(PathState &result,
+                                      const PathState &state) {
+  assert(&result != &state && "join inputs must not alias");
+  for (const auto &entry : state.pmap)
+    llvm::set_union(result.pmap[entry.first], entry.second);
+  for (const auto &entry : state.invalidHist)
+    appendUnique(result.invalidHist[entry.first].entries,
+                 ArrayRef<InvalidHistEntry>(entry.second.entries));
+  for (const auto &entry : state.nullHist)
+    if (!result.nullHist.lookup(entry.first))
+      result.nullHist[entry.first] = entry.second;
+  for (auto &entry : result.values)
+    if (!state.values.count(entry.first))
+      clearBooleanValues(entry.second);
+  for (const auto &entry : state.values) {
+    auto found = result.values.find(entry.first);
+    if (found == result.values.end()) {
+      auto inserted = result.values.insert(entry);
+      clearBooleanValues(inserted.first->second);
+    } else
+      found->second = joinValues(found->second, entry.second);
+  }
+  for (auto &entry : result.storedValues)
+    if (!state.storedValues.count(entry.first))
+      clearBooleanValues(entry.second);
+  for (const auto &entry : state.storedValues) {
+    auto found = result.storedValues.find(entry.first);
+    if (found == result.storedValues.end()) {
+      auto inserted = result.storedValues.insert(entry);
+      clearBooleanValues(inserted.first->second);
+    } else
+      found->second = joinValues(found->second, entry.second);
+  }
+  // No map entry denotes unknown occupancy, not absence of an incoming
+  // path. A replacement in just one branch cannot establish presence.
+  for (auto &entry : result.occupancy)
+    if (!state.occupancy.count(entry.first))
+      entry.second.unknown = true;
+  for (const auto &entry : state.occupancy) {
+    auto found = result.occupancy.find(entry.first);
+    if (found == result.occupancy.end()) {
+      result.occupancy.insert(entry);
+      result.occupancy[entry.first].unknown = true;
+      continue;
+    }
+    found->second.mayBeEmpty |= entry.second.mayBeEmpty;
+    found->second.mayBePresent |= entry.second.mayBePresent;
+    found->second.unknown |= entry.second.unknown;
+    appendUnique(found->second.emptyOrigins,
+                 ArrayRef<Location>(entry.second.emptyOrigins));
+  }
+  appendUnique(result.liveObjects, ArrayRef<ObjectId>(state.liveObjects));
+  for (auto &entry : result.lastWrites)
+    if (state.lastWrites.lookup(entry.first) != entry.second)
+      entry.second = nullptr;
+  // Co-ownership is a must fact, unlike invalid/null may facts. A relation
+  // absent from either incoming path cannot keep a resource alive.
+  SmallVector<ObjectId, 4> forgottenGroups;
+  for (auto &entry : result.ownershipGroups) {
+    auto other = state.ownershipGroups.find(entry.first);
+    if (other == state.ownershipGroups.end()) {
+      forgottenGroups.push_back(entry.first);
+      continue;
+    }
+    llvm::erase_if(entry.second, [&](ObjectId holder) {
+      return !llvm::is_contained(other->second, holder);
+    });
+    if (entry.second.size() < 2)
+      forgottenGroups.push_back(entry.first);
+  }
+  for (ObjectId object : forgottenGroups)
+    result.ownershipGroups.erase(object);
+  for (const auto &entry : state.ownerMutations)
+    appendUnique(result.ownerMutations[entry.first],
+                 ArrayRef<Operation *>(entry.second));
+  for (const auto &witness : state.diagnostics) {
+    auto found = llvm::find_if(result.diagnostics, [&](const auto &other) {
+      return witness.operation == other.operation &&
+             witness.object == other.object && witness.style == other.style;
+    });
+    if (found == result.diagnostics.end()) {
+      result.diagnostics.push_back(witness);
+    } else {
+      llvm::set_union(found->pset, witness.pset);
+      appendUnique(found->history.entries,
+                   ArrayRef<InvalidHistEntry>(witness.history.entries));
+      if (!found->nullOrigin)
+        found->nullOrigin = witness.nullOrigin;
+    }
+  }
+}
+
+LifetimeCheckPass::PathState
+LifetimeCheckPass::joinStates(ArrayRef<const PathState *> states) {
+  if (states.empty())
+    return {};
+  PathState result = *states.front();
+  for (const PathState *state : states.drop_front())
+    joinStateInto(result, *state);
+  return result;
+}
+
+bool LifetimeCheckPass::equivalentStates(const PathState &a,
+                                         const PathState &b) {
+  // Diagnostic accumulation does not drive the fixed point. Every witness is
+  // retained separately and emitted once after solving the function.
+  return a.pmap == b.pmap && a.invalidHist == b.invalidHist &&
+         a.nullHist == b.nullHist && a.values == b.values &&
+         a.storedValues == b.storedValues && a.occupancy == b.occupancy &&
+         a.liveObjects == b.liveObjects && a.lastWrites == b.lastWrites &&
+         a.ownerMutations == b.ownerMutations &&
+         a.ownershipGroups == b.ownershipGroups;
+}
+
+void LifetimeCheckPass::mergeFlow(FlowResult &destination, FlowResult source) {
+  if (source.normal) {
+    if (destination.normal)
+      joinStateInto(*destination.normal, *source.normal);
+    else
+      destination.normal = std::move(source.normal);
+  }
+  auto merge = [&](SmallVectorImpl<PathState> &to,
+                   SmallVectorImpl<PathState> &from) {
+    if (from.empty())
+      return;
+    to.append(std::make_move_iterator(from.begin()),
+              std::make_move_iterator(from.end()));
+    if (to.size() > 1) {
+      PathState joined = std::move(to.front());
+      for (const PathState &state : llvm::drop_begin(to))
+        joinStateInto(joined, state);
+      to.clear();
+      to.push_back(std::move(joined));
+    }
+  };
+  merge(destination.breaks, source.breaks);
+  merge(destination.continues, source.continues);
+  merge(destination.returns, source.returns);
+  for (auto &jump : source.gotos) {
+    auto found = llvm::find_if(destination.gotos, [&](const auto &other) {
+      return other.label == jump.label;
+    });
+    if (found == destination.gotos.end())
+      destination.gotos.push_back(std::move(jump));
+    else
+      joinStateInto(found->state, jump.state);
+  }
+  for (auto &exception : source.exceptions) {
+    auto found = llvm::find_if(destination.exceptions, [&](const auto &other) {
+      return other.thrownType == exception.thrownType &&
+             other.typeInfo == exception.typeInfo;
+    });
+    if (found == destination.exceptions.end())
+      destination.exceptions.push_back(std::move(exception));
+    else
+      joinStateInto(found->state, exception.state);
+  }
+}
+
+std::optional<bool>
+LifetimeCheckPass::evaluateCondition(Value condition, const PathState &state) {
+  if (auto constant = condition.getDefiningOp<ConstantOp>())
+    if (auto value = dyn_cast<cir::BoolAttr>(constant.getValue()))
+      return value.getValue();
+  // A captured SSA result is authoritative even if a library predicate used
+  // to compute it has changed since that evaluation.
+  if (auto recorded = state.values.find(condition);
+      recorded != state.values.end() && recorded->second.booleanValue)
+    return recorded->second.booleanValue;
+  if (auto negate = condition.getDefiningOp<NotOp>())
+    if (auto known = evaluateCondition(negate.getInput(), state))
+      return !*known;
+  auto summary = summarizeValue(condition, state);
+  if (summary.booleanValue)
+    return summary.booleanValue;
+  if (!summary.predicate)
+    return std::nullopt;
+  const auto &predicate = *summary.predicate;
+  if (predicate.domain == ValuePredicate::ConditionalMove)
+    return std::nullopt;
+  auto occupancy = getOccupancy(state, predicate.objects);
+  if (occupancy.unknown || occupancy.mayBeEmpty == occupancy.mayBePresent)
+    return std::nullopt;
+  return occupancy.mayBePresent == predicate.trueMeansPresent;
+}
+
+LifetimeCheckPass::PathState
+LifetimeCheckPass::refineCondition(Value condition, bool truth,
+                                   PathState state) {
+  auto summary = summarizeValue(condition, state);
+  if (!summary.predicate)
+    return state;
+  const auto &predicate = *summary.predicate;
+  if (predicate.domain == ValuePredicate::ConditionalMove) {
+    bool consumed = truth == predicate.trueMeansPresent;
+    const auto &snapshots = consumed ? predicate.after : predicate.before;
+    auto valid = [&](const ValuePredicate::ObjectSnapshot &snapshot) {
+      return snapshot.valid &&
+             state.lastWrites.lookup(snapshot.object) == snapshot.expectedWrite;
+    };
+    for (const auto &snapshot : snapshots) {
+      if (!valid(snapshot))
+        continue;
+      state.pmap[snapshot.object] = snapshot.pset;
+      state.invalidHist[snapshot.object] = snapshot.history;
+      state.nullHist[snapshot.object] = snapshot.nullOrigin;
+      state.storedValues[snapshot.object].pointer = snapshot.pointer;
+      state.storedValues[snapshot.object].objectOccupancy =
+          snapshot.valueOccupancy;
+      state.occupancy[snapshot.object] = snapshot.occupancy;
+    }
+    for (const auto &snapshot :
+         consumed ? predicate.pointersAfter : predicate.pointersBefore) {
+      if (!snapshot.valid ||
+          (snapshot.stored &&
+           state.lastWrites.lookup(snapshot.value) != snapshot.expectedWrite))
+        continue;
+      auto &values = snapshot.stored ? state.storedValues : state.values;
+      auto found = values.find(snapshot.value);
+      if (found == values.end())
+        continue;
+      ValueSummary *value = &found->second;
+      for (unsigned index : snapshot.tuplePath) {
+        if (index >= value->tupleValues.size()) {
+          value = nullptr;
+          break;
+        }
+        value = &value->tupleValues[index];
+      }
+      if (value)
+        value->pointer = snapshot.pointer;
+    }
+    // Re-establish only complete, unchanged ownership relations. Restoring a
+    // single peer after another holder was reset would resurrect a resource.
+    auto validGroup = [&](const ValuePredicate::ObjectSnapshot &snapshot) {
+      if (!valid(snapshot) || !snapshot.ownershipValid)
+        return false;
+      return llvm::all_of(snapshot.ownershipGroup, [&](ObjectId holder) {
+        auto peer = llvm::find_if(snapshots, [&](const auto &candidate) {
+          return candidate.object == holder;
+        });
+        return peer != snapshots.end() && valid(*peer) &&
+               peer->ownershipValid &&
+               peer->ownershipGroup == snapshot.ownershipGroup;
+      });
+    };
+    for (const auto &snapshot : snapshots) {
+      if (!validGroup(snapshot))
+        continue;
+      state.ownershipGroups.erase(snapshot.object);
+      for (auto &entry : state.ownershipGroups)
+        llvm::erase(entry.second, snapshot.object);
+    }
+    for (const auto &snapshot : snapshots)
+      if (validGroup(snapshot) && snapshot.ownershipGroup.size() > 1)
+        state.ownershipGroups[snapshot.object] = snapshot.ownershipGroup;
+    SmallVector<ObjectId, 4> singletons;
+    for (const auto &entry : state.ownershipGroups)
+      if (entry.second.size() < 2)
+        singletons.push_back(entry.first);
+    for (ObjectId object : singletons)
+      state.ownershipGroups.erase(object);
+    return state;
+  }
+  if (!predicate.objects.isDefinite())
+    return state;
+  ObjectId object = predicate.objects.objects.front();
+  bool present = truth == predicate.trueMeansPresent;
+  auto &occupancy = state.occupancy[object];
+  occupancy.unknown = false;
+  occupancy.mayBePresent = present;
+  occupancy.mayBeEmpty = !present;
+  if (present) {
+    occupancy.emptyOrigins.clear();
+    // Presence proves a null fact impossible; it does not prove that a moved
+    // or dangling fact is impossible.
+    state.pmap[object].erase(State::getNullPtr());
+    state.nullHist.erase(object);
+  }
+  return state;
+}
+
+LifetimeCheckPass::PathState
+LifetimeCheckPass::finishRegionOperation(Operation *operation,
+                                         ValueRange yielded, PathState state) {
+  for (auto pair : llvm::zip(operation->getResults(), yielded)) {
+    setValueSummary(state, std::get<0>(pair),
+                    summarizeValue(std::get<1>(pair), state));
+    copyConditionalPointerSnapshots(state, std::get<1>(pair), false,
+                                    std::get<0>(pair), false);
+  }
+  return state;
+}
+
+LifetimeCheckPass::FlowResult
+LifetimeCheckPass::analyzeCall(Operation *operation, PathState state) {
+  auto call = dyn_cast<CallOp>(operation);
+  if (!call)
+    return {std::move(state)};
+  CallInfo info;
+  info.op = operation;
+  if (call.getCallee())
+    info.callee = getCalleeFromSymbol(*moduleSymbols, *call.getCallee());
+  if (info.callee)
+    info.lifetime = info.callee.getLifetimeAttr();
+  info.args.append(call.getArgOperands().begin(), call.getArgOperands().end());
+  for (Value argument : info.args)
+    info.argValues.push_back(summarizeValue(argument, state));
+  info.mayThrow = !call.getNothrow() && !call.getNounwind();
+  // CIRGen omits unwinding when exceptions are disabled. Honor that serialized
+  // module fact after text/bytecode reload as well. Missing metadata remains
+  // conservative; a noexcept function can still contain an internal catch.
+  if (auto langOptions = theModule->getAttrOfType<LoweringLangOptionsAttr>(
+          CIRDialect::getLoweringLangOptionsAttrName()))
+    info.mayThrow &= langOptions.getExceptions();
+  if (info.lifetime && info.lifetime.getIsMethod() &&
+      !info.lifetime.getIsStatic() && !info.args.empty())
+    info.receiver = resolveAddress(info.args.front(), state);
+  // A call can modify previously escaped storage even without a pointer
+  // argument at this call site. Without escape/effect proofs, forget stored
+  // boolean constants on both normal and exceptional continuations. Already
+  // evaluated SSA values (including argument values above) remain snapshots.
+  clearStoredBooleanValues(state);
+  if (auto modeled = modelLibraryCall(info, state))
+    return std::move(*modeled);
+
+  std::optional<PathState> exceptional;
+  if (info.mayThrow)
+    exceptional.emplace(state);
+  Attribute special = info.callee ? info.callee.getFuncInfoAttr() : Attribute{};
+  auto ctor = dyn_cast_if_present<CXXCtorAttr>(special);
+  auto assignment = dyn_cast_if_present<CXXAssignAttr>(special);
+  bool moveSpecial =
+      (ctor && ctor.getCtorKind() == CtorKind::Move) ||
+      (assignment && assignment.getAssignKind() == AssignKind::Move);
+  bool handledSpecial = false;
+  if ((ctor || assignment) && info.receiver.isDefinite() &&
+      info.args.size() >= 2) {
+    ObjectTargets source = resolveAddress(info.args[1], state);
+    ObjectId destination = info.receiver.objects.front();
+    auto destinationInfo = getObjectInfo(destination);
+    if (destinationInfo && !source.objects.empty()) {
+      if (moveSpecial &&
+          (destinationInfo->category != ObjectInfo::Pointer ||
+           llvm::any_of(source.objects, [&](ObjectId object) {
+             return state.pmap[object].count(State::getInvalid());
+           })))
+        checkUse(state, source, call.getLoc(), UseAfterMove);
+      // Snapshot the source before destination mutation, including self move.
+      PSetType sourceSet;
+      InvalidHist sourceHistory;
+      std::optional<Location> nullOrigin;
+      ValueSummary sourceValue;
+      bool first = true;
+      for (ObjectId object : source.objects) {
+        llvm::set_union(sourceSet, state.pmap[object]);
+        appendUnique(
+            sourceHistory.entries,
+            ArrayRef<InvalidHistEntry>(state.invalidHist[object].entries));
+        if (!nullOrigin)
+          nullOrigin = state.nullHist.lookup(object);
+        auto value = state.storedValues.lookup(object);
+        sourceValue = first ? value : joinValues(sourceValue, value);
+        first = false;
+      }
+      if (assignment && destinationInfo->category == ObjectInfo::Owner)
+        invalidateOwnerContents(state, info.receiver, call.getLoc());
+      reinitializeObjects(state, info.receiver, call.getLoc());
+      if (destinationInfo->category == ObjectInfo::Pointer) {
+        state.pmap[destination] = std::move(sourceSet);
+        state.invalidHist[destination] = std::move(sourceHistory);
+        if (nullOrigin)
+          state.nullHist[destination] = nullOrigin;
+        else
+          state.nullHist.erase(destination);
+        storeSummary(state, info.receiver, sourceValue);
+      }
+      if (moveSpecial) {
+        markMoved(state, source, call.getLoc());
+        if (exceptional)
+          markMoved(*exceptional, source, call.getLoc());
+      }
+      handledSpecial = true;
+    }
+  }
+  if (!handledSpecial) {
+    StateGuard guard(*this, state);
+    checkCall(call);
+  }
+  if ((ctor || assignment) && !handledSpecial && info.receiver.isDefinite()) {
+    auto object = info.receiver.objects.front();
+    auto type = getObjectInfo(object);
+    if (type && type->category != ObjectInfo::Pointer)
+      reinitializeObjects(state, info.receiver, call.getLoc());
+  }
+
+  if (info.lifetime && info.lifetime.hasParameterInfo()) {
+    for (unsigned param = 0; param < info.lifetime.getNumParams(); ++param) {
+      unsigned index = info.lifetime.getParamOperandIndex(param);
+      if (index >= info.args.size() || (handledSpecial && index == 1))
+        continue;
+      auto targets = resolveAddress(info.args[index], state);
+      if (!info.lifetime.isParamRValueReference(param)) {
+        for (ObjectId object : targets.objects) {
+          auto type = getObjectInfo(object);
+          if (type && !tasks.count(object) &&
+              (type->category == ObjectInfo::Record ||
+               type->category == ObjectInfo::Aggregate) &&
+              state.pmap[object].count(State::getInvalid()))
+            checkUse(state, ObjectTargets{{object}}, call.getLoc());
+        }
+        continue;
+      }
+      checkUse(state, targets, call.getLoc(), UseAfterMove);
+      // Obtaining an element reference does not consume the containing tuple.
+      // Keep the generic source checks, result summary, and exceptional flow.
+      if (info.lifetime.getLibraryFunction() ==
+          LifetimeLibraryFunction::TupleGet)
+        continue;
+      markMoved(state, targets, call.getLoc());
+      if (exceptional)
+        markMoved(*exceptional, targets, call.getLoc());
+    }
+  }
+  if (info.lifetime && info.lifetime.getIsMethod() && !ctor && !assignment &&
+      !dyn_cast_if_present<CXXDtorAttr>(special)) {
+    for (ObjectId object : info.receiver.objects) {
+      auto type = getObjectInfo(object);
+      if (type && !tasks.count(object) &&
+          (type->category == ObjectInfo::Record ||
+           type->category == ObjectInfo::Aggregate) &&
+          state.pmap[object].count(State::getInvalid()))
+        checkUse(state, ObjectTargets{{object}}, call.getLoc());
+    }
+  }
+  synchronizeSummaries(state);
+  for (Value result : call->getResults()) {
+    ValueSummary summary = summarizeValue(result, state);
+    if (!summary.pointer && isPointerType(result.getType()))
+      summary.pointer.emplace();
+    if (summary.pointer && summary.pointer->targets.objects.empty())
+      summary.pointer->targets.objects.push_back(result);
+    if (info.lifetime && info.lifetime.getReturnsNonnull() && summary.pointer) {
+      summary.pointer->targets.unknown = false;
+      summary.pointer->mayBeNonNull = true;
+      summary.pointer->unknownNullness = false;
+      summary.unknown = false;
+    }
+    setValueSummary(state, result, std::move(summary));
+  }
+  FlowResult result{std::move(state)};
+  if (exceptional) {
+    // A successful assignment/reinitialization is not assumed on an
+    // exceptional path; operand evaluation and possible source consumption
+    // already occurred. Other calls retain both possible effect states.
+    if (!ctor && !assignment)
+      joinStateInto(*exceptional, *result.normal);
+    result.exceptions.push_back({std::move(*exceptional), {}});
+  }
+  return result;
+}
+
+LifetimeCheckPass::FlowResult
+LifetimeCheckPass::leaveScope(FlowResult flow, ArrayRef<ObjectId> locals,
+                              Location loc) {
+  auto end = [&](PathState &state) {
+    StateGuard guard(*this, state);
+    for (ObjectId object : locals) {
+      if (!llvm::is_contained(state.liveObjects, object))
+        continue;
+      kill(State::getLocalValue(object), InvalidStyle::EndOfScope, loc);
+      auto invalidate = [&](ValueSummary &value) {
+        if (!value.pointer)
+          return;
+        if (llvm::is_contained(value.pointer->targets.objects, object) ||
+            llvm::is_contained(value.pointer->borrowedOwners, object)) {
+          value.pointer->targets.mayBeInvalid = true;
+          value.pointer->invalidHistory.add(object, EndOfScope, loc, object);
+        }
+      };
+      for (auto &entry : state.values)
+        visitValueSummary(entry.second, invalidate);
+      for (auto &entry : state.storedValues)
+        visitValueSummary(entry.second, invalidate);
+    }
+    if (currScope)
+      for (auto returned : currScope->localRetLambdas)
+        checkPointerDeref(returned.first, returned.second, RetLambda);
+  };
+  if (flow.normal)
+    end(*flow.normal);
+  for (auto &state : flow.breaks)
+    end(state);
+  for (auto &state : flow.continues)
+    end(state);
+  for (auto &state : flow.returns)
+    end(state);
+  for (auto &exception : flow.exceptions)
+    end(exception.state);
+  for (auto &jump : flow.gotos)
+    end(jump.state);
+  return flow;
+}
+
+LifetimeCheckPass::FlowResult
+LifetimeCheckPass::leaveOperationScope(Operation *scope, FlowResult flow) {
+  if (flow.normal && scope->getNumResults() && scope->getNumRegions()) {
+    Region &body = scope->getRegion(0);
+    if (!body.empty() && !body.back().empty())
+      if (auto yield = dyn_cast<YieldOp>(body.back().back()))
+        flow.normal = finishRegionOperation(scope, yield.getArgs(),
+                                            std::move(*flow.normal));
+  }
+  if (auto cleanup = dyn_cast<CleanupScopeOp>(scope)) {
+    FlowResult cleaned;
+    auto run = [&](PathState state, unsigned kind, Type thrownType = {},
+                   FlatSymbolRefAttr typeInfo = {}, StringAttr label = {}) {
+      bool unwind = kind == 4;
+      bool applies = unwind ? cleanup.getCleanupKindAttr().isEH()
+                            : cleanup.getCleanupKindAttr().isNormal();
+      FlowResult result =
+          applies ? analyzeRegion(cleanup.getCleanupRegion(), std::move(state))
+                  : FlowResult{std::move(state)};
+      if (result.normal) {
+        switch (kind) {
+        case 0:
+          break;
+        case 1:
+          result.breaks.push_back(std::move(*result.normal));
+          result.normal.reset();
+          break;
+        case 2:
+          result.continues.push_back(std::move(*result.normal));
+          result.normal.reset();
+          break;
+        case 3:
+          result.returns.push_back(std::move(*result.normal));
+          result.normal.reset();
+          break;
+        case 4:
+          result.exceptions.push_back(
+              {std::move(*result.normal), thrownType, typeInfo});
+          result.normal.reset();
+          break;
+        case 5:
+          result.gotos.push_back({std::move(*result.normal), label});
+          result.normal.reset();
+          break;
+        }
+      }
+      mergeFlow(cleaned, std::move(result));
+    };
+    if (flow.normal)
+      run(std::move(*flow.normal), 0);
+    for (auto &state : flow.breaks)
+      run(std::move(state), 1);
+    for (auto &state : flow.continues)
+      run(std::move(state), 2);
+    for (auto &state : flow.returns)
+      run(std::move(state), 3);
+    for (auto &exception : flow.exceptions)
+      run(std::move(exception.state), 4, exception.thrownType,
+          exception.typeInfo);
+    for (auto &jump : flow.gotos)
+      run(std::move(jump.state), 5, {}, {}, jump.label);
+    flow = std::move(cleaned);
+  }
+  SmallVector<ObjectId> locals;
+  for (auto entry : objectInfo) {
+    auto *definition = entry.second.storageRoot.getDefiningOp();
+    if (entry.second.callerOwned || !definition)
+      continue;
+    auto *parent = definition->getParentOp();
+    while (parent && parent != scope &&
+           !parent->hasTrait<OpTrait::AutomaticAllocationScope>())
+      parent = parent->getParentOp();
+    if (parent == scope)
+      locals.push_back(entry.first);
+  }
+  return leaveScope(std::move(flow), locals, getEndLocForHist(scope));
+}
+
+LifetimeCheckPass::FlowResult LifetimeCheckPass::analyzeBlock(Block &block,
+                                                              PathState state) {
+  FlowResult result{std::move(state)};
+  for (Operation &operation : block) {
+    if (!result.normal)
+      break;
+    FlowResult current =
+        transferOperation(&operation, std::move(*result.normal));
+    result.normal.reset();
+    mergeFlow(result, std::move(current));
+    if (operation.hasTrait<OpTrait::IsTerminator>())
+      break;
+  }
+  return result;
+}
+
+LifetimeCheckPass::FlowResult
+LifetimeCheckPass::analyzeRegion(Region &region, PathState state, bool scoped) {
+  // Full expressions can contain thousands of nested temporary cleanups.
+  // Continue the same CIR analysis on a fresh stack when necessary; the
+  // enclosing invocation waits, so path state and diagnostics remain serial.
+  std::optional<FlowResult> result;
+  bool canContinue = true;
+  clang::runWithSufficientStackSpace(
+      [&] {
+#if !LLVM_ENABLE_THREADS
+        canContinue = false;
+#endif
+      },
+      [&] {
+        if (canContinue)
+          result = analyzeRegionImpl(region, std::move(state), scoped);
+      });
+  // A non-threaded build cannot extend the stack. Also do not silently accept
+  // an empty result if an enclosing crash-recovery context interrupted it.
+  if (!result) {
+    mlir::emitError(region.getLoc(),
+                    "CIR lifetime analysis could not continue on a sufficient "
+                    "stack");
+    signalPassFailure();
+    return {};
+  }
+  return std::move(*result);
+}
+
+LifetimeCheckPass::FlowResult
+LifetimeCheckPass::analyzeRegionImpl(Region &region, PathState state,
+                                     bool scoped) {
+  if (region.empty())
+    return {std::move(state)};
+  LexicalScopeContext local{&region};
+  auto *previousScope = currScope;
+  if (scoped)
+    currScope = &local;
+  FlowResult result;
+  // A label-free block without incoming or outgoing edges cannot be
+  // re-entered within this region. Consume its state directly: retaining an
+  // entry snapshot at every nested cleanup scope copies growing state prefixes.
+  // Symbolic gotos without a local label still propagate to the enclosing
+  // region, and nested regions keep their own control-flow handling.
+  if (llvm::hasSingleElement(region) && region.front().hasNoPredecessors() &&
+      llvm::none_of(region.front(), [](Operation &operation) {
+        return isa<LabelOp>(operation) || operation.getNumSuccessors() != 0;
+      })) {
+    result = analyzeBlock(region.front(), std::move(state));
+  } else {
+    // CIR is normally structured here. Follow explicit block edges as well:
+    // unreachable continuation blocks after return/throw are not executable.
+    DenseMap<Block *, PathState> entries;
+    DenseMap<StringAttr, Block *> labels;
+    for (Block &block : region)
+      for (Operation &operation : block)
+        if (auto label = dyn_cast<LabelOp>(operation))
+          labels[label.getLabelAttr()] = &block;
+    SmallVector<Block *> worklist;
+    auto enqueue = [&](Block *successor, ValueRange operands, PathState next) {
+      for (auto pair : llvm::zip(successor->getArguments(), operands))
+        setValueSummary(next, std::get<0>(pair),
+                        summarizeValue(std::get<1>(pair), next));
+      auto found = entries.find(successor);
+      if (found == entries.end()) {
+        entries[successor] = std::move(next);
+        worklist.push_back(successor);
+      } else {
+        auto joined = joinStates({&found->second, &next});
+        if (!equivalentStates(found->second, joined)) {
+          found->second = std::move(joined);
+          worklist.push_back(successor);
+        }
+      }
+    };
+    enqueue(&region.front(), {}, std::move(state));
+    while (!worklist.empty()) {
+      Block *block = worklist.pop_back_val();
+      FlowResult blockFlow = analyzeBlock(*block, entries[block]);
+      SmallVector<GotoState, 0> outgoing;
+      for (auto &jump : blockFlow.gotos) {
+        auto target = labels.find(jump.label);
+        if (target != labels.end())
+          enqueue(target->second, {}, std::move(jump.state));
+        else
+          outgoing.push_back(std::move(jump));
+      }
+      blockFlow.gotos = std::move(outgoing);
+      if (blockFlow.normal && !block->empty() &&
+          block->back().getNumSuccessors()) {
+        if (auto branch = dyn_cast<BrOp>(block->getTerminator()))
+          enqueue(branch.getDest(), branch.getDestOperands(),
+                  *blockFlow.normal);
+        else {
+          mlir::emitError(block->getTerminator()->getLoc(),
+                          "unsupported CFG terminator in lifetime analysis");
+          signalPassFailure();
+        }
+        blockFlow.normal.reset();
+      }
+      mergeFlow(result, std::move(blockFlow));
+    }
+  }
+  if (scoped) {
+    SmallVector<ObjectId> locals(local.localValues.begin(),
+                                 local.localValues.end());
+    result = leaveScope(std::move(result), locals,
+                        getEndLocForHist(region.getParentOp()));
+    currScope = previousScope;
+  }
+  return result;
+}
+
+LifetimeCheckPass::FlowResult
+LifetimeCheckPass::analyzeLoop(LoopOpInterface loop, PathState input) {
+  PathState head = input;
+  FlowResult exits;
+  bool bodyFirst = &loop.getEntry() == &loop.getBody();
+  auto cleanup = [&](FlowResult flow) {
+    auto *region = loop.maybeGetCleanup();
+    auto kind = loop.maybeGetCleanupKind();
+    if (!region || !kind)
+      return flow;
+    // Loop cleanup applies on every iteration exit, including continue, break,
+    // false condition, and exceptional unwinding.
+    FlowResult result;
+    auto run = [&](PathState state, unsigned exit, Type thrown = {},
+                   FlatSymbolRefAttr typeInfo = {}, StringAttr label = {}) {
+      bool applies = exit == 4 ? kind.isEH() : kind.isNormal();
+      FlowResult cleaned = applies ? analyzeRegion(*region, std::move(state))
+                                   : FlowResult{std::move(state)};
+      if (cleaned.normal && exit) {
+        if (exit == 1)
+          cleaned.breaks.push_back(std::move(*cleaned.normal));
+        if (exit == 2)
+          cleaned.continues.push_back(std::move(*cleaned.normal));
+        if (exit == 3)
+          cleaned.returns.push_back(std::move(*cleaned.normal));
+        if (exit == 4)
+          cleaned.exceptions.push_back(
+              {std::move(*cleaned.normal), thrown, typeInfo});
+        if (exit == 5)
+          cleaned.gotos.push_back({std::move(*cleaned.normal), label});
+        cleaned.normal.reset();
+      }
+      mergeFlow(result, std::move(cleaned));
+    };
+    if (flow.normal)
+      run(std::move(*flow.normal), 0);
+    for (auto &state : flow.breaks)
+      run(std::move(state), 1);
+    for (auto &state : flow.continues)
+      run(std::move(state), 2);
+    for (auto &state : flow.returns)
+      run(std::move(state), 3);
+    for (auto &exception : flow.exceptions)
+      run(std::move(exception.state), 4, exception.thrownType,
+          exception.typeInfo);
+    for (auto &jump : flow.gotos)
+      run(std::move(jump.state), 5, {}, {}, jump.label);
+    return result;
+  };
+  for (unsigned iteration = 0;; ++iteration) {
+    if (iteration == 4096) {
+      mlir::emitError(loop->getLoc(),
+                      "lifetime loop analysis did not converge");
+      signalPassFailure();
+      return exits;
+    }
+    FlowResult current{head};
+    auto condition = [&](FlowResult flow) {
+      if (!flow.normal)
+        return flow;
+      auto checked = analyzeRegion(loop.getCond(), std::move(*flow.normal));
+      flow.normal.reset();
+      if (checked.normal) {
+        Value value;
+        if (!loop.getCond().empty())
+          if (auto cond =
+                  dyn_cast<ConditionOp>(loop.getCond().back().getTerminator()))
+            value = cond.getCondition();
+        auto known =
+            value ? evaluateCondition(value, *checked.normal) : std::nullopt;
+        if (!known || !*known) {
+          PathState falseState =
+              value ? refineCondition(value, false, *checked.normal)
+                    : *checked.normal;
+          FlowResult falseExit = cleanup(FlowResult{std::move(falseState)});
+          mergeFlow(exits, std::move(falseExit));
+        }
+        if (known && !*known)
+          checked.normal.reset();
+        else if (value)
+          checked.normal =
+              refineCondition(value, true, std::move(*checked.normal));
+      }
+      mergeFlow(flow, std::move(checked));
+      return flow;
+    };
+    if (!bodyFirst)
+      current = condition(std::move(current));
+    if (current.normal) {
+      auto body = analyzeRegion(loop.getBody(), std::move(*current.normal));
+      current.normal.reset();
+      mergeFlow(current, std::move(body));
+    }
+    // Continue reaches the increment (and the condition in a do-while), while
+    // break and return do not. Always evaluate the first increment.
+    for (auto &continued : current.continues) {
+      if (current.normal)
+        joinStateInto(*current.normal, continued);
+      else
+        current.normal = std::move(continued);
+    }
+    current.continues.clear();
+    if (current.normal && loop.maybeGetStep()) {
+      auto step =
+          analyzeRegion(*loop.maybeGetStep(), std::move(*current.normal));
+      current.normal.reset();
+      mergeFlow(current, std::move(step));
+    }
+    if (bodyFirst)
+      current = condition(std::move(current));
+    current = cleanup(std::move(current));
+    auto backedge = std::move(current.normal);
+    current.normal.reset();
+    for (auto &broken : current.breaks)
+      mergeFlow(exits, FlowResult{std::move(broken)});
+    current.breaks.clear();
+    mergeFlow(exits, std::move(current));
+    if (!backedge)
+      break;
+    PathState next = joinStates({&input, &head, &*backedge});
+    if (equivalentStates(head, next))
+      break;
+    head = std::move(next);
+  }
+  return exits;
+}
+
+LifetimeCheckPass::FlowResult
+LifetimeCheckPass::transferOperation(Operation *operation, PathState state) {
+  llvm::SaveAndRestore<Operation *> operationGuard(activeOperation, operation);
+  // These operations can form long, finite chains (for example, else-if
+  // dispatch). Keep leaf value summaries and other transfer scratch in an
+  // outlined fallback so that every recursive level does not reserve them.
+  if (auto ifOp = dyn_cast<IfOp>(operation)) {
+    FlowResult result;
+    auto known = evaluateCondition(ifOp.getCondition(), state);
+    if (!known || *known)
+      mergeFlow(result,
+                analyzeRegion(ifOp.getThenRegion(),
+                              refineCondition(ifOp.getCondition(), true, state),
+                              true));
+    if (!known || !*known)
+      mergeFlow(result, analyzeRegion(ifOp.getElseRegion(),
+                                      refineCondition(ifOp.getCondition(),
+                                                      false, std::move(state)),
+                                      true));
+    return result;
+  } else if (auto ternary = dyn_cast<TernaryOp>(operation)) {
+    FlowResult result;
+    auto known = evaluateCondition(ternary.getCond(), state);
+    if (!known || *known)
+      mergeFlow(result,
+                analyzeRegion(ternary.getTrueRegion(),
+                              refineCondition(ternary.getCond(), true, state)));
+    if (!known || !*known)
+      mergeFlow(result, analyzeRegion(ternary.getFalseRegion(),
+                                      refineCondition(ternary.getCond(), false,
+                                                      std::move(state))));
+    return result;
+  } else if (isa<ScopeOp, CleanupScopeOp>(operation)) {
+    LexicalScopeContext local{operation};
+    llvm::SaveAndRestore<LexicalScopeContext *> scopeGuard(currScope, &local);
+    auto flow = analyzeRegion(operation->getRegion(0), std::move(state));
+    return leaveOperationScope(operation, std::move(flow));
+  }
+  return transferOtherOperation(operation, std::move(state));
+}
+
+LifetimeCheckPass::FlowResult
+LifetimeCheckPass::transferOtherOperation(Operation *operation, PathState state) {
+  if (auto alloca = dyn_cast<AllocaOp>(operation)) {
+    initializeObject(state, alloca.getAddr(), alloca.getLoc());
+  } else if (auto load = dyn_cast<LoadOp>(operation)) {
+    transferLoad(load, state);
+  } else if (auto store = dyn_cast<StoreOp>(operation)) {
+    transferStore(store, state);
+  } else if (auto copy = dyn_cast<CopyOp>(operation)) {
+    transferCopy(copy, state);
+  } else if (auto call = dyn_cast<CallOp>(operation)) {
+    auto result = analyzeCall(operation, std::move(state));
+    bool noReturn = call->hasAttr(CIRDialect::getNoReturnAttrName());
+    if (!noReturn && call.getCallee())
+      if (auto callee = getCalleeFromSymbol(*moduleSymbols, *call.getCallee()))
+        noReturn = callee->hasAttr(CIRDialect::getNoReturnAttrName());
+    // CIR cleanup regions may end in yield after a noreturn destructor.
+    // The call still has argument/diagnostic effects, and can throw, but its
+    // normal continuation cannot reach another statement or loop iteration.
+    if (noReturn)
+      result.normal.reset();
+    return result;
+  } else if (auto cast = dyn_cast<CastOp>(operation)) {
+    // Preserve identity through address casts. Arithmetic/numeric conversions
+    // do not make the source of an arbitrary expression a consumed object.
+    if (isa<cir::PointerType>(cast.getSrc().getType()) &&
+        isa<cir::PointerType>(cast.getResult().getType())) {
+      setValueSummary(state, cast.getResult(),
+                      summarizeValue(cast.getSrc(), state));
+      copyConditionalPointerSnapshots(state, cast.getSrc(), false,
+                                      cast.getResult(), false);
+    }
+  } else if (auto negate = dyn_cast<NotOp>(operation)) {
+    if (isa<cir::BoolType>(negate.getType())) {
+      ValueSummary summary;
+      summary.booleanValue = evaluateCondition(negate.getInput(), state);
+      if (summary.booleanValue)
+        summary.booleanValue = !*summary.booleanValue;
+      summary.predicate = summarizeValue(negate.getInput(), state).predicate;
+      if (summary.predicate) {
+        auto predicate = *summary.predicate;
+        predicate.trueMeansPresent = !predicate.trueMeansPresent;
+        summary.predicate =
+            std::make_shared<const ValuePredicate>(std::move(predicate));
+      }
+      setValueSummary(state, negate.getResult(), std::move(summary));
+    }
+  } else if (auto member = dyn_cast<GetMemberOp>(operation)) {
+    auto canonical = canonicalObjects.find(member.getResult());
+    if (canonical != canonicalObjects.end()) {
+      ValueSummary address;
+      address.pointer.emplace();
+      address.pointer->targets.objects.push_back(canonical->second);
+      address.pointer->mayBeNonNull = true;
+      setValueSummary(state, member.getResult(), std::move(address));
+    }
+  } else if (auto stride = dyn_cast<PtrStrideOp>(operation)) {
+    setValueSummary(state, stride.getResult(),
+                    summarizeValue(stride.getBase(), state));
+  } else if (auto element = dyn_cast<GetElementOp>(operation)) {
+    setValueSummary(state, element.getResult(),
+                    summarizeValue(element.getBase(), state));
+  } else if (auto yield = dyn_cast<YieldOp>(operation)) {
+    state = finishRegionOperation(operation->getParentOp(), yield.getArgs(),
+                                  std::move(state));
+  } else if (auto select = dyn_cast<SelectOp>(operation)) {
+    auto known = evaluateCondition(select.getCondition(), state);
+    ValueSummary summary;
+    if (known)
+      summary = summarizeValue(
+          *known ? select.getTrueValue() : select.getFalseValue(), state);
+    else
+      summary = joinValues(summarizeValue(select.getTrueValue(), state),
+                           summarizeValue(select.getFalseValue(), state));
+    setValueSummary(state, select.getResult(), std::move(summary));
+  } else if (auto loop = dyn_cast<LoopOpInterface>(operation)) {
+    return analyzeLoop(loop, std::move(state));
+  } else if (auto switchOp = dyn_cast<SwitchOp>(operation)) {
+    SmallVector<CaseOp> cases;
+    if (!switchOp.isSimpleForm(cases))
+      return {std::move(state)};
+    FlowResult result;
+    if (llvm::none_of(
+            cases, [](CaseOp c) { return c.getKind() == CaseOpKind::Default; }))
+      result.normal = state;
+    for (unsigned start = 0; start < cases.size(); ++start) {
+      // An empty entry executes the same suffix from the same incoming state
+      // as the following case. Keep the final entry, which can be an identity
+      // exit, and determine default coverage from the original cases above.
+      Region &entry = cases[start].getRegion();
+      if (start + 1 < cases.size() && llvm::hasSingleElement(entry) &&
+          entry.front().getNumArguments() == 0 &&
+          llvm::hasSingleElement(entry.front())) {
+        auto yield = dyn_cast<YieldOp>(entry.front().front());
+        if (yield && yield.getArgs().empty())
+          continue;
+      }
+      FlowResult path{state};
+      for (unsigned index = start; index < cases.size() && path.normal;
+           ++index) {
+        auto next =
+            analyzeRegion(cases[index].getRegion(), std::move(*path.normal));
+        path.normal.reset();
+        mergeFlow(path, std::move(next));
+      }
+      for (auto &broken : path.breaks)
+        mergeFlow(result, FlowResult{std::move(broken)});
+      path.breaks.clear();
+      mergeFlow(result, std::move(path));
+    }
+    return result;
+  } else if (auto tryOp = dyn_cast<TryOp>(operation)) {
+    auto result = analyzeRegion(tryOp.getTryRegion(), std::move(state), true);
+    auto exceptions = std::move(result.exceptions);
+    result.exceptions.clear();
+    for (auto &exception : exceptions) {
+      bool caught = false;
+      auto kinds = tryOp.getHandlerTypes();
+      for (unsigned index = 0; kinds && index < kinds.size(); ++index) {
+        Attribute kind = kinds[index];
+        bool all = isa<CatchAllAttr>(kind);
+        bool unwind = isa<UnwindAttr, EhFilterAttr, EhUnexpectedAttr>(kind);
+        auto typed = dyn_cast<GlobalViewAttr>(kind);
+        bool exact = typed && exception.typeInfo &&
+                     typed.getSymbol() == exception.typeInfo;
+        // Distinct class RTTI does not prove a mismatch: a base-class handler
+        // can catch a derived object. Pointer exceptions also permit standard
+        // conversions. Without a serialized class hierarchy, retain both the
+        // matching-handler and later-handler alternatives for these cases.
+        bool scalar = exception.thrownType &&
+                      isa<cir::IntType, cir::BoolType, cir::FPTypeInterface>(
+                          exception.thrownType);
+        if (typed && exception.typeInfo && !exact && scalar)
+          continue;
+        llvm::SaveAndRestore<FlatSymbolRefAttr> exceptionGuard(
+            currentExceptionType, exception.typeInfo);
+        llvm::SaveAndRestore<Type> exceptionTypeGuard(currentExceptionIRType,
+                                                      exception.thrownType);
+        auto handler = analyzeRegion(tryOp.getHandlerRegions()[index],
+                                     exception.state, true);
+        if (unwind && handler.normal) {
+          handler.exceptions.push_back({std::move(*handler.normal),
+                                        exception.thrownType,
+                                        exception.typeInfo});
+          handler.normal.reset();
+        }
+        mergeFlow(result, std::move(handler));
+        if (all || exact || unwind) {
+          caught = true;
+          break;
+        }
+      }
+      if (!caught)
+        result.exceptions.push_back(std::move(exception));
+    }
+    return result;
+  } else if (auto throwOp = dyn_cast<ThrowOp>(operation)) {
+    FlowResult result;
+    Type thrownType = currentExceptionIRType;
+    if (auto exception = throwOp.getExceptionPtr())
+      if (auto pointer = dyn_cast<cir::PointerType>(exception.getType()))
+        thrownType = pointer.getPointee();
+    result.exceptions.push_back({std::move(state), thrownType,
+                                 throwOp.getTypeInfoAttr()
+                                     ? throwOp.getTypeInfoAttr()
+                                     : currentExceptionType});
+    return result;
+  } else if (isa<ResumeOp>(operation)) {
+    FlowResult result;
+    result.exceptions.push_back({std::move(state), {}});
+    return result;
+  } else if (auto coroutine = dyn_cast<CoroutineOp>(operation)) {
+    FlowResult result{std::move(state)};
+    for (Region *region :
+         {&coroutine.getInitialSuspend(), &coroutine.getBody(),
+          &coroutine.getFinalSuspend(), &coroutine.getExit()}) {
+      if (!result.normal)
+        break;
+      auto next = analyzeRegion(*region, std::move(*result.normal));
+      result.normal.reset();
+      mergeFlow(result, std::move(next));
+    }
+    return result;
+  } else if (auto await = dyn_cast<AwaitOp>(operation)) {
+    FlowResult result;
+    for (Region &region : await->getRegions())
+      mergeFlow(result, analyzeRegion(region, state));
+    return result;
+  } else if (auto ret = dyn_cast<ReturnOp>(operation)) {
+    {
+      StateGuard guard(*this, state);
+      checkReturn(ret);
+    }
+    FlowResult result;
+    result.returns.push_back(std::move(state));
+    return result;
+  } else if (auto jump = dyn_cast<GotoOp>(operation)) {
+    FlowResult result;
+    result.gotos.push_back({std::move(state), jump.getLabelAttr()});
+    return result;
+  } else if (isa<BreakOp>(operation)) {
+    FlowResult result;
+    result.breaks.push_back(std::move(state));
+    return result;
+  } else if (isa<ContinueOp>(operation)) {
+    FlowResult result;
+    result.continues.push_back(std::move(state));
+    return result;
+  } else if (isa<UnreachableOp>(operation)) {
+    return {};
+  } else if (isa<ConditionOp, BrOp, LabelOp>(operation)) {
+    // These operations carry control without mutating storage, even though
+    // they do not all expose a memory-effect interface.
+    return {std::move(state)};
+  } else if (auto effects = dyn_cast<MemoryEffectOpInterface>(operation)) {
+    SmallVector<MemoryEffects::EffectInstance> instances;
+    effects.getEffects(instances);
+    if (llvm::any_of(instances, [](const auto &effect) {
+          return isa<MemoryEffects::Write, MemoryEffects::Free>(
+              effect.getEffect());
+        }))
+      clearStoredBooleanValues(state);
+  } else if (!mlir::isMemoryEffectFree(operation)) {
+    // An unmodeled operation without a memory-effect contract cannot preserve
+    // a must fact about mutable storage. This does not reset lifetime facts.
+    clearStoredBooleanValues(state);
+  }
+  return {std::move(state)};
+}
+
+void LifetimeCheckPass::recordWitness(PathState &state,
+                                      DiagnosticWitness witness) {
+  auto record = [&](auto &witnesses) {
+    auto found = llvm::find_if(witnesses, [&](const auto &other) {
+      return witness.operation == other.operation &&
+             witness.object == other.object && witness.style == other.style;
+    });
+    if (found == witnesses.end()) {
+      witnesses.push_back(witness);
+      return;
+    }
+    llvm::set_union(found->pset, witness.pset);
+    appendUnique(found->history.entries,
+                 ArrayRef<InvalidHistEntry>(witness.history.entries));
+    if (!found->nullOrigin)
+      found->nullOrigin = witness.nullOrigin;
+  };
+  record(state.diagnostics);
+  record(functionWitnesses);
+}
+
+void LifetimeCheckPass::emitWitnesses(const FlowResult &flow) {
+  SmallVector<const PathState *, 4> states;
+  if (flow.normal)
+    states.push_back(&*flow.normal);
+  for (const PathState &state : flow.breaks)
+    states.push_back(&state);
+  for (const PathState &state : flow.continues)
+    states.push_back(&state);
+  for (const PathState &state : flow.returns)
+    states.push_back(&state);
+  for (const auto &exception : flow.exceptions)
+    states.push_back(&exception.state);
+  PathState observed;
+  observed.diagnostics.assign(functionWitnesses.begin(),
+                              functionWitnesses.end());
+  states.push_back(&observed);
+  PathState joined = joinStates(states);
+  emittingWitnesses = true;
+  for (const auto &witness : joined.diagnostics) {
+    PathState state;
+    state.pmap[witness.object] = witness.pset;
+    state.invalidHist[witness.object] = witness.history;
+    if (witness.nullOrigin)
+      state.nullHist[witness.object] = witness.nullOrigin;
+    StateGuard guard(*this, state);
+    auto generations = owners;
+    for (auto generation : witness.ownerGenerations)
+      owners[generation.first] = generation.second;
+    checkPointerDeref(witness.object, witness.location, witness.style);
+    owners = std::move(generations);
+  }
+  emittingWitnesses = false;
+}
+
+#include "LifetimeCheckLibrary.inc"
+
 void LifetimeCheckPass::runOnOperation() {
+  // cir-opt does not initialize Clang's stack accounting on its own.
+  clang::noteBottomOfStack();
   opts.parseOptions(*this);
   Operation *op = getOperation();
   if (opts.error) {
@@ -2610,7 +4638,12 @@ void LifetimeCheckPass::runOnOperation() {
   }
   if (failed(validateSwitchControlFlow(op)))
     return signalPassFailure();
-  checkOperation(op);
+  theModule = cast<ModuleOp>(op);
+  mlir::SymbolTable symbols(theModule);
+  llvm::SaveAndRestore<mlir::SymbolTable *> symbolGuard(moduleSymbols,
+                                                        &symbols);
+  for (auto function : theModule.getOps<FuncOp>())
+    checkFunc(function);
 }
 
 std::unique_ptr<Pass> mlir::createLifetimeCheckPass() {
