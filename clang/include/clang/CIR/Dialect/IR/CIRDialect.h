@@ -99,6 +99,10 @@ RecordLayoutAttr getRecordLayout(mlir::ModuleOp mod, mlir::StringAttr name);
 /// Same lookup as getRecordLayout, but returns a null attribute instead of
 /// asserting when the record has no layout entry.
 RecordLayoutAttr tryGetRecordLayout(mlir::ModuleOp mod, mlir::StringAttr name);
+
+/// Look up lifetime facts for a record in the module's cir.lifetime_records
+/// dictionary. Returns a null attribute when the record has no entry.
+LifetimeRecordAttr getLifetimeRecord(RecordType record, mlir::ModuleOp mod);
 } // namespace cir
 
 // TableGen'erated files for MLIR dialects require that a macro be defined when

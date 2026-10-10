@@ -1046,6 +1046,38 @@ RecordLayoutAttr cir::getRecordLayout(mlir::ModuleOp mod,
 }
 
 //===----------------------------------------------------------------------===//
+// Lifetime metadata
+//===----------------------------------------------------------------------===//
+
+LogicalResult LifetimeRecordAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, bool owner, bool pointer,
+    bool lambda, bool promiseType) {
+  if (owner && pointer)
+    return emitError() << "a lifetime record cannot be both an owner and a pointer";
+  return success();
+}
+
+LogicalResult LifetimeFunctionAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, bool isMethod, bool isStatic,
+    bool isConst, bool isOverloadedOperator) {
+  if (isStatic && !isMethod)
+    return emitError() << "a static lifetime function must be a method";
+  if (isConst && (!isMethod || isStatic))
+    return emitError() << "a const lifetime function must be a non-static method";
+  return success();
+}
+
+LifetimeRecordAttr cir::getLifetimeRecord(RecordType record, mlir::ModuleOp mod) {
+  if (!record || !record.getName())
+    return {};
+  auto dict = mod->getAttrOfType<mlir::DictionaryAttr>(
+      CIRDialect::getLifetimeRecordsAttrName());
+  if (!dict)
+    return {};
+  return dict.getAs<LifetimeRecordAttr>(record.getName());
+}
+
+//===----------------------------------------------------------------------===//
 // CIR Dialect
 //===----------------------------------------------------------------------===//
 

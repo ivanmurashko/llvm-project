@@ -1,0 +1,23 @@
+// RUN: cir-opt %s --verify-roundtrip | FileCheck %s
+
+module attributes {cir.lifetime_records = {
+  Owner = #cir.lifetime_record<owner = true, pointer = false, lambda = false, promise_type = false>,
+  Pointer = #cir.lifetime_record<owner = false, pointer = true, lambda = false, promise_type = false>,
+  Lambda = #cir.lifetime_record<owner = false, pointer = false, lambda = true, promise_type = false>,
+  Task = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = true>
+}} {
+  cir.func private @observe() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = false>}
+  cir.func private @static_method() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = true, is_const = false, is_overloaded_operator = false>}
+  cir.func private @call_operator() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = true>}
+  cir.func private @free_function()
+}
+
+// CHECK-DAG: Owner = #cir.lifetime_record<owner = true, pointer = false, lambda = false, promise_type = false>
+// CHECK-DAG: Pointer = #cir.lifetime_record<owner = false, pointer = true, lambda = false, promise_type = false>
+// CHECK-DAG: Lambda = #cir.lifetime_record<owner = false, pointer = false, lambda = true, promise_type = false>
+// CHECK-DAG: Task = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = true>
+// CHECK: cir.func private @observe() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = false>}
+// CHECK: cir.func private @static_method() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = true, is_const = false, is_overloaded_operator = false>}
+// CHECK: cir.func private @call_operator() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = true>}
+// CHECK: cir.func private @free_function()
+// CHECK-NOT: lifetime

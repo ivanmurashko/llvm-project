@@ -253,6 +253,8 @@ mlir::Type CIRGenTypes::convertRecordDeclType(const clang::RecordDecl *rd) {
     recordDeclTypes[key] = entry;
   }
 
+  cgm.addLifetimeRecord(rd, entry);
+
   rd = rd->getDefinition();
   if (!rd || !rd->isCompleteDefinition() || entry.isComplete())
     return entry;

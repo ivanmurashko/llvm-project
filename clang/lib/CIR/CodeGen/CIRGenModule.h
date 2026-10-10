@@ -36,6 +36,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/TargetParser/Triple.h"
@@ -113,6 +114,10 @@ private:
   /// Accumulated record layout entries, materialized in release().
   llvm::SmallVector<mlir::NamedAttribute> recordLayoutEntries;
 
+  /// Record declarations whose final lifetime facts are emitted in release().
+  llvm::DenseMap<mlir::StringAttr, const clang::RecordDecl *>
+      lifetimeRecordDecls;
+
   llvm::DenseSet<clang::GlobalDecl> diagnosedConflictingDefinitions;
 
   /// -------
@@ -169,6 +174,14 @@ public:
   void addRecordLayout(mlir::StringAttr name, cir::RecordLayoutAttr attr) {
     recordLayoutEntries.push_back(mlir::NamedAttribute(name, attr));
   }
+
+  /// Queue even incomplete records so late definitions and inferred attributes
+  /// are observed when release() materializes the lifetime metadata.
+  void addLifetimeRecord(const clang::RecordDecl *record,
+                         cir::RecordType type) {
+    lifetimeRecordDecls[type.getName()] = record;
+  }
+  void emitLifetimeRecords();
   clang::ASTContext &getASTContext() const { return astContext; }
   const clang::TargetInfo &getTarget() const { return target; }
   const clang::CodeGenOptions &getCodeGenOpts() const { return codeGenOpts; }
@@ -827,6 +840,9 @@ public:
   /// form (constructor, destructor, assignment) or a known standard library
   /// entity that passes can recognize without the AST.
   void setFuncInfoAttr(cir::FuncOp funcOp, const clang::FunctionDecl *funcDecl);
+
+  void setLifetimeFunctionAttr(cir::FuncOp funcOp,
+                               const clang::FunctionDecl *funcDecl);
 
   cir::FuncOp createRuntimeFunction(cir::FuncType ty, llvm::StringRef name,
                                     mlir::NamedAttrList extraAttrs = {},

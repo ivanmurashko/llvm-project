@@ -98,6 +98,7 @@ def CIR_Dialect : Dialect {
     static llvm::StringRef getResAttrsAttrName() { return "res_attrs"; }
     static llvm::StringRef getArgAttrsAttrName() { return "arg_attrs"; }
     static llvm::StringRef getRecordLayoutsAttrName() { return "cir.record_layouts"; }
+    static llvm::StringRef getLifetimeRecordsAttrName() { return "cir.lifetime_records"; }
     static llvm::StringRef getTargetCPUAttrName() { return "cir.target-cpu"; }
     static llvm::StringRef getTuneCPUAttrName() { return "cir.tune-cpu"; }
     static llvm::StringRef getTargetFeaturesAttrName() { return "cir.target-features"; }
