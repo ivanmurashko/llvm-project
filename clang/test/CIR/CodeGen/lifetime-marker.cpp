@@ -3,7 +3,7 @@
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -O2 -fclangir -emit-llvm -disable-llvm-passes %s -o %t.ll
 // RUN: FileCheck --input-file=%t.ll %s --check-prefix=LLVM
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -fclangir -emit-cir %s -o %t-o0.cir
-// RUN: FileCheck --input-file=%t-o0.cir %s --implicit-check-not "cir.lifetime"
+// RUN: FileCheck --input-file=%t-o0.cir %s --implicit-check-not "cir.lifetime.{{(start|end)}}"
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -O1 -fcxx-exceptions -fexceptions -fclangir -emit-cir %s -o %t-eh.cir
 // RUN: FileCheck --input-file=%t-eh.cir %s --check-prefix=CIR-EH
 // RUN: %clang_cc1 -triple x86_64-unknown-linux-gnu -O1 -fcxx-exceptions -fexceptions -fclangir -emit-llvm -disable-llvm-passes %s -o %t-eh.ll
@@ -72,7 +72,7 @@ void bypass_switch(int n) {
 }
 
 // CIR-LABEL: cir.func{{.*}}bypass_switch
-// CIR-NOT:     cir.lifetime
+// CIR-NOT:     cir.lifetime.{{(start|end)}}
 
 // LLVM-LABEL: define{{.*}}bypass_switch
 // LLVM-NOT:    call void @llvm.lifetime
@@ -86,7 +86,7 @@ target:
 }
 
 // CIR-LABEL: cir.func{{.*}}bypass_label
-// CIR-NOT:     cir.lifetime
+// CIR-NOT:     cir.lifetime.{{(start|end)}}
 
 void bypass_indirect_goto() {
   int x;
@@ -98,7 +98,7 @@ target:
 }
 
 // CIR-LABEL: cir.func{{.*}}bypass_indirect_goto
-// CIR-NOT:     cir.lifetime
+// CIR-NOT:     cir.lifetime.{{(start|end)}}
 
 // A local declared inside the body region of an if statement is scoped to that
 // region: its lifetime.start/end are nested in the region and the end marker

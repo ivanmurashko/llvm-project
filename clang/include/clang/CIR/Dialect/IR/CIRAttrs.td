@@ -226,6 +226,67 @@ def CIR_RecordLayoutAttr : CIR_Attr<"RecordLayout", "record_layout", [
 }
 
 //===----------------------------------------------------------------------===//
+// Lifetime metadata
+//===----------------------------------------------------------------------===//
+
+def CIR_LifetimeRecordAttr : CIR_Attr<"LifetimeRecord", "lifetime_record"> {
+  let summary = "Record properties used by lifetime analysis";
+  let description = [{
+    Holds the semantic facts used to classify records during lifetime
+    analysis. Entries live in the module's `cir.lifetime_records` dictionary,
+    keyed by the record type's name, including incomplete record types.
+    Records without an entry have none of these properties.
+
+    `owner` and `pointer` reflect the GSL Owner and Pointer attributes,
+    including attributes inferred by Sema. `lambda` identifies closure types.
+    `promise_type` identifies a class template specialization that declares a
+    nested record named `promise_type`, as used by the coroutine lifetime
+    model. It does not represent arbitrary coroutine-traits lookup.
+
+    These facts are independent of ABI layout and survive textual CIR
+    round-trips without retaining a Clang AST declaration.
+  }];
+
+  let parameters = (ins
+    "bool":$owner,
+    "bool":$pointer,
+    "bool":$lambda,
+    "bool":$promise_type
+  );
+  let assemblyFormat = [{
+    `<` struct($owner, $pointer, $lambda, $promise_type) `>`
+  }];
+  let genVerifyDecl = 1;
+  let canHaveIllegalCXXABIType = 0;
+}
+
+def CIR_LifetimeFunctionAttr : CIR_Attr<"LifetimeFunction", "lifetime_function"> {
+  let summary = "Function properties used by lifetime analysis";
+  let description = [{
+    Records whether a function is a C++ method, a static method, a const
+    method, or an overloaded operator. The attribute is separate from
+    `func_info`, which describes constructors, destructors, assignments, and
+    known standard library functions. Both can be present on the same
+    `cir.func`.
+
+    All fields are serializable semantic facts; analysis does not require a
+    live Clang AST to interpret them.
+  }];
+
+  let parameters = (ins
+    "bool":$is_method,
+    "bool":$is_static,
+    "bool":$is_const,
+    "bool":$is_overloaded_operator
+  );
+  let assemblyFormat = [{
+    `<` struct($is_method, $is_static, $is_const, $is_overloaded_operator) `>`
+  }];
+  let genVerifyDecl = 1;
+  let canHaveIllegalCXXABIType = 0;
+}
+
+//===----------------------------------------------------------------------===//
 // OptInfoAttr
 //===----------------------------------------------------------------------===//
 

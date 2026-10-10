@@ -1,0 +1,44 @@
+// RUN: cir-opt %s -verify-diagnostics -split-input-file
+
+// expected-error @below {{'cir.lifetime_records' must be a dictionary attribute}}
+module attributes {cir.lifetime_records = "invalid"} {}
+
+// -----
+
+// expected-error @below {{'cir.lifetime_records' entry 'Owner' must be a #cir.lifetime_record attribute}}
+module attributes {cir.lifetime_records = {Owner = true}} {}
+
+// -----
+
+module {
+  // expected-error @below {{'cir.lifetime_records' must be attached to a module}}
+  cir.func private @invalid() attributes {cir.lifetime_records = {}}
+}
+
+// -----
+
+module attributes {cir.lifetime_records = {
+  // expected-error @below {{a lifetime record cannot be both an owner and a pointer}}
+  Invalid = #cir.lifetime_record<owner = true, pointer = true, lambda = false, promise_type = false>
+}} {}
+
+// -----
+
+module {
+  // expected-error @below {{a static lifetime function must be a method}}
+  cir.func private @invalid() attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = true, is_const = false, is_overloaded_operator = false>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{a const lifetime function must be a non-static method}}
+  cir.func private @invalid() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = true, is_const = true, is_overloaded_operator = false>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{a const lifetime function must be a non-static method}}
+  cir.func private @invalid() attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = true, is_overloaded_operator = false>}
+}

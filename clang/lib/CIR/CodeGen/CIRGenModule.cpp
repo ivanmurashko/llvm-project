@@ -22,6 +22,7 @@
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/Attrs.inc"
 #include "clang/AST/DeclBase.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclOpenACC.h"
 #include "clang/AST/GlobalDecl.h"
 #include "clang/AST/Mangle.h"
@@ -3743,6 +3744,7 @@ CIRGenModule::createCIRFunction(mlir::Location loc, StringRef name,
     // Record the func_info tag, a C++ special member form or a known standard
     // library entity.
     setFuncInfoAttr(func, funcDecl);
+    setLifetimeFunctionAttr(func, funcDecl);
 
     if (funcDecl && this->getLangOpts().OpenACC) {
       // We only have to handle this attribute, since OpenACCAnnotAttrs are
@@ -3913,6 +3915,46 @@ CIRGenModule::getMLIRVisibilityFromCIRLinkage(cir::GlobalLinkageKind glk) {
   llvm_unreachable("linkage should be handled above!");
 }
 
+void CIRGenModule::setLifetimeFunctionAttr(
+    cir::FuncOp funcOp, const clang::FunctionDecl *funcDecl) {
+  if (const auto *method = dyn_cast_or_null<CXXMethodDecl>(funcDecl))
+    funcOp.setLifetimeAttr(cir::LifetimeFunctionAttr::get(
+        &getMLIRContext(), /*isMethod=*/true, method->isStatic(),
+        method->isConst(), method->isOverloadedOperator()));
+}
+
+void CIRGenModule::emitLifetimeRecords() {
+  llvm::SmallVector<mlir::NamedAttribute> entries;
+  for (auto [name, decl] : lifetimeRecordDecls) {
+    const RecordDecl *record = decl->getDefinitionOrSelf();
+    // Sema also attaches these attributes when inferring standard library
+    // owners and pointers, so explicit and inferred annotations share a path.
+    bool owner = record->hasAttr<OwnerAttr>();
+    bool pointer = record->hasAttr<PointerAttr>();
+    const auto *cxxRecord = dyn_cast<CXXRecordDecl>(record);
+    bool lambda = cxxRecord && cxxRecord->isLambda();
+    bool promiseType = false;
+    if (isa<ClassTemplateSpecializationDecl>(record)) {
+      for (const Decl *member : record->decls()) {
+        const auto *nested = dyn_cast<CXXRecordDecl>(member);
+        if (nested && nested->getDeclName().isIdentifier() &&
+            nested->getName() == "promise_type") {
+          promiseType = true;
+          break;
+        }
+      }
+    }
+    if (!owner && !pointer && !lambda && !promiseType)
+      continue;
+    entries.emplace_back(name, cir::LifetimeRecordAttr::get(
+                                   &getMLIRContext(), owner, pointer, lambda,
+                                   promiseType));
+  }
+  if (!entries.empty())
+    theModule->setAttr(cir::CIRDialect::getLifetimeRecordsAttrName(),
+                      mlir::DictionaryAttr::get(&getMLIRContext(), entries));
+}
+
 void CIRGenModule::release() {
   emitDeferred();
   emitVTablesOpportunistically();
@@ -3927,6 +3969,8 @@ void CIRGenModule::release() {
     theModule->setAttr(
         cir::CIRDialect::getRecordLayoutsAttrName(),
         mlir::DictionaryAttr::get(&getMLIRContext(), recordLayoutEntries));
+
+  emitLifetimeRecords();
 
   if (getTriple().isAMDGPU() ||
       (getTriple().isSPIRV() && getTriple().getVendor() == llvm::Triple::AMD))

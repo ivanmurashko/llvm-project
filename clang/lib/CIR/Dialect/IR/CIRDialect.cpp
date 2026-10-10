@@ -257,6 +257,22 @@ cir::CIRDialect::verifyOperationAttribute(mlir::Operation *op,
   if (isOpenCLVersionAttrName(attrName))
     return verifyOpenCLVersionAttr(op, attr);
 
+  if (attrName == getLifetimeRecordsAttrName()) {
+    if (!mlir::isa<mlir::ModuleOp>(op))
+      return op->emitOpError()
+             << "'cir.lifetime_records' must be attached to a module";
+    auto records = mlir::dyn_cast<mlir::DictionaryAttr>(attr.getValue());
+    if (!records)
+      return op->emitOpError()
+             << "'cir.lifetime_records' must be a dictionary attribute";
+    for (mlir::NamedAttribute record : records)
+      if (!mlir::isa<cir::LifetimeRecordAttr>(record.getValue()))
+        return op->emitOpError()
+               << "'cir.lifetime_records' entry '" << record.getName().getValue()
+               << "' must be a #cir.lifetime_record attribute";
+    return success();
+  }
+
   if (attrName == getOffloadContainerAttrName()) {
     if (!mlir::isa<mlir::UnitAttr>(attr.getValue()))
       return op->emitOpError() << "expects '" << getOffloadContainerAttrName()
@@ -3098,11 +3114,12 @@ ParseResult cir::FuncOp::parse(OpAsmParser &parser, OperationState &state) {
     return failure();
 
   // Every other declared attribute has dedicated syntax above, so
-  // memory_effects and uwtable is the only one the explicit list may carry.
+  // memory_effects, uwtable, and lifetime use the explicit attribute list.
   // Without the exception cir.func could not parse back what it prints.
   for (StringRef disallowed : cir::FuncOp::getAttributeNames()) {
     if (disallowed == CIRDialect::getMemoryEffectsAttrName() ||
-        disallowed == CIRDialect::getUwtableAttrName())
+        disallowed == CIRDialect::getUwtableAttrName() ||
+        disallowed == getLifetimeAttrName(state.name).getValue())
       continue;
     if (parsedAttrs.get(disallowed))
       return parser.emitError(loc, "attribute '")
@@ -3295,12 +3312,13 @@ void cir::FuncOp::print(OpAsmPrinter &p) {
   }
 
   // Every declared attribute is printed by the syntax above, except
-  // memory_effects and uwtable, which have none and so must reach the
+  // memory_effects, uwtable, and lifetime, which must reach the
   // dictionary.
   llvm::SmallVector<llvm::StringRef> elidedAttrs;
   for (llvm::StringRef name : cir::FuncOp::getAttributeNames())
     if (name != CIRDialect::getMemoryEffectsAttrName() &&
-        name != CIRDialect::getUwtableAttrName())
+        name != CIRDialect::getUwtableAttrName() &&
+        name != getLifetimeAttrName().getValue())
       elidedAttrs.push_back(name);
   function_interface_impl::printFunctionAttributes(p, *this, elidedAttrs);
 
