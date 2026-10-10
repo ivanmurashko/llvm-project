@@ -1,0 +1,65 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+!s32i = !cir.int<s, 32>
+!ptr = !cir.ptr<!s32i>
+!slot = !cir.ptr<!ptr>
+
+module {
+  // EH-only cleanup must not run on the normal path. Visiting its store would
+  // produce a warning both in the cleanup and after it, and change p's state.
+  cir.func @eh_only_cleanup_is_skipped() {
+    %x = cir.alloca "x" align(4) : !ptr
+    %p = cir.alloca "p" align(8) : !slot
+    cir.store %x, %p : !ptr, !slot
+    cir.cleanup.scope {
+      %body = cir.load deref %p : !slot, !ptr
+      cir.yield
+    } cleanup eh {
+      %null = cir.const #cir.ptr<null> : !ptr
+      cir.store %null, %p : !ptr, !slot
+      %cleanup = cir.load deref %p : !slot, !ptr
+      cir.yield
+    }
+    %after = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+
+  // An "all" cleanup does run on normal exit. Its state changes must reach
+  // subsequent operations, even though its body has no lifetime errors.
+  cir.func @all_cleanup_runs_normally() {
+    %x = cir.alloca "x" align(4) : !ptr
+    %p = cir.alloca "p" align(8) : !slot
+    cir.store %x, %p : !ptr, !slot
+    cir.cleanup.scope {
+      %body = cir.load deref %p : !slot, !ptr
+      cir.yield
+    } cleanup all {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !ptr
+      cir.store %null, %p : !ptr, !slot
+      cir.yield
+    }
+    // expected-warning @below {{use of invalid pointer 'p'}}
+    %after = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+
+  // The body allocation remains alive during cleanup and is invalidated only
+  // after cleanup finishes. The outer pointer exposes that lifetime boundary.
+  cir.func @cleanup_scope_ends_body_lifetime() {
+    %p = cir.alloca "p" align(8) : !slot
+    // expected-note @below {{pointee 'x' invalidated at end of scope}}
+    cir.cleanup.scope {
+      %x = cir.alloca "x" align(4) : !ptr
+      cir.store %x, %p : !ptr, !slot
+      %body = cir.load deref %p : !slot, !ptr
+      cir.yield
+    } cleanup normal {
+      %cleanup = cir.load deref %p : !slot, !ptr
+      cir.yield
+    }
+    // expected-warning @below {{use of invalid pointer 'p'}}
+    %after = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+}

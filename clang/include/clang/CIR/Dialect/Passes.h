@@ -28,6 +28,11 @@ namespace mlir {
 std::unique_ptr<Pass> createCIRCanonicalizePass();
 std::unique_ptr<Pass> createCIRFlattenCFGPass();
 std::unique_ptr<Pass> createCIRSimplifyPass();
+std::unique_ptr<Pass> createLifetimeCheckPass();
+std::unique_ptr<Pass>
+createLifetimeCheckPass(llvm::ArrayRef<llvm::StringRef> remarks,
+                        llvm::ArrayRef<llvm::StringRef> history,
+                        unsigned historyLimit);
 std::unique_ptr<Pass> createCIREHABILoweringPass();
 std::unique_ptr<Pass> createCXXABILoweringPass();
 std::unique_ptr<Pass> createTargetLoweringPass();

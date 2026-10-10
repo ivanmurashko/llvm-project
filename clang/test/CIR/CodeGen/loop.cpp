@@ -205,7 +205,6 @@ void l4() {
 // CIR:     %[[RANGE_ADDR:.*]] = cir.alloca "__range1" {{.*}} init const
 // CIR:     %[[BEGIN_ADDR:.*]] = cir.alloca "__begin1" {{.*}} init
 // CIR:     %[[END_ADDR:.*]] = cir.alloca "__end1" {{.*}} init
-// CIR:     %[[N_ADDR:.*]] = cir.alloca "n" {{.*}} init
 // CIR:     cir.store{{.*}} %[[A_ADDR]], %[[RANGE_ADDR]]
 // CIR:     %[[RANGE_LOAD:.*]] = cir.load{{.*}} %[[RANGE_ADDR]]
 // CIR:     %[[RANGE_CAST:.*]] = cir.cast array_to_ptrdecay %[[RANGE_LOAD]] : {{.*}}
@@ -221,9 +220,12 @@ void l4() {
 // CIR:       %[[CMP:.*]] = cir.cmp ne %[[CUR]], %[[END]]
 // CIR:       cir.condition(%[[CMP]])
 // CIR:     } body {
+// CIR:       cir.scope {
+// CIR:         %[[N_ADDR:.*]] = cir.alloca "n" {{.*}} init
 // CIR:       %[[CUR:.*]] = cir.load deref{{.*}} %[[BEGIN_ADDR]]
 // CIR:       %[[N:.*]] = cir.load{{.*}} %[[CUR]]
 // CIR:       cir.store{{.*}} %[[N]], %[[N_ADDR]]
+// CIR:       }
 // CIR:       cir.yield
 // CIR:     } step {
 // CIR:       %[[CUR:.*]] = cir.load{{.*}} %[[BEGIN_ADDR]]
@@ -314,7 +316,6 @@ void l5() {
 // CIR:     %[[RANGE_ADDR:.*]] = cir.alloca "__range1" {{.*}} init const
 // CIR:     %[[BEGIN_ADDR:.*]] = cir.alloca "__begin1" {{.*}} init
 // CIR:     %[[END_ADDR:.*]] = cir.alloca "__end1" {{.*}} init
-// CIR:     %[[X_ADDR:.*]] = cir.alloca "x" {{.*}} init
 // CIR:     %[[ARR_INIT:.*]] = cir.get_global @[[L5_ARR]]
 // CIR:     cir.copy %[[ARR_INIT]] align(16) to %[[ARR_ADDR]] align(16)
 // CIR:     cir.store{{.*}} %[[ARR_ADDR]], %[[RANGE_ADDR]]
@@ -332,9 +333,12 @@ void l5() {
 // CIR:       %[[CMP:.*]] = cir.cmp ne %[[CUR]], %[[END]]
 // CIR:       cir.condition(%[[CMP]])
 // CIR:     } body {
+// CIR:       cir.scope {
+// CIR:         %[[X_ADDR:.*]] = cir.alloca "x" {{.*}} init
 // CIR:       %[[CUR:.*]] = cir.load deref{{.*}} %[[BEGIN_ADDR]]
 // CIR:       %[[X:.*]] = cir.load{{.*}} %[[CUR]]
 // CIR:       cir.store{{.*}} %[[X]], %[[X_ADDR]]
+// CIR:       }
 // CIR:       cir.yield
 // CIR:     } step {
 // CIR:       %[[CUR:.*]] = cir.load{{.*}} %[[BEGIN_ADDR]]

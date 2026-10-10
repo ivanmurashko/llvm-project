@@ -44,6 +44,7 @@ class CIRGenerator : public clang::ASTConsumer {
   llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> fs;
 
   const clang::CodeGenOptions &codeGenOpts;
+  bool preserveLifetimeScopes;
 
   unsigned handlingTopLevelDecls;
 
@@ -74,7 +75,8 @@ private:
 public:
   CIRGenerator(clang::DiagnosticsEngine &diags,
                llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> fs,
-               const clang::CodeGenOptions &cgo);
+               const clang::CodeGenOptions &cgo,
+               bool preserveLifetimeScopes = false);
   ~CIRGenerator() override;
   void Initialize(clang::ASTContext &astContext) override;
   bool HandleTopLevelDecl(clang::DeclGroupRef group) override;

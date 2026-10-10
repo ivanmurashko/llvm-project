@@ -2934,6 +2934,10 @@ static void GenerateFrontendArgs(const FrontendOptions &Opts,
 
   GenerateProgramAction();
 
+  if (Opts.ClangIRLifetimeCheckEnabled)
+    GenerateArg(Consumer, OPT_fclangir_lifetime_check_EQ,
+                Opts.ClangIRLifetimeCheckOptions);
+
   for (const auto &PluginArgs : Opts.PluginArgs) {
     Option Opt = getDriverOptTable().getOption(OPT_plugin_arg);
     for (const auto &PluginArg : PluginArgs.second)
@@ -3182,6 +3186,17 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
                                                            << "-emit-module";
   if (Args.hasArg(OPT_emit_cir, OPT_emit_cir_bc))
     Opts.UseClangIRPipeline = true;
+
+  if (const Arg *A = Args.getLastArg(OPT_fclangir_lifetime_check,
+                                     OPT_fclangir_lifetime_check_EQ)) {
+    Opts.ClangIRLifetimeCheckEnabled = true;
+    Opts.ClangIRLifetimeCheckOptions =
+        A->getOption().matches(OPT_fclangir_lifetime_check_EQ) ? A->getValue()
+                                                               : "";
+    if (!Opts.UseClangIRPipeline)
+      Diags.Report(diag::err_drv_argument_only_allowed_with)
+          << A->getSpelling() << "-fclangir";
+  }
 
 #if CLANG_ENABLE_CIR
   if (Args.hasArg(OPT_clangir_disable_passes))

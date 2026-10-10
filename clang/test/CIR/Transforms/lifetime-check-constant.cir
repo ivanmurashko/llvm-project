@@ -1,0 +1,71 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all remarks=pset-always" --verify-diagnostics -o /dev/null
+
+!s32i = !cir.int<s, 32>
+!ptr = !cir.ptr<!s32i>
+!slot = !cir.ptr<!ptr>
+!record = !cir.struct<"PointerField" {data !ptr}>
+!record_ptr = !cir.ptr<!record>
+
+module {
+  // A concrete non-null constant address has no automatic-storage lifetime.
+  // This does not establish that the address is otherwise dereferenceable.
+  cir.func @constant_address() {
+    %p = cir.alloca "p" align(8) : !slot
+    %address = cir.const #cir.ptr<4660 : i64> : !ptr
+    cir.store %address, %p : !ptr, !slot
+    // expected-remark @below {{pset => { global }}}
+    %value = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+
+  // Undef and poison are not concrete addresses. They must invalidate even a
+  // previously valid pointer, with the history referring to the new value.
+  cir.func @undefined_pointer() {
+    %x = cir.alloca "x" align(4) : !ptr
+    %p = cir.alloca "p" align(8) : !slot
+    cir.store %x, %p : !ptr, !slot
+    // expected-note @below {{uninitialized here}}
+    %undef = cir.const #cir.undef : !ptr
+    cir.store %undef, %p : !ptr, !slot
+    // expected-remark @below {{pset => { invalid }}}
+    // expected-warning @below {{use of invalid pointer 'p'}}
+    %value = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+
+  cir.func @poison_pointer() {
+    %x = cir.alloca "x" align(4) : !ptr
+    %p = cir.alloca "p" align(8) : !slot
+    cir.store %x, %p : !ptr, !slot
+    // expected-note @below {{uninitialized here}}
+    %poison = cir.const #cir.poison : !ptr
+    cir.store %poison, %p : !ptr, !slot
+    // expected-remark @below {{pset => { invalid }}}
+    // expected-warning @below {{use of invalid pointer 'p'}}
+    %value = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+
+  // Bulk initialization must use the same classification for pointer fields.
+  cir.func @constant_address_in_record() {
+    %record = cir.alloca "record" align(8) : !record_ptr
+    %constant = cir.const #cir.const_record<{#cir.ptr<4660 : i64> : !ptr}> : !record
+    cir.store %constant, %record : !record, !record_ptr
+    %field = cir.get_member %record[0] {name = "field"} : !record_ptr -> !slot
+    // expected-remark @below {{pset => { global }}}
+    %value = cir.load deref %field : !slot, !ptr
+    cir.return
+  }
+
+  cir.func @poison_pointer_in_record() {
+    %record = cir.alloca "record" align(8) : !record_ptr
+    // expected-note @below {{uninitialized here}}
+    %constant = cir.const #cir.const_record<{#cir.poison : !ptr}> : !record
+    cir.store %constant, %record : !record, !record_ptr
+    %field = cir.get_member %record[0] {name = "field"} : !record_ptr -> !slot
+    // expected-remark @below {{pset => { invalid }}}
+    // expected-warning @below {{use of invalid pointer 'record.field'}}
+    %value = cir.load deref %field : !slot, !ptr
+    cir.return
+  }
+}

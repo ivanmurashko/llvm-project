@@ -29,6 +29,26 @@ def CIRCanonicalize : Pass<"cir-canonicalize"> {
   let dependentDialects = ["cir::CIRDialect"];
 }
 
+def LifetimeCheck : Pass<"cir-lifetime-check", "mlir::ModuleOp"> {
+  let summary = "Diagnose lifetime errors in structured CIR";
+  let description = [{
+    Analyze pointer and owner lifetimes without modifying the program. The pass
+    consumes serializable CIR lifetime metadata and does not require a Clang AST.
+    Run it after CIR canonicalization and before lowering structured control flow.
+  }];
+  let constructor = "mlir::createLifetimeCheckPass()";
+  let dependentDialects = ["cir::CIRDialect"];
+  let options = [
+    ListOption<"historyList", "history", "std::string",
+               "Diagnostic history: all, null, invalid", "llvm::cl::ZeroOrMore">,
+    ListOption<"remarksList", "remarks", "std::string",
+               "Points-to remarks: all, pset-invalid, pset-always",
+               "llvm::cl::ZeroOrMore">,
+    Option<"historyLimit", "history_limit", "unsigned", "1",
+           "Maximum number of history notes for a diagnostic">
+  ];
+}
+
 def CIRSimplify : Pass<"cir-simplify"> {
   let summary = "Performs CIR simplification and code optimization";
   let description = [{

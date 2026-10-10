@@ -117,8 +117,9 @@ public:
                  SmallVectorImpl<::clang::LinkModule> &LinkModules)
       : Action(Action), CI(CI), OutputStream(std::move(OS)),
         FS(&CI.getVirtualFileSystem()),
-        Gen(std::make_unique<CIRGenerator>(CI.getDiagnostics(), std::move(FS),
-                                           CI.getCodeGenOpts())),
+        Gen(std::make_unique<CIRGenerator>(
+            CI.getDiagnostics(), std::move(FS), CI.getCodeGenOpts(),
+            CI.getFrontendOpts().ClangIRLifetimeCheckEnabled)),
         FEOptions(CI.getFrontendOpts()), CGO(CGO), LLVMCtx(LLVMCtx),
         LinkModules(LinkModules),
         DiagConsumer(CI.getDiagnostics(), CI.getCodeGenOpts()) {}
@@ -155,6 +156,15 @@ public:
 
   void HandleTranslationUnit(ASTContext &C) override {
     Gen->HandleTranslationUnit(C);
+    // Preserve textual partial CIR for inspecting unsupported constructs, but
+    // do not verify or transform a module after a source error. Placeholder IR
+    // is not necessarily suitable for the verifier, passes, or backend.
+    if (CI.getDiagnostics().hasErrorOccurred()) {
+      if (Action == CIRGenAction::OutputType::EmitCIR && OutputStream &&
+          Gen->getModule())
+        printCIRModule(Gen->getModule(), *OutputStream);
+      return;
+    }
 
     if (!FEOptions.ClangIRDisableCIRVerifier) {
       if (!Gen->verifyModule()) {
@@ -181,7 +191,9 @@ public:
       if (runCIRToCIRPasses(
               MlirModule, MlirCtx, !FEOptions.ClangIRDisableCIRVerifier,
               FEOptions.ClangIREnableIdiomRecognizer, CGO.OptimizationLevel > 0,
-              EnableLibOpt, LibOptOptions, FEOptions.ClangIRCallConvLowering)
+              EnableLibOpt, LibOptOptions, FEOptions.ClangIRCallConvLowering,
+              FEOptions.ClangIRLifetimeCheckEnabled,
+              FEOptions.ClangIRLifetimeCheckOptions)
               .failed()) {
         // Pass-side errors already routed through ClangIRDiagnosticHandler.
         // Skip the generic catch-all if a specific diagnostic was emitted.

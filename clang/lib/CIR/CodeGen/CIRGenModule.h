@@ -69,7 +69,8 @@ class CIRGenModule : public CIRGenTypeCache {
 public:
   CIRGenModule(mlir::MLIRContext &mlirContext, clang::ASTContext &astContext,
                const clang::CodeGenOptions &cgo,
-               clang::DiagnosticsEngine &diags);
+               clang::DiagnosticsEngine &diags,
+               bool preserveLifetimeScopes = false);
 
   ~CIRGenModule();
 
@@ -84,6 +85,7 @@ private:
   const clang::LangOptions &langOpts;
 
   const clang::CodeGenOptions &codeGenOpts;
+  bool preserveLifetimeScopes;
 
   /// A "module" matches a c/cpp source file: containing a list of functions.
   mlir::ModuleOp theModule;
@@ -185,6 +187,7 @@ public:
   clang::ASTContext &getASTContext() const { return astContext; }
   const clang::TargetInfo &getTarget() const { return target; }
   const clang::CodeGenOptions &getCodeGenOpts() const { return codeGenOpts; }
+  bool shouldPreserveLifetimeScopes() const { return preserveLifetimeScopes; }
   clang::DiagnosticsEngine &getDiags() const { return diags; }
   CIRGenTypes &getTypes() { return genTypes; }
   const clang::LangOptions &getLangOpts() const { return langOpts; }

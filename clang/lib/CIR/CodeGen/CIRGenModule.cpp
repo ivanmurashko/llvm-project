@@ -86,9 +86,11 @@ static CIRGenCXXABI *createCXXABI(CIRGenModule &cgm) {
 CIRGenModule::CIRGenModule(mlir::MLIRContext &mlirContext,
                            clang::ASTContext &astContext,
                            const clang::CodeGenOptions &cgo,
-                           DiagnosticsEngine &diags)
+                           DiagnosticsEngine &diags,
+                           bool preserveLifetimeScopes)
     : builder(mlirContext, *this), astContext(astContext),
       langOpts(astContext.getLangOpts()), codeGenOpts(cgo),
+      preserveLifetimeScopes(preserveLifetimeScopes),
       theModule{mlir::ModuleOp::create(mlir::UnknownLoc::get(&mlirContext))},
       diags(diags), target(astContext.getTargetInfo()),
       abi(createCXXABI(*this)), genTypes(*this), vtables(*this) {
@@ -2192,8 +2194,11 @@ void CIRGenModule::replaceUsesOfNonProtoTypeWithRealFunction(
       // the initializer context (e.g. struct field type), not the FuncOp type,
       // so no update is required when the no-proto FuncOp is replaced.
     } else {
-      llvm_unreachable(
-          "replaceUsesOfNonProtoTypeWithRealFunction: unexpected use type");
+      // Runtime operations such as cir.dyn_cast also reference functions.
+      // Their lowering may depend on the original signature, so do not
+      // silently retarget them when a definition changes that signature.
+      errorNYI(use.getUser()->getLoc(),
+               "function type replacement for a non-call symbol use");
     }
   }
 }

@@ -8295,6 +8295,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   SanitizeArgs.addArgs(TC, Args, CmdArgs, InputType);
 
   Args.AddLastArg(CmdArgs, options::OPT_falloc_token_max_EQ);
+  Args.AddLastArg(CmdArgs, options::OPT_fclangir_lifetime_check,
+                  options::OPT_fclangir_lifetime_check_EQ);
 
 #if CLANG_ENABLE_CIR
   // Forward -mmlir arguments to to the MLIR option parser.

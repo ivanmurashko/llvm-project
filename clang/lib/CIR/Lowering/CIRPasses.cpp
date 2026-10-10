@@ -18,6 +18,8 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include <algorithm>
+
 namespace cir {
 
 /// Map a target triple to the ABI target that drives CallConvLowering.
@@ -74,7 +76,8 @@ mlir::LogicalResult
 runCIRToCIRPasses(mlir::ModuleOp theModule, mlir::MLIRContext &mlirContext,
                   bool enableVerifier, bool enableIdiomRecognizer,
                   bool enableCIRSimplify, bool enableLibOpt,
-                  llvm::StringRef libOptOptions, bool enableCallConvLowering) {
+                  llvm::StringRef libOptOptions, bool enableCallConvLowering,
+                  bool enableLifetimeCheck, llvm::StringRef lifetimeOptions) {
 
   llvm::TimeTraceScope scope("CIR To CIR Passes");
 
@@ -95,6 +98,20 @@ runCIRToCIRPasses(mlir::ModuleOp theModule, mlir::MLIRContext &mlirContext,
 
   mlir::PassManager pm(&mlirContext);
   pm.addPass(mlir::createCIRCanonicalizePass());
+
+  if (enableLifetimeCheck) {
+    auto lifetimePass = mlir::createLifetimeCheckPass();
+    std::string options = lifetimeOptions.str();
+    std::replace(options.begin(), options.end(), ';', ' ');
+    auto errorHandler = [&](const llvm::Twine &message) {
+      mlir::emitError(theModule.getLoc())
+          << "invalid CIR lifetime-check options: " << message;
+      return mlir::failure();
+    };
+    if (failed(lifetimePass->initializeOptions(options, errorHandler)))
+      return mlir::failure();
+    pm.addPass(std::move(lifetimePass));
+  }
 
   if (enableCIRSimplify)
     pm.addPass(mlir::createCIRSimplifyPass());

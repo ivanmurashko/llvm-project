@@ -17,6 +17,7 @@
 #include "mlir/IR/Location.h"
 #include "mlir/Support/LLVM.h"
 #include "clang/AST/ExprCXX.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/StmtOpenACC.h"
 #include "clang/AST/StmtOpenMP.h"
@@ -172,8 +173,8 @@ void CIRGenFunction::emitStopPoint(const Stmt *s) {
 mlir::LogicalResult CIRGenFunction::emitStmt(const Stmt *s,
                                              bool useCurrentScope,
                                              ArrayRef<const Attr *> attr) {
-  if (mlir::succeeded(emitSimpleStmt(s, useCurrentScope)))
-    return mlir::success();
+  if (auto result = emitSimpleStmt(s, useCurrentScope))
+    return *result;
 
   switch (s->getStmtClass()) {
   case Stmt::NoStmtClass:
@@ -477,11 +478,11 @@ mlir::LogicalResult CIRGenFunction::emitStmt(const Stmt *s,
   llvm_unreachable("Unexpected statement class");
 }
 
-mlir::LogicalResult CIRGenFunction::emitSimpleStmt(const Stmt *s,
-                                                   bool useCurrentScope) {
+std::optional<mlir::LogicalResult>
+CIRGenFunction::emitSimpleStmt(const Stmt *s, bool useCurrentScope) {
   switch (s->getStmtClass()) {
   default:
-    return mlir::failure();
+    return std::nullopt;
   case Stmt::DeclStmtClass:
     return emitDeclStmt(cast<DeclStmt>(*s));
   case Stmt::CompoundStmtClass:
@@ -975,15 +976,21 @@ CIRGenFunction::emitCXXForRangeStmt(const CXXForRangeStmt &s,
         },
         /*bodyBuilder=*/
         [&](mlir::OpBuilder &b, mlir::Location loc) {
-          // https://en.cppreference.com/w/cpp/language/for
-          // In C++ the scope of the init-statement and the scope of
-          // statement are one and the same.
-          RunCleanupsScope bodyScope(*this);
-          bool useCurrentScope = true;
-          if (emitStmt(s.getLoopVarStmt(), useCurrentScope).failed())
-            loopRes = mlir::failure();
-          if (emitStmt(s.getBody(), useCurrentScope).failed())
-            loopRes = mlir::failure();
+          // The loop variable and body locals are recreated each iteration.
+          // Keep their allocas and cleanups inside that iteration, while the
+          // range, begin, and end remain in the enclosing loop scope.
+          cir::ScopeOp::create(
+              builder, getLoc(s.getBody()->getSourceRange()),
+              [&](mlir::OpBuilder &b, mlir::Location loc) {
+                SymTableScopeTy varScope(symbolTable);
+                // LexicalScope also owns the iteration's RunCleanupsScope.
+                LexicalScope bodyScope(*this, loc, b.getInsertionBlock());
+                if (emitStmt(s.getLoopVarStmt(), /*useCurrentScope=*/true)
+                        .failed())
+                  loopRes = mlir::failure();
+                if (emitStmt(s.getBody(), /*useCurrentScope=*/true).failed())
+                  loopRes = mlir::failure();
+              });
           emitStopPoint(&s);
         },
         /*stepBuilder=*/
@@ -1016,7 +1023,53 @@ CIRGenFunction::emitCXXForRangeStmt(const CXXForRangeStmt &s,
   return mlir::success();
 }
 
+namespace {
+class LoopConditionTemporaryFinder
+    : public RecursiveASTVisitor<LoopConditionTemporaryFinder> {
+  const VarDecl *conditionVar;
+  const MaterializeTemporaryExpr *temporary = nullptr;
+
+public:
+  explicit LoopConditionTemporaryFinder(const VarDecl *conditionVar)
+      : conditionVar(conditionVar) {}
+
+  bool shouldVisitImplicitCode() const { return true; }
+
+  bool VisitMaterializeTemporaryExpr(MaterializeTemporaryExpr *expr) {
+    if (expr->getExtendingDecl() == conditionVar &&
+        expr->getType().isDestructedType() != QualType::DK_none) {
+      temporary = expr;
+      return false;
+    }
+    return true;
+  }
+
+  const MaterializeTemporaryExpr *getTemporary() const { return temporary; }
+};
+
+const MaterializeTemporaryExpr *
+findUnsupportedLoopConditionTemporary(const VarDecl *conditionVar) {
+  if (!conditionVar || !conditionVar->hasInit())
+    return nullptr;
+  LoopConditionTemporaryFinder finder(conditionVar);
+  finder.TraverseStmt(const_cast<Expr *>(conditionVar->getInit()));
+  return finder.getTemporary();
+}
+} // namespace
+
 mlir::LogicalResult CIRGenFunction::emitForStmt(const ForStmt &s) {
+  // A lifetime-extended temporary's destructor is not currently captured by
+  // emitLoopConditionVariable. Reject before opening loop/cleanup state: simply
+  // moving that destructor to loop cleanup would also require a construction
+  // guard for exceptions during the condition initializer.
+  if (const auto *temporary =
+          findUnsupportedLoopConditionTemporary(s.getConditionVariable())) {
+    cgm.errorNYI(temporary->getSourceRange(),
+                 "loop condition with a lifetime-extended temporary requiring "
+                 "destruction");
+    return mlir::failure();
+  }
+
   cir::ForOp forOp;
 
   // TODO: pass in an array of attributes.
@@ -1156,6 +1209,15 @@ mlir::LogicalResult CIRGenFunction::emitDoStmt(const DoStmt &s) {
 }
 
 mlir::LogicalResult CIRGenFunction::emitWhileStmt(const WhileStmt &s) {
+  // See emitForStmt: this must precede construction of any loop cleanup state.
+  if (const auto *temporary =
+          findUnsupportedLoopConditionTemporary(s.getConditionVariable())) {
+    cgm.errorNYI(temporary->getSourceRange(),
+                 "loop condition with a lifetime-extended temporary requiring "
+                 "destruction");
+    return mlir::failure();
+  }
+
   cir::WhileOp whileOp;
 
   // TODO: pass in array of attributes.

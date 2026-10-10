@@ -19,7 +19,6 @@ void for_range() {
 // CIR:      %[[RANGE_ADDR:.*]] = cir.alloca "__range1" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Container>>
 // CIR:      %[[BEGIN_ADDR:.*]] = cir.alloca "__begin1" {{.*}} init : !cir.ptr<!cir.ptr<!rec_Element>>
 // CIR:      %[[END_ADDR:.*]] = cir.alloca "__end1" {{.*}} init : !cir.ptr<!cir.ptr<!rec_Element>>
-// CIR:      %[[E_ADDR:.*]] = cir.alloca "e" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Element>>
 // CIR:      cir.store{{.*}} %[[C_ADDR]], %[[RANGE_ADDR]]
 // CIR:      %[[C_REF:.*]] = cir.load{{.*}} %[[RANGE_ADDR]]
 // CIR:      %[[BEGIN:.*]] = cir.call @_Z5beginR9Container(%[[C_REF]])
@@ -33,8 +32,11 @@ void for_range() {
 // CIR:        %[[CMP:.*]] = cir.cmp ne %[[BEGIN]], %[[END]]
 // CIR:        cir.condition(%[[CMP]])
 // CIR:      } body {
+// CIR:        cir.scope {
+// CIR:          %[[E_ADDR:.*]] = cir.alloca "e" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Element>>
 // CIR:        %[[E:.*]] = cir.load deref{{.*}} %[[BEGIN_ADDR]]
 // CIR:        cir.store{{.*}} %[[E]], %[[E_ADDR]]
+// CIR:        }
 // CIR:        cir.yield
 // CIR:      } step {
 // CIR:        %[[BEGIN:.*]] = cir.load{{.*}} %[[BEGIN_ADDR]]
@@ -65,7 +67,6 @@ void for_range2() {
 // CIR:      %[[RANGE_ADDR:.*]] = cir.alloca "__range1" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_C2>>
 // CIR:      %[[BEGIN_ADDR:.*]] = cir.alloca "__begin1" {{.*}} init : !cir.ptr<!cir.ptr<!rec_Element>>
 // CIR:      %[[END_ADDR:.*]] = cir.alloca "__end1" {{.*}} init : !cir.ptr<!cir.ptr<!rec_Element>>
-// CIR:      %[[E_ADDR:.*]] = cir.alloca "e" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Element>>
 // CIR:      cir.store{{.*}} %[[C_ADDR]], %[[RANGE_ADDR]]
 // CIR:      %[[C_REF:.*]] = cir.load{{.*}} %[[RANGE_ADDR]]
 // CIR:      %[[BEGIN:.*]] = cir.call @_ZN2C25beginEv(%[[C_REF]])
@@ -79,8 +80,11 @@ void for_range2() {
 // CIR:        %[[CMP:.*]] = cir.cmp ne %[[BEGIN]], %[[END]]
 // CIR:        cir.condition(%[[CMP]])
 // CIR:      } body {
+// CIR:        cir.scope {
+// CIR:          %[[E_ADDR:.*]] = cir.alloca "e" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Element>>
 // CIR:        %[[E:.*]] = cir.load deref{{.*}} %[[BEGIN_ADDR]]
 // CIR:        cir.store{{.*}} %[[E]], %[[E_ADDR]]
+// CIR:        }
 // CIR:        cir.yield
 // CIR:      } step {
 // CIR:        %[[BEGIN:.*]] = cir.load{{.*}} %[[BEGIN_ADDR]]
@@ -117,14 +121,16 @@ void for_range3() {
 // CIR:      %[[RANGE_ADDR:.*]] = cir.alloca "__range1" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_C3>>
 // CIR:      %[[BEGIN_ADDR:.*]] = cir.alloca "__begin1" {{.*}} init : !cir.ptr<!rec_Iterator>
 // CIR:      %[[END_ADDR:.*]] = cir.alloca "__end1" {{.*}} init : !cir.ptr<!rec_Iterator>
-// CIR:      %[[E_ADDR:.*]] = cir.alloca "e" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Element>>
 // CIR:      cir.store{{.*}} %[[C_ADDR]], %[[RANGE_ADDR]]
 // CIR:      cir.for : cond {
 // CIR:        %[[ITER_NE:.*]] = cir.call @_ZNK8IteratorneERKS_(%[[BEGIN_ADDR]], %[[END_ADDR]])
 // CIR:        cir.condition(%[[ITER_NE]])
 // CIR:      } body {
+// CIR:        cir.scope {
+// CIR:          %[[E_ADDR:.*]] = cir.alloca "e" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Element>>
 // CIR:        %[[E:.*]] = cir.call @_ZN8IteratordeEv(%[[BEGIN_ADDR]])
 // CIR:        cir.store{{.*}} %[[E]], %[[E_ADDR]]
+// CIR:        }
 // CIR:        cir.yield
 // CIR:      } step {
 // CIR:        %[[ITER_NEXT:.*]] = cir.call @_ZN8IteratorppEv(%[[BEGIN_ADDR]])
@@ -146,13 +152,14 @@ void for_range4() {
 // CIR:      %[[RANGE_ADDR:.*]] = cir.alloca "__range1" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_C3>>
 // CIR:      %[[BEGIN_ADDR:.*]] = cir.alloca "__begin1" {{.*}} init : !cir.ptr<!rec_Iterator>
 // CIR:      %[[END_ADDR:.*]] = cir.alloca "__end1" {{.*}} init : !cir.ptr<!rec_Iterator>
-// CIR:      %[[E_ADDR:.*]] = cir.alloca "e" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Element>>
-// CIR:      %[[HD:.*]] = cir.alloca "hd" {{.*}} : !cir.ptr<!rec_HasDtor>
 // CIR:      cir.store{{.*}} %[[C_ADDR]], %[[RANGE_ADDR]]
 // CIR:      cir.for : cond {
 // CIR:        %[[ITER_NE:.*]] = cir.call @_ZNK8IteratorneERKS_(%[[BEGIN_ADDR]], %[[END_ADDR]])
 // CIR:        cir.condition(%[[ITER_NE]])
 // CIR:      } body {
+// CIR:        cir.scope {
+// CIR:          %[[E_ADDR:.*]] = cir.alloca "e" {{.*}} init const : !cir.ptr<!cir.ptr<!rec_Element>>
+// CIR:          %[[HD:.*]] = cir.alloca "hd" {{.*}} : !cir.ptr<!rec_HasDtor>
 // CIR:        %[[E:.*]] = cir.call @_ZN8IteratordeEv(%[[BEGIN_ADDR]])
 // CIR:        cir.store{{.*}} %[[E]], %[[E_ADDR]]
 // CIR:        cir.cleanup.scope {
@@ -160,6 +167,7 @@ void for_range4() {
 // CIR:        } cleanup normal {
 // CIR:          cir.call @_ZN7HasDtorD1Ev(%[[HD]]) nothrow 
 // CIR:          cir.yield
+// CIR:        }
 // CIR:        }
 // CIR:        cir.yield
 // CIR:      } step {

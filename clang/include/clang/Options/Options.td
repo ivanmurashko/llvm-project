@@ -3540,6 +3540,14 @@ defm clangir_call_conv_lowering : BoolFOption<"clangir-call-conv-lowering",
           "Do not run the ClangIR calling-convention lowering pass">,
   BothFlags<[], [ClangOption, CC1Option], " (x86_64 only)">>;
 
+def fclangir_lifetime_check_EQ : Joined<["-"], "fclangir-lifetime-check=">,
+  Visibility<[ClangOption, CC1Option]>, Group<f_Group>,
+  HelpText<"Run CIR lifetime analysis with the specified pass options">;
+
+def fclangir_lifetime_check : Flag<["-"], "fclangir-lifetime-check">,
+  Visibility<[ClangOption, CC1Option]>, Group<f_Group>,
+  HelpText<"Run CIR lifetime analysis">;
+
 def clangir_lib_opt_EQ : Joined<["-"], "clangir-lib-opt=">,
   Visibility<[ClangOption, CC1Option]>, Group<f_Group>, Values<"all">,
   HelpText<"Enable C/C++ library based optimizations (with options)">,

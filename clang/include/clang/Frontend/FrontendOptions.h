@@ -436,6 +436,10 @@ public:
   LLVM_PREFERRED_TYPE(bool)
   unsigned ClangIRLibOptEnabled : 1;
 
+  /// Run the CIR lifetime analysis pass.
+  bool ClangIRLifetimeCheckEnabled = false;
+  std::string ClangIRLifetimeCheckOptions;
+
   /// Options to control ClangIR library optimization
   std::string ClangIRLibOptOptions;
 
