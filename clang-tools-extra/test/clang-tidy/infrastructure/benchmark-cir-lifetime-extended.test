@@ -1,0 +1,242 @@
+# REQUIRES: system-linux || system-darwin
+# RUN: split-file %s %t
+# RUN: %python %t/test.py %S/../../../clang-tidy/tool/benchmark-cir-lifetime.py %t
+
+#--- fixture.py
+import json
+from pathlib import Path
+import sys
+import time
+
+if "--version" in sys.argv:
+    print("fixture clang-tidy version 24")
+    sys.exit(0)
+if "--list-checks" in sys.argv:
+    print("Enabled checks:\n    cir-lifetime-check\n    bugprone-use-after-move")
+    sys.exit(0)
+config = json.loads(next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--config=")))
+check = config["Checks"].removeprefix("-*,")
+assert check in ("cir-lifetime-check", "bugprone-use-after-move")
+assert "--checks=-*," + check in sys.argv
+assert config["WarningsAsErrors"] == ""
+assert all(k.startswith(check + ".") for k in config["CheckOptions"])
+assert not any(a in ("--fix", "-fix") for a in sys.argv)
+output = Path(next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--export-fixes=")))
+source = Path(sys.argv[-1])
+event = {"variant": Path(sys.argv[0]).name, "phase": output.parent.name,
+         "file": source.name, "check": check, "time": time.monotonic()}
+trace = Path(sys.argv[0]).parent / "trace.jsonl"
+with trace.open("a") as stream:
+    stream.write(json.dumps(dict(event, event="start")) + "\n")
+time.sleep(0.03)
+if source.stem == "invalidate-input":
+    (Path(sys.argv[0]).parent / "input.h").write_text("modified during run")
+if source.stem == "warmup-failure" and output.parent.name.startswith("warmup"):
+    print("error: deliberate warmup failure", file=sys.stderr)
+    sys.exit(1)
+if source.stem == "measured-failure" and output.parent.name == "repeat-002" and event["variant"] == "candidate":
+    print("error: deliberate measured failure", file=sys.stderr)
+    sys.exit(1)
+message = "use of moved-from value 'x'" if check == "cir-lifetime-check" else "'x' used after it was moved"
+note = "moved here via std::move or rvalue reference" if check == "cir-lifetime-check" else "move occurred here"
+print(f"{source}:1:1: warning: {message} [{check}]", file=sys.stderr)
+print(f"{source}:1:2: note: {note}", file=sys.stderr)
+output.write_text(json.dumps({"MainSourceFile": str(source), "Diagnostics": [{
+    "DiagnosticName": check, "Level": "Warning", "BuildDirectory": str(Path.cwd()),
+    "DiagnosticMessage": {"Message": message, "FilePath": str(source), "FileOffset": 0,
+                          "Replacements": [], "Ranges": [{"FilePath": str(source), "FileOffset": 0, "Length": 1}]},
+    "Notes": [{"Message": note, "FilePath": str(source), "FileOffset": 1, "Replacements": []}]}]}))
+with trace.open("a") as stream:
+    stream.write(json.dumps(dict(event, event="end", time=time.monotonic())) + "\n")
+
+#--- driver.py
+import json
+import shlex
+import sys
+if "--version" in sys.argv:
+    print("fixture clang version 24")
+    sys.exit(0)
+if "-###" in sys.argv:
+    language = "c++"
+    standard = "gnu++17"
+    for i, arg in enumerate(sys.argv):
+        if arg == "-x": language = sys.argv[i + 1]
+        elif arg.startswith("-std="): standard = arg.split("=", 1)[1]
+    print(shlex.join(["fixture-clang", "-cc1", "-x", language, "-std=" + standard]), file=sys.stderr)
+    sys.exit(0)
+if "-cc1" in sys.argv:
+    standard = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("-std=")), "gnu++17")
+    print("CIR_BENCH_CXX11" if standard not in ("c++98", "gnu++98", "c++03", "gnu++03") else "CIR_BENCH_PRE_CXX11")
+    sys.exit(0)
+sys.exit(2)
+
+#--- test.py
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import unittest
+
+RUNNER = Path(sys.argv.pop(1)).resolve()
+ROOT = Path(sys.argv.pop(1)).resolve()
+HAS_YAML = importlib.util.find_spec("yaml") is not None
+
+
+class ExtendedBenchmarkTest(unittest.TestCase):
+    def setUp(self):
+        self.work = ROOT / self._testMethodName
+        shutil.rmtree(self.work, ignore_errors=True)
+        self.work.mkdir()
+        self.source = self.work / "source"
+        self.source.mkdir()
+        self.build = self.work / "build"
+        self.build.mkdir()
+        for name, fixture in [("baseline", "fixture.py"), ("candidate", "fixture.py"), ("clang++", "driver.py")]:
+            path = self.work / name
+            path.write_text("#!" + sys.executable + "\n" + (ROOT / fixture).read_text())
+            path.chmod(0o755)
+
+    def database(self, names):
+        entries = []
+        for name, flags in names:
+            source = self.source / (name + ".cpp")
+            source.write_text("int x;\n")
+            entries.append({"file": str(source), "directory": str(self.build),
+                            "arguments": [str(self.work / "clang++"), *flags, "-c", str(source)]})
+        (self.build / "compile_commands.json").write_text(json.dumps(entries))
+        return entries
+
+    def run_benchmark(self, *extra, expected=0):
+        args = [sys.executable, str(RUNNER), "--baseline", str(self.work / "baseline"),
+                "--candidate", str(self.work / "candidate"), "--baseline-revision", "a" * 40,
+                "--candidate-revision", "b" * 40, "--source-revision", "c" * 40,
+                "--baseline-build-type", "Release", "--candidate-build-type", "Release",
+                "--baseline-assertions", "on", "--candidate-assertions", "on",
+                "--clang-source-root", str(self.source), "--compilation-database", str(self.build),
+                "--output-dir", str(self.work / "out"), "--repetitions", "2", "--timeout", "2", *extra]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=40)
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        if expected:
+            return result
+        return json.loads((self.work / "out/report.json").read_text())
+
+    def test_source_root_alias(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--source-root", str(self.source))
+        self.assertEqual(report["source"]["root"], str(self.source))
+
+    @unittest.skipUnless(HAS_YAML, "optional PyYAML dependency")
+    def test_independent_checks_options_and_yaml_groups(self):
+        self.database([("clean", ["-std=c++17"])])
+        report = self.run_benchmark("--baseline-check", "bugprone-use-after-move",
+                                    "--candidate-check-option", "HistLimit=2",
+                                    "--eligibility-driver", str(self.work / "clang++"))
+        self.assertEqual(report["analysis_configs"]["baseline"]["CheckOptions"], {
+            "bugprone-use-after-move.InvalidationFunctions": "",
+            "bugprone-use-after-move.ReinitializationFunctions": ""})
+        self.assertEqual(report["analysis_configs"]["candidate"]["CheckOptions"]["cir-lifetime-check.HistLimit"], "2")
+        for run in report["runs"]:
+            self.assertEqual(run["diagnostic_export"]["status"], "parsed")
+            self.assertEqual(len(run["diagnostic_groups"]), 1)
+            self.assertEqual(len(run["diagnostic_groups"][0]["notes"]), 1)
+
+    def test_warmups_are_retained_but_do_not_enter_measured_cohort(self):
+        self.database([("clean", []), ("warmup-failure", []), ("measured-failure", [])])
+        report = self.run_benchmark("--warmups", "1")
+        self.assertEqual(len(report["runs"]), 18)
+        self.assertEqual(sum(r["phase"] == "warmup" for r in report["runs"]), 6)
+        self.assertEqual(report["summary"]["baseline"]["completed_runs"], 6)
+        self.assertEqual(report["summary"]["baseline"]["warmup_status_counts"], {"success": 2, "frontend_failure": 1})
+        self.assertEqual(report["comparison"]["common_successful_units"], ["clean.cpp", "warmup-failure.cpp"])
+
+    def test_parallel_batches_never_overlap_checks_and_alternate_rounds(self):
+        self.database([(str(i), []) for i in range(4)])
+        report = self.run_benchmark("--jobs", "2", "--warmups", "1", "--execution-mode", "batches")
+        batches = report["batches"]
+        self.assertEqual([(b["phase"], b["variant"]) for b in batches], [
+            ("warmup", "baseline"), ("warmup", "candidate"),
+            ("measured", "candidate"), ("measured", "baseline"),
+            ("measured", "baseline"), ("measured", "candidate")])
+        self.assertTrue(all(b["completed_runs"] == 4 and b["wall_seconds"] > 0 for b in batches))
+        events = [json.loads(line) for line in (self.work / "trace.jsonl").read_text().splitlines()]
+        active = {}; peak = 0
+        for event in events:
+            key = (event["variant"], event["phase"], event["file"])
+            if event["event"] == "start": active[key] = event["variant"]
+            else: del active[key]
+            self.assertLessEqual(len(set(active.values())), 1)
+            peak = max(peak, len(active))
+        self.assertEqual(peak, 2)
+        self.assertIsNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+
+    @unittest.skipUnless(HAS_YAML, "optional PyYAML dependency")
+    def test_effective_language_and_standard_exclude_inactive_check(self):
+        self.database([("cpp17", ["-std=c++17"]), ("cpp98", ["-std=c++98"]),
+                       ("forced-c", ["-x", "c", "-std=c11"]),
+                       ("last-x-wins", ["-x", "c", "-x", "c++", "-std=c++11"])])
+        report = self.run_benchmark("--baseline-check", "bugprone-use-after-move",
+                                    "--eligibility-driver", str(self.work / "clang++"))
+        self.assertEqual(report["comparison"]["common_successful_units"], ["cpp17.cpp", "last-x-wins.cpp"])
+        self.assertEqual(report["summary"]["baseline"]["ineligible_units"], ["cpp98.cpp", "forced-c.cpp"])
+        self.assertEqual(len(report["runs"]), 16)
+
+    def test_frozen_selection_preserves_generated_units_and_provenance(self):
+        entry = self.database([("source", [])])[0]
+        generated = self.build / "generated.cpp"
+        generated.write_text("int generated;\n")
+        command = dict(entry, file=str(generated), arguments=[str(self.work / "clang++"), "-c", str(generated)])
+        units = [{"id": "frozen-generated", "relative_file": "generated/project/generated.cpp",
+                  "project": "clang", "origin": "generated", "command": command,
+                  "discarded_commands": 7}]
+        selection = self.work / "selection.json"
+        selection.write_text(json.dumps({"selection": {"units": units}}))
+        report = self.run_benchmark("--selection-file", str(selection))
+        self.assertEqual(report["selection"]["units"], units)
+        self.assertEqual(report["comparison"]["common_successful_units"], [units[0]["relative_file"]])
+
+    def test_input_manifest_mismatch_prevents_analysis(self):
+        self.database([("clean", [])])
+        header = self.work / "input.h"; header.write_text("changed\n")
+        manifest = self.work / "inputs.json"
+        manifest.write_text(json.dumps([{"path": str(header), "sha256": "0" * 64}]))
+        result = self.run_benchmark("--input-manifest", str(manifest), expected=2)
+        self.assertIn("input fingerprint mismatch", result.stderr)
+        self.assertFalse((self.work / "trace.jsonl").exists())
+
+    def test_serial_batches_do_not_claim_paired_ratio(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--execution-mode", "batches")
+        self.assertIsNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+
+    def test_input_change_retains_incomplete_run_evidence(self):
+        self.database([("invalidate-input", [])])
+        header = self.work / "input.h"; header.write_text("original")
+        manifest = self.work / "inputs.json"
+        manifest.write_text(json.dumps([{"path": str(header), "sha256": hashlib.sha256(header.read_bytes()).hexdigest()}]))
+        result = self.run_benchmark("--input-manifest", str(manifest), expected=2)
+        self.assertIn("input fingerprint mismatch", result.stderr)
+        report = json.loads((self.work / "out/report.json").read_text())
+        self.assertFalse(report["complete"])
+        self.assertFalse(report["input_freeze"]["final_verified"])
+        self.assertGreater(len(report["runs"]), 0)
+
+    def test_mixed_shared_options_are_rejected_before_analysis(self):
+        self.database([("clean", [])])
+        result = self.run_benchmark("--baseline-check", "bugprone-use-after-move", "--check-option", "HistLimit=2", expected=2)
+        self.assertIn("shared --check-option requires matching checks", result.stderr)
+        self.assertFalse((self.work / "trace.jsonl").exists())
+
+    def test_missing_yaml_dependency_is_explicit(self):
+        code = ("import importlib.util; s=importlib.util.spec_from_file_location('support', "
+                + repr(str(RUNNER.with_name('cir_lifetime_benchmark_support.py')))
+                + "); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.require_yaml()")
+        result = subprocess.run([sys.executable, "-S", "-c", code], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("diagnostic YAML parsing requires PyYAML", result.stderr)
+
+
+unittest.main()
