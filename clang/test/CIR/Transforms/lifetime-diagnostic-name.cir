@@ -1,0 +1,54 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all remarks=pset-always" --verify-diagnostics -o /dev/null
+
+!s32i = !cir.int<s, 32>
+!ptr = !cir.ptr<!s32i>
+!slot = !cir.ptr<!ptr>
+!fnptr = !cir.ptr<!cir.func<(!s32i) -> !ptr>>
+!arrayptr = !cir.ptr<!cir.array<!s32i x 4>>
+
+module {
+  // An indirect call has no source variable or direct callee symbol to print.
+  cir.func @indirect_call_result(%fn: !fnptr, %arg: !s32i) {
+    %p = cir.alloca "p" align(8) : !slot
+    %result = cir.call %fn(%arg) : (!fnptr, !s32i) -> !ptr
+    cir.store %result, %p : !ptr, !slot
+    // expected-remark @below {{pset => { <unnamed> }}}
+    %value = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+
+  // get_element records this unnamed non-entry array base in p's pointee set.
+  cir.func @non_entry_array_base(%array: !arrayptr) {
+    cir.br ^body(%array : !arrayptr)
+  ^body(%base: !arrayptr):
+    %p = cir.alloca "p" align(8) : !slot
+    %zero = cir.const #cir.int<0> : !s32i
+    %element = cir.get_element %base[%zero : !s32i] : !arrayptr -> !ptr
+    cir.store %element, %p : !ptr, !slot
+    // expected-remark @below {{pset => { <unnamed> }}}
+    %value = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+
+  // Preserve the existing names of direct calls, entry arguments and locals.
+  cir.func private @get_pointer(!s32i) -> !ptr
+  cir.func @named_values(%array: !arrayptr, %arg: !s32i) {
+    %p = cir.alloca "p" align(8) : !slot
+    %result = cir.call @get_pointer(%arg) : (!s32i) -> !ptr
+    cir.store %result, %p : !ptr, !slot
+    // expected-remark @below {{pset => { call:get_pointer }}}
+    %from_call = cir.load deref %p : !slot, !ptr
+
+    %zero = cir.const #cir.int<0> : !s32i
+    %element = cir.get_element %array[%zero : !s32i] : !arrayptr -> !ptr
+    cir.store %element, %p : !ptr, !slot
+    // expected-remark @below {{pset => { fn_arg:0 }}}
+    %from_arg = cir.load deref %p : !slot, !ptr
+
+    %local = cir.alloca "local" align(4) : !ptr
+    cir.store %local, %p : !ptr, !slot
+    // expected-remark @below {{pset => { local }}}
+    %from_local = cir.load deref %p : !slot, !ptr
+    cir.return
+  }
+}

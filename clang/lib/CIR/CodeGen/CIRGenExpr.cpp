@@ -1930,6 +1930,10 @@ static Address createReferenceTemporary(CIRGenFunction &cgf,
     mlir::OpBuilder::InsertPoint ip;
     if (extDeclAlloca) {
       ip = {extDeclAlloca->getBlock(), extDeclAlloca->getIterator()};
+    } else if (m->getStorageDuration() == SD_FullExpression &&
+               cgf.currentFullExprLifetimeScope) {
+      ip = cgf.getBuilder().getBestAllocaInsertPoint(
+          &cgf.currentFullExprLifetimeScope.getScopeRegion().front());
     } else if (cgf.isInConditionalBranch() &&
                m->getStorageDuration() == SD_FullExpression) {
       // Place in the function entry block so the alloca dominates both

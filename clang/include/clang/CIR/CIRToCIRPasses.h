@@ -29,7 +29,8 @@ mlir::LogicalResult
 runCIRToCIRPasses(mlir::ModuleOp theModule, mlir::MLIRContext &mlirCtx,
                   bool enableVerifier, bool enableIdiomRecognizer,
                   bool enableCIRSimplify, bool enableLibOpt,
-                  llvm::StringRef libOptOptions, bool enableCallConvLowering);
+                  llvm::StringRef libOptOptions, bool enableCallConvLowering,
+                  bool enableLifetimeCheck, llvm::StringRef lifetimeOptions);
 
 } // namespace cir
 

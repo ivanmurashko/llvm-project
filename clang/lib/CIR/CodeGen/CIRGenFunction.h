@@ -200,6 +200,11 @@ public:
   /// what closes those scopes.
   cir::CleanupScopeOp currentFullExprCleanupScope = nullptr;
 
+  /// Optional source lifetime boundary for full-expression temporaries.
+  /// Kept separately from cleanup scopes because trivial temporaries have no
+  /// destructor cleanup and lifetime-extended temporaries belong elsewhere.
+  cir::ScopeOp currentFullExprLifetimeScope = nullptr;
+
   /// A cleanup that was pushed to the EH stack but whose deactivation is
   /// deferred until the enclosing CleanupDeactivationScope exits. Used to
   /// protect partially-constructed aggregates (e.g. lambda captures) so that
@@ -1475,6 +1480,8 @@ public:
     RunCleanupsScope cleanups;
     cir::CleanupScopeOp scope;
     cir::CleanupScopeOp oldFullExprCleanupScope;
+    cir::ScopeOp lifetimeScope;
+    cir::ScopeOp oldFullExprLifetimeScope;
     size_t deferredCleanupStackSize;
     size_t conditionalScopeDepth;
     bool exited = false;
@@ -2253,8 +2260,9 @@ public:
   mlir::LogicalResult emitStmt(const clang::Stmt *s, bool useCurrentScope,
                                llvm::ArrayRef<const Attr *> attrs = {});
 
-  mlir::LogicalResult emitSimpleStmt(const clang::Stmt *s,
-                                     bool useCurrentScope);
+  /// Return nullopt for an unhandled statement, otherwise its emission result.
+  std::optional<mlir::LogicalResult> emitSimpleStmt(const clang::Stmt *s,
+                                                   bool useCurrentScope);
 
   mlir::LogicalResult emitForStmt(const clang::ForStmt &s);
 

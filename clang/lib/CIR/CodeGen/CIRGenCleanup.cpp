@@ -146,10 +146,21 @@ CIRGenFunction::FullExprCleanupScope::FullExprCleanupScope(CIRGenFunction &cgf,
                                                            const Expr *subExpr)
     : cgf(cgf), cleanups(cgf), scope(nullptr),
       oldFullExprCleanupScope(cgf.currentFullExprCleanupScope),
+      lifetimeScope(nullptr),
+      oldFullExprLifetimeScope(cgf.currentFullExprLifetimeScope),
       deferredCleanupStackSize(cgf.deferredConditionalCleanupStack.size()),
       conditionalScopeDepth(cgf.conditionalCleanupScopes.size()) {
 
   assert(subExpr && "ExprWithCleanups always has a sub-expression");
+  if (cgf.cgm.shouldPreserveLifetimeScopes()) {
+    lifetimeScope = cir::ScopeOp::create(
+        cgf.builder, cgf.getLoc(subExpr->getSourceRange()),
+        [](mlir::OpBuilder &, mlir::Location) {});
+    cgf.builder.setInsertionPointToEnd(
+        &lifetimeScope.getScopeRegion().front());
+  }
+  cgf.currentFullExprLifetimeScope = lifetimeScope;
+
   ConditionalEvaluationFinder finder;
   finder.TraverseStmt(const_cast<Expr *>(subExpr));
   if (finder.found()) {
@@ -303,10 +314,11 @@ void CIRGenFunction::FullExprCleanupScope::exit(
   exited = true;
 
   cgf.currentFullExprCleanupScope = oldFullExprCleanupScope;
+  cgf.currentFullExprLifetimeScope = oldFullExprLifetimeScope;
 
   size_t oldSize = deferredCleanupStackSize;
 
-  if (!scope) {
+  if (!scope && !lifetimeScope) {
     assert(cgf.conditionalCleanupScopes.size() == conditionalScopeDepth &&
            "conditional cleanup scope opened without one to close it");
     cgf.deferredConditionalCleanupStack.truncate(oldSize);
@@ -340,8 +352,8 @@ void CIRGenFunction::FullExprCleanupScope::exit(
   // stack after we've finished emitting any deferred cleanups.
   cleanups.forceCleanupExceptLifetimeExtended();
 
-  // Make sure the cleanup scope body region has a terminator.
-  {
+  // Make sure the conditional cleanup scope body region has a terminator.
+  if (scope) {
     mlir::OpBuilder::InsertionGuard guard(cgf.builder);
     mlir::Block &lastBodyBlock = scope.getBodyRegion().back();
     cgf.builder.setInsertionPointToEnd(&lastBodyBlock);
@@ -353,7 +365,7 @@ void CIRGenFunction::FullExprCleanupScope::exit(
   // Deferred cleanups are emitted into the conditional scopes closed above,
   // so this scope's cleanup region is empty and canonicalization will inline
   // the scope away.
-  {
+  if (scope) {
     mlir::OpBuilder::InsertionGuard guard(cgf.builder);
     mlir::Block &cleanupBlock = scope.getCleanupRegion().front();
     cgf.builder.setInsertionPointToEnd(&cleanupBlock);
@@ -362,7 +374,21 @@ void CIRGenFunction::FullExprCleanupScope::exit(
 
   assert(cgf.deferredConditionalCleanupStack.size() == oldSize &&
          "deferred cleanups were not consumed by a conditional scope");
-  cgf.builder.setInsertionPointAfter(scope);
+  if (scope)
+    cgf.builder.setInsertionPointAfter(scope);
+
+  if (lifetimeScope) {
+    mlir::Block &lastBodyBlock = lifetimeScope.getScopeRegion().back();
+    cgf.builder.setInsertionPointToEnd(&lastBodyBlock);
+    if (lastBodyBlock.empty() ||
+        !lastBodyBlock.back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+      mlir::Location endLoc = lifetimeScope.getLoc();
+      if (auto fused = mlir::dyn_cast<mlir::FusedLoc>(endLoc))
+        endLoc = fused.getLocations().back();
+      cgf.builder.createYield(endLoc);
+    }
+    cgf.builder.setInsertionPointAfter(lifetimeScope);
+  }
 
   // Promote any lifetime-extended cleanups onto the EH scope stack. The new
   // cir.cleanup.scope ops created here will wrap any code in the enclosing
@@ -607,6 +633,15 @@ void CIRGenFunction::deactivateCleanupBlock(EHScopeStack::stable_iterator c,
   if (c == ehStack.stable_begin() &&
       currentCleanupStackDepth.strictlyEncloses(c)) {
     popCleanupBlock(/*forDeactivation=*/true);
+    return;
+  }
+
+  // EH-only cleanups remain on the stack when exceptions are disabled, but
+  // pushCleanup clears their EH flag and creates no cleanup scope. Initializer
+  // temporaries can leave such an entry below a real normal cleanup. Deactivate
+  // the inert entry without creating a flag for code that will never execute.
+  if (!scope.isNormalCleanup() && !scope.isEHCleanup()) {
+    scope.setActive(false);
     return;
   }
 
