@@ -8,5 +8,5 @@ struct S {
 };
 
 void S::f(int a, int b) {
-  std::shared_ptr<S> l = std::make_shared<S>(a, b, this); // expected-remark {{pset => { this }}}
+  std::shared_ptr<S> l = std::make_shared<S>(a, b, this); // expected-remark 2 {{pset => { fn_arg:0 }}}
 }

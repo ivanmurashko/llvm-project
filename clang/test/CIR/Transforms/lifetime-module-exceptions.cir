@@ -1,0 +1,122 @@
+// RUN: split-file %s %t
+// RUN: cir-opt %t/disabled.cir --cir-canonicalize --cir-lifetime-check="history=all" --verify-diagnostics --emit-bytecode -o %t/disabled.bc
+// RUN: cir-opt %t/disabled.bc --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/enabled.cir --cir-canonicalize --cir-lifetime-check="history=all" --verify-diagnostics --emit-bytecode -o %t/enabled.bc
+// RUN: cir-opt %t/enabled.bc --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/absent.cir --cir-canonicalize --cir-lifetime-check="history=all" --verify-diagnostics --emit-bytecode -o %t/absent.bc
+// RUN: cir-opt %t/absent.bc --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+//--- disabled.cir
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+// Explicit exceptions=false preserves normal cleanup and diagnostics, including
+// witnesses generated while evaluating a noreturn call's arguments. There are
+// no contradictory catch regions in this no-exceptions module.
+module attributes {cir.lowering_lang_options = #cir.lowering_lang_options<
+  exceptions = false, threadsafe_statics = true, cuda = false,
+  cuda_is_device = false, hip = false, gpu_rdc = false, openmp = false,
+  openmp_is_target_device = false, clang_abi_compat = 17>} {
+  cir.func private @may_throw()
+  cir.func private @observe(!i) attributes {nothrow}
+  cir.func private @stop(!i) attributes {noreturn}
+  cir.func @normal_cleanup_still_runs() {
+    %live = cir.alloca "live" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.store %live, %pointer : !p, !pp
+    cir.cleanup.scope {
+      cir.call @may_throw() : () -> ()
+      cir.yield
+    } cleanup normal {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %pointer : !p, !pp
+      cir.yield
+    }
+    %address = cir.load %pointer : !pp, !p
+    // expected-warning @below {{use of invalid pointer}}
+    %value = cir.load %address : !p, !i
+    cir.call @observe(%value) nothrow : (!i) -> ()
+    cir.return
+  }
+  cir.func @noreturn_keeps_argument_witness() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    %address = cir.load %pointer : !pp, !p
+    // expected-warning @below {{use of invalid pointer}}
+    %value = cir.load %address : !p, !i
+    cir.call @stop(%value) : (!i) -> ()
+    cir.unreachable
+  }
+}
+
+//--- enabled.cir
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+// Both explicit exceptions=true and missing metadata retain the possible
+// exceptional continuation before the normal path reinitializes the pointer.
+module attributes {cir.lowering_lang_options = #cir.lowering_lang_options<
+  exceptions = true, threadsafe_statics = true, cuda = false,
+  cuda_is_device = false, hip = false, gpu_rdc = false, openmp = false,
+  openmp_is_target_device = false, clang_abi_compat = 17>} {
+  cir.func private @may_throw()
+  cir.func private @observe(!i) attributes {nothrow}
+  cir.func @catch_before_normal_reinitialization() {
+    %live = cir.alloca "live" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.store %live, %pointer : !p, !pp
+    cir.try {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %pointer : !p, !pp
+      cir.call @may_throw() : () -> ()
+      cir.store %live, %pointer : !p, !pp
+      cir.yield
+    } catch all (%token : !cir.eh_token) {
+      %catch, %exception = cir.begin_catch %token : !cir.eh_token -> (!cir.catch_token, !cir.ptr<!cir.void>)
+      %address = cir.load %pointer : !pp, !p
+      // expected-warning @below {{use of invalid pointer}}
+      %value = cir.load %address : !p, !i
+      cir.call @observe(%value) nothrow : (!i) -> ()
+      cir.end_catch %catch : !cir.catch_token
+      cir.yield
+    }
+    cir.return
+  }
+}
+
+//--- absent.cir
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+// Both explicit exceptions=true and missing metadata retain the possible
+// exceptional continuation before the normal path reinitializes the pointer.
+module {
+  cir.func private @may_throw()
+  cir.func private @observe(!i) attributes {nothrow}
+  cir.func @catch_before_normal_reinitialization() {
+    %live = cir.alloca "live" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.store %live, %pointer : !p, !pp
+    cir.try {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %pointer : !p, !pp
+      cir.call @may_throw() : () -> ()
+      cir.store %live, %pointer : !p, !pp
+      cir.yield
+    } catch all (%token : !cir.eh_token) {
+      %catch, %exception = cir.begin_catch %token : !cir.eh_token -> (!cir.catch_token, !cir.ptr<!cir.void>)
+      %address = cir.load %pointer : !pp, !p
+      // expected-warning @below {{use of invalid pointer}}
+      %value = cir.load %address : !p, !i
+      cir.call @observe(%value) nothrow : (!i) -> ()
+      cir.end_catch %catch : !cir.catch_token
+      cir.yield
+    }
+    cir.return
+  }
+}

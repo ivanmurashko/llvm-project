@@ -13,7 +13,8 @@ owner and pointer types.
 This experimental check is available only in builds configured with
 `CLANG_ENABLE_CIR=ON`. It generates CIR from the translation unit's existing AST
 and compilation options, verifies the module, and runs CIR canonicalization
-followed by lifetime analysis.
+followed by lifetime analysis. The analysis operates on CIR operations and
+structured regions without constructing or analyzing an AST control-flow graph.
 
 ```cpp
 void example() {
@@ -54,6 +55,12 @@ Dereferencing the moved-from pointer is diagnosed. Parameter reference
 categories and method identity come from serialized CIR metadata; argument move
 tracking is skipped when CIRGen cannot prove the source-parameter mapping.
 
+Verified `std::get` overloads for `std::pair` and `std::tuple` do not consume the
+containing object when returning an element reference. Existing invalid-source
+checks still apply; the contract does not establish general element aliasing or
+memberwise move tracking. Unavailable reference contents in modeled library
+calls remain unknown rather than becoming the reference's address.
+
 ## Options
 
 ### HistoryList
@@ -84,18 +91,49 @@ Switch analysis supports cases whose blocks execute in source order, including
 labels connected by unconditional branches to the next block. Nested case
 labels, other case control-flow graphs, and gotos in functions containing a
 switch are reported as unsupported analysis errors.
+Jumps into nested structured regions are also unsupported. Array constructor
+and destructor regions are not generally modeled, including some forms that do
+not cause an error.
+A successful run does not establish coverage of every operation.
 
-The analysis uses an approximation for loops and joins. Structured branches
-proven to return do not contribute pointer state to subsequent code. General
-control-flow, interprocedural, exception, and conditional-expression analysis
-remain limited. Passing an aggregate with a null pointer field to an implicit
-assignment can produce a conservative false positive. Valid reinitialization,
-including scalar reassignment and an owner's `reset(new T)`, is not fully
-handled and remains follow-up work. Structured bindings and other compound
-operations can also produce conservative false positives; this check does not
-provide general member-sensitive move tracking.
+The analysis follows local aliases and captured value snapshots, joins
+structured control-flow alternatives, and computes a finite loop fixed point.
+Normal, return, break, continue, and exceptional continuations are separate.
+Range-for loop-variable and body-local storage has a lifetime for each iteration,
+with cleanup before the increment and on exit. The range and begin/end objects
+remain in the enclosing loop scope.
+Completed scalar assignments, non-const value assignment overloads, and
+supported library replacements restore state on normal completion. Compound
+and const assignment operators do not restore it, and a throwing assignment
+keeps the incoming receiver state on its exceptional continuation. Unknown
+calls do not prove reinitialization. Whole local objects and direct
+local captures are tracked, while general memberwise moves in compound classes,
+array-element move propagation, escaping lambdas or callbacks, and arbitrary
+interprocedural effects remain outside the model. Selected returned-lambda
+checks do not cover arbitrary uses after captured locals leave scope.
 
-Capture handling is partial. Some direct local-owner lambda init-captures are
-handled through move construction; remaining capture semantics need follow-up.
-General lambda escape and moved-callback analysis are not supported. Diagnostic
-counts alone are not a measure of accuracy.
+The check follows emitted CIR order, including explicitly sequenced operations,
+short-circuit regions and supported temporary cleanup. Canonicalized CIR and
+text/bytecode reloads use the same analysis. It does not explore every C++
+evaluation order. A call such as `consume(*p, std::move(p))`, where the second
+parameter is a `std::unique_ptr` passed by value, can therefore be missed when
+the emitted order dereferences `p` before moving it. Another permitted ordering
+moves first and then dereferences an empty pointer. This is an accepted gap
+relative to `bugprone-use-after-move`; complete coverage parity is not promised.
+
+The inherited aggregate pointer-field rules can produce conservative false
+positives for compound operations. Custom tuple-like accessors do not acquire
+the standard `std::get` contract through their name or structured-binding use.
+Branch joins can lose correlations between conditions and object states,
+retaining an invalid state that cannot reach a particular use. Conditional
+transfers through unmodeled custom containers and relational loop invariants
+can still produce false positives. A nonempty standard smart-pointer guard
+excludes its empty moved-from alternative; optional engagement and arbitrary
+record state do not imply the same guarantee. Standard-library models cover
+bounded contracts; unknown custom constructors cannot establish a library's
+guaranteed post-move contents. See [CIR lifetime checking](https://clang.llvm.org/docs/CIR/LifetimeCheck.html)
+for the analysis model and further limitations.
+
+Diagnostic counts alone are not a measure of accuracy. In particular, scalar
+move-intent and repeated-move policy warnings must be distinguished from actual
+invalid uses when comparing this check with `bugprone-use-after-move`.

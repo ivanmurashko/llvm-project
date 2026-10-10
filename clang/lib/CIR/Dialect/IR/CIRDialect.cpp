@@ -3336,6 +3336,9 @@ mlir::LogicalResult cir::FuncOp::verify() {
 
   if (auto lifetime = getLifetimeAttr()) {
     llvm::ArrayRef<mlir::Type> inputs = getFunctionType().getInputs();
+    if (lifetime.getReturnsNonnull() &&
+        !mlir::isa<cir::PointerType>(getFunctionType().getReturnType()))
+      return emitOpError() << "a nonnull lifetime result must be a pointer";
     if (lifetime.getHasImplicitObject() &&
         (inputs.empty() || !mlir::isa<cir::PointerType>(inputs.front())))
       return emitOpError()
@@ -3352,6 +3355,91 @@ mlir::LogicalResult cir::FuncOp::verify() {
           return emitOpError() << "a lifetime reference parameter must map to "
                                   "a pointer input";
       }
+    }
+    auto effect = lifetime.getLibraryFunction();
+    if (effect != LifetimeLibraryFunction::None &&
+        effect != LifetimeLibraryFunction::Tie &&
+        effect != LifetimeLibraryFunction::MakeTuple &&
+        effect != LifetimeLibraryFunction::TupleGet) {
+      auto pointer = cast<PointerType>(inputs.front());
+      auto receiver = dyn_cast<RecordType>(pointer.getPointee());
+      auto properties =
+          receiver ? getLifetimeRecord(receiver,
+                                       (*this)->getParentOfType<ModuleOp>())
+                   : LifetimeRecordAttr{};
+      if (!properties ||
+          properties.getLibraryKind() == LifetimeLibraryKind::None)
+        return emitOpError() << "a library member contract requires a "
+                                "standard-library receiver";
+      if (effect == LifetimeLibraryFunction::TupleAssign &&
+          (properties.getLibraryKind() != LifetimeLibraryKind::Tuple ||
+           lifetime.getNumParams() != 1))
+        return emitOpError() << "tuple assignment requires a tuple receiver "
+                                "and one source parameter";
+      if (effect == LifetimeLibraryFunction::SharedAliasConstruct) {
+        // The attribute verifier established a reference source parameter,
+        // and reference parameters map to pointer inputs.
+        auto source =
+            cast<PointerType>(inputs[lifetime.getParamOperandIndex(0)]);
+        auto owner = dyn_cast<RecordType>(source.getPointee());
+        auto ownerProperties =
+            owner
+                ? getLifetimeRecord(owner, (*this)->getParentOfType<ModuleOp>())
+                : LifetimeRecordAttr{};
+        if (properties.getLibraryKind() != LifetimeLibraryKind::SharedPointer ||
+            !ownerProperties ||
+            ownerProperties.getLibraryKind() !=
+                LifetimeLibraryKind::SharedPointer ||
+            !isa<PointerType>(inputs[lifetime.getParamOperandIndex(1)]))
+          return emitOpError()
+                 << "shared_alias_construct requires a shared_ptr receiver, a "
+                    "shared_ptr source reference, and a pointer argument";
+      }
+    }
+    if (effect == LifetimeLibraryFunction::TupleGet) {
+      auto source = cast<PointerType>(inputs[lifetime.getParamOperandIndex(0)]);
+      if (!isa<RecordType>(source.getPointee()) ||
+          !isa<PointerType>(getFunctionType().getReturnType()))
+        return emitOpError() << "tuple_get requires a record reference and a "
+                                "reference result";
+    }
+    if (effect == LifetimeLibraryFunction::Bool ||
+        effect == LifetimeLibraryFunction::HasValue ||
+        effect == LifetimeLibraryFunction::Empty ||
+        effect == LifetimeLibraryFunction::Expired) {
+      if (lifetime.getNumParams() != 0 ||
+          !isa<BoolType>(getFunctionType().getReturnType()))
+        return emitOpError() << "a library predicate requires zero parameters "
+                                "and a boolean result";
+    }
+    if (effect == LifetimeLibraryFunction::Get ||
+        effect == LifetimeLibraryFunction::Release ||
+        effect == LifetimeLibraryFunction::Data) {
+      if (lifetime.getNumParams() != 0 ||
+          !isa<PointerType>(getFunctionType().getReturnType()))
+        return emitOpError() << "a library pointer observer requires zero "
+                                "parameters and a pointer result";
+    }
+    if (effect == LifetimeLibraryFunction::TryEmplace) {
+      auto result = dyn_cast<RecordType>(getFunctionType().getReturnType());
+      unsigned index = lifetime.getInsertionResultIndex();
+      if (!result || index >= result.getMembers().size() ||
+          !isa<BoolType>(cir::memberStorageType(result.getMembers()[index])))
+        return emitOpError() << "an insertion result member index must name a "
+                                "boolean record member";
+    }
+    if (auto mapping = lifetime.getTupleElementParams()) {
+      Type tupleType = getFunctionType().getReturnType();
+      if (effect != LifetimeLibraryFunction::MakeTuple)
+        tupleType = cast<PointerType>(inputs.front()).getPointee();
+      auto tuple = dyn_cast<RecordType>(tupleType);
+      auto properties =
+          tuple ? getLifetimeRecord(tuple, (*this)->getParentOfType<ModuleOp>())
+                : LifetimeRecordAttr{};
+      if (!properties || !properties.getTupleElementKinds() ||
+          mapping.size() != properties.getTupleElementKinds().size())
+        return emitOpError() << "tuple element parameter mapping must match "
+                                "logical tuple arity";
     }
   }
 

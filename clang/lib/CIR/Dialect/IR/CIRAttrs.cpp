@@ -1052,10 +1052,28 @@ RecordLayoutAttr cir::getRecordLayout(mlir::ModuleOp mod,
 LogicalResult
 LifetimeRecordAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                            bool owner, bool pointer, bool lambda,
-                           bool promiseType, bool smartPointer) {
+                           bool promiseType, bool smartPointer,
+                           LifetimeLibraryKind libraryKind,
+                           mlir::DenseI32ArrayAttr tupleElementKinds) {
   if (owner && pointer)
     return emitError()
            << "a lifetime record cannot be both an owner and a pointer";
+  if (lambda && libraryKind != LifetimeLibraryKind::None)
+    return emitError() << "a lambda cannot have standard-library semantics";
+  if (smartPointer && libraryKind != LifetimeLibraryKind::None &&
+      libraryKind != LifetimeLibraryKind::UniquePointer &&
+      libraryKind != LifetimeLibraryKind::SharedPointer)
+    return emitError() << "smart-pointer null-after-move semantics require "
+                          "unique_ptr or shared_ptr";
+  if (tupleElementKinds) {
+    if (libraryKind != LifetimeLibraryKind::Tuple)
+      return emitError()
+             << "tuple element kinds require the tuple library kind";
+    for (int32_t kind : tupleElementKinds.asArrayRef())
+      if (kind < static_cast<int32_t>(LifetimeParameterKind::Value) ||
+          kind > static_cast<int32_t>(LifetimeParameterKind::RValueReference))
+        return emitError() << "invalid lifetime tuple element kind";
+  }
   return success();
 }
 
@@ -1063,7 +1081,10 @@ LogicalResult LifetimeFunctionAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, bool isMethod, bool isStatic,
     bool isConst, bool isOverloadedOperator, bool hasImplicitObject,
     llvm::StringRef methodName, mlir::DenseI32ArrayAttr parameterKinds,
-    mlir::DenseI32ArrayAttr parameterIndices) {
+    mlir::DenseI32ArrayAttr parameterIndices, bool reinitializes,
+    bool returnsNonnull, LifetimeLibraryFunction libraryFunction,
+    mlir::DenseI32ArrayAttr guaranteedMoveParams,
+    mlir::DenseI32ArrayAttr tupleElementParams, int32_t insertionResultIndex) {
   if (isStatic && !isMethod)
     return emitError() << "a static lifetime function must be a method";
   if (isConst && (!isMethod || isStatic))
@@ -1074,18 +1095,99 @@ LogicalResult LifetimeFunctionAttr::verify(
            << "an implicit object parameter requires a non-static method";
   if (!methodName.empty() && !isMethod)
     return emitError() << "a lifetime method name requires a method";
+  if (reinitializes && (!isMethod || isStatic))
+    return emitError() << "reinitialization requires a non-static method";
+  if (libraryFunction != LifetimeLibraryFunction::None) {
+    if (!parameterKinds)
+      return emitError()
+             << "a library contract requires source parameter mapping";
+    if (libraryFunction == LifetimeLibraryFunction::Tie ||
+        libraryFunction == LifetimeLibraryFunction::MakeTuple ||
+        libraryFunction == LifetimeLibraryFunction::TupleGet) {
+      if (isMethod)
+        return emitError()
+               << (libraryFunction == LifetimeLibraryFunction::Tie
+                       ? "the tie contract requires a free function"
+                   : libraryFunction == LifetimeLibraryFunction::MakeTuple
+                       ? "the make_tuple contract requires a free function"
+                       : "the tuple_get contract requires a free function");
+    } else if (!isMethod || isStatic || !hasImplicitObject) {
+      return emitError()
+             << "a library member contract requires an implicit object";
+    }
+  }
   if (static_cast<bool>(parameterKinds) != static_cast<bool>(parameterIndices))
     return emitError()
            << "lifetime parameter kinds and indices must be present together";
+  if (guaranteedMoveParams &&
+      libraryFunction != LifetimeLibraryFunction::TryEmplace &&
+      libraryFunction != LifetimeLibraryFunction::TryEmplaceHint)
+    return emitError()
+           << "guaranteed move parameters require a try_emplace contract";
+  if (tupleElementParams &&
+      libraryFunction != LifetimeLibraryFunction::Construct &&
+      libraryFunction != LifetimeLibraryFunction::MakeTuple)
+    return emitError() << "tuple element parameters require a constructor or "
+                          "make_tuple contract";
+  if (libraryFunction == LifetimeLibraryFunction::TryEmplace) {
+    if (insertionResultIndex < 0)
+      return emitError()
+             << "try_emplace requires an insertion result member index";
+  } else if (insertionResultIndex != -1) {
+    return emitError() << "an insertion result member index requires a "
+                          "try_emplace contract";
+  }
   if (!parameterKinds)
     return success();
   if (parameterKinds.size() != parameterIndices.size())
     return emitError()
            << "lifetime parameter kinds and indices must have the same size";
+  if (libraryFunction == LifetimeLibraryFunction::TupleGet &&
+      (parameterKinds.size() != 1 ||
+       (parameterKinds[0] !=
+            static_cast<int32_t>(LifetimeParameterKind::LValueReference) &&
+        parameterKinds[0] !=
+            static_cast<int32_t>(LifetimeParameterKind::RValueReference))))
+    return emitError() << "tuple_get requires one source reference parameter";
+  if (tupleElementParams) {
+    int32_t previous = -1;
+    for (int32_t index : tupleElementParams.asArrayRef()) {
+      if (index <= previous)
+        return emitError() << "tuple element parameters must be nonnegative "
+                              "and strictly increasing";
+      if (static_cast<unsigned>(index) >= parameterKinds.size())
+        return emitError() << "tuple element parameter is outside the source "
+                              "parameter array";
+      previous = index;
+    }
+  }
+  if (guaranteedMoveParams) {
+    int32_t previous = -1;
+    for (int32_t index : guaranteedMoveParams.asArrayRef()) {
+      if (index <= previous)
+        return emitError() << "guaranteed move parameters must be nonnegative "
+                              "and strictly increasing";
+      if (static_cast<unsigned>(index) >= parameterKinds.size())
+        return emitError() << "guaranteed move parameter is outside the source "
+                              "parameter array";
+      if (parameterKinds[index] !=
+          static_cast<int32_t>(LifetimeParameterKind::RValueReference))
+        return emitError()
+               << "a guaranteed move parameter must be an rvalue reference";
+      previous = index;
+    }
+  }
   for (int32_t kind : parameterKinds.asArrayRef())
     if (kind < static_cast<int32_t>(LifetimeParameterKind::Value) ||
         kind > static_cast<int32_t>(LifetimeParameterKind::RValueReference))
       return emitError() << "invalid lifetime parameter kind";
+  if (libraryFunction == LifetimeLibraryFunction::SharedAliasConstruct &&
+      (parameterKinds.size() < 2 ||
+       parameterKinds[0] ==
+           static_cast<int32_t>(LifetimeParameterKind::Value) ||
+       parameterKinds[1] != static_cast<int32_t>(LifetimeParameterKind::Value)))
+    return emitError() << "shared_alias_construct requires a source owner "
+                          "reference and a stored pointer value";
   int32_t previous = -1;
   for (int32_t index : parameterIndices.asArrayRef()) {
     if (index <= previous)

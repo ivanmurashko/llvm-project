@@ -1,0 +1,126 @@
+// RUN: cir-opt %s -verify-diagnostics -split-input-file
+
+module {
+  // expected-error @below {{reinitialization requires a non-static method}}
+  cir.func private @free() attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, reinitializes = true>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{a nonnull lifetime result must be a pointer}}
+  cir.func private @integer() -> !cir.int<s, 32> attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, returns_nonnull = true>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{a library contract requires source parameter mapping}}
+  cir.func private @unknown_mapping() attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, library_function = reset>}
+}
+
+// -----
+
+module {
+  // expected-error @below {{the tie contract requires a free function}}
+  cir.func private @method(!cir.ptr<!cir.int<s, 32>>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [], parameter_indices = [], library_function = tie>}
+}
+
+// -----
+
+// expected-error @below {{smart-pointer null-after-move semantics require unique_ptr or shared_ptr}}
+module attributes {cir.lifetime_records = {Bad = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = optional>}} {}
+
+// -----
+
+// expected-error @below {{a lambda cannot have standard-library semantics}}
+module attributes {cir.lifetime_records = {Bad = #cir.lifetime_record<owner = false, pointer = false, lambda = true, promise_type = false, library_kind = container>}} {}
+
+// -----
+
+module {
+  // expected-error @below {{a library member contract requires a standard-library receiver}}
+  cir.func private @not_a_library(!cir.ptr<!cir.int<s, 32>>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [], parameter_indices = [], library_function = clear>}
+}
+
+// -----
+
+!Optional = !cir.struct<"Optional" {data !cir.int<s, 32>}>
+module attributes {cir.lifetime_records = {Optional = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, library_kind = optional>}} {
+  // expected-error @below {{a library predicate requires zero parameters and a boolean result}}
+  cir.func private @bad_predicate(!cir.ptr<!Optional>) -> !cir.int<s, 32> attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [], parameter_indices = [], library_function = has_value>}
+}
+
+// -----
+
+!Tuple = !cir.struct<"Tuple" {data !cir.int<s, 32>}>
+module attributes {cir.lifetime_records = {Tuple = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, library_kind = tuple, tuple_element_kinds = [0]>}} {
+  // expected-error @below {{tuple assignment requires a tuple receiver and one source parameter}}
+  cir.func private @missing_tuple_source(!cir.ptr<!Tuple>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [], parameter_indices = [], library_function = tuple_assign>}
+}
+
+// -----
+
+!Tuple = !cir.struct<"Tuple" {data !cir.int<s, 32>}>
+module attributes {cir.lifetime_records = {Tuple = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, library_kind = tuple, tuple_element_kinds = [0]>}} {
+  // expected-error @below {{tuple element parameter mapping must match logical tuple arity}}
+  cir.func private @bad_tuple_mapping(!cir.int<s, 32>, !cir.int<s, 32>) -> !Tuple attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0, 0], parameter_indices = [0, 1], library_function = make_tuple, tuple_element_params = [0, 1]>}
+}
+
+// -----
+
+!Shared = !cir.struct<"Shared" {data !cir.ptr<!cir.int<s, 32>>}>
+module attributes {cir.lifetime_records = {Shared = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = shared_ptr>}} {
+  // expected-error @below {{shared_alias_construct requires a source owner reference and a stored pointer value}}
+  cir.func private @alias_without_parameters(!cir.ptr<!Shared>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [], parameter_indices = [], library_function = shared_alias_construct>}
+}
+
+// -----
+
+!Shared = !cir.struct<"Shared" {data !cir.ptr<!cir.int<s, 32>>}>
+module attributes {cir.lifetime_records = {Shared = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = shared_ptr>}} {
+  // expected-error @below {{shared_alias_construct requires a source owner reference and a stored pointer value}}
+  cir.func private @alias_without_pointer(!cir.ptr<!Shared>, !cir.ptr<!Shared>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [1], parameter_indices = [1], library_function = shared_alias_construct>}
+}
+
+// -----
+
+!Shared = !cir.struct<"Shared" {data !cir.ptr<!cir.int<s, 32>>}>
+module attributes {cir.lifetime_records = {Shared = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = shared_ptr>}} {
+  // expected-error @below {{shared_alias_construct requires a source owner reference and a stored pointer value}}
+  cir.func private @alias_owner_by_value(!cir.ptr<!Shared>, !Shared, !cir.ptr<!cir.int<s, 32>>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [0, 0], parameter_indices = [1, 2], library_function = shared_alias_construct>}
+}
+
+// -----
+
+!Shared = !cir.struct<"Shared" {data !cir.ptr<!cir.int<s, 32>>}>
+module attributes {cir.lifetime_records = {Shared = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = shared_ptr>}} {
+  // expected-error @below {{shared_alias_construct requires a source owner reference and a stored pointer value}}
+  cir.func private @alias_pointer_by_reference(!cir.ptr<!Shared>, !cir.ptr<!Shared>, !cir.ptr<!cir.ptr<!cir.int<s, 32>>>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [1, 1], parameter_indices = [1, 2], library_function = shared_alias_construct>}
+}
+
+// -----
+
+!Shared = !cir.struct<"Shared" {data !cir.ptr<!cir.int<s, 32>>}>
+!Unique = !cir.struct<"Unique" {data !cir.ptr<!cir.int<s, 32>>}>
+module attributes {cir.lifetime_records = {Shared = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = shared_ptr>, Unique = #cir.lifetime_record<owner = true, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = unique_ptr>}} {
+  // expected-error @below {{shared_alias_construct requires a shared_ptr receiver, a shared_ptr source reference, and a pointer argument}}
+  cir.func private @alias_from_unique(!cir.ptr<!Shared>, !cir.ptr<!Unique>, !cir.ptr<!cir.int<s, 32>>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [1, 0], parameter_indices = [1, 2], library_function = shared_alias_construct>}
+}
+
+// -----
+
+!Shared = !cir.struct<"Shared" {data !cir.ptr<!cir.int<s, 32>>}>
+!Unique = !cir.struct<"Unique" {data !cir.ptr<!cir.int<s, 32>>}>
+module attributes {cir.lifetime_records = {Shared = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = shared_ptr>, Unique = #cir.lifetime_record<owner = true, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = unique_ptr>}} {
+  // expected-error @below {{shared_alias_construct requires a shared_ptr receiver, a shared_ptr source reference, and a pointer argument}}
+  cir.func private @alias_into_unique(!cir.ptr<!Unique>, !cir.ptr<!Shared>, !cir.ptr<!cir.int<s, 32>>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [1, 0], parameter_indices = [1, 2], library_function = shared_alias_construct>}
+}
+
+// -----
+
+!Shared = !cir.struct<"Shared" {data !cir.ptr<!cir.int<s, 32>>}>
+module attributes {cir.lifetime_records = {Shared = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, smart_pointer = true, library_kind = shared_ptr>}} {
+  // expected-error @below {{shared_alias_construct requires a shared_ptr receiver, a shared_ptr source reference, and a pointer argument}}
+  cir.func private @alias_integer_pointer(!cir.ptr<!Shared>, !cir.ptr<!Shared>, !cir.int<s, 64>) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [1, 0], parameter_indices = [1, 2], library_function = shared_alias_construct>}
+}

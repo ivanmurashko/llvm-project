@@ -335,6 +335,8 @@ void CIRGenFunction::FullExprCleanupScope::exit(
     }
     Address temp = cgf.createDefaultAlignTempAlloca(val.getType(), val.getLoc(),
                                                     "tmp.exprcleanup");
+    if (cgf.cgm.shouldPreserveLifetimeScopes())
+      temp.getUnderlyingAllocaOp().setLifetimeValueSpill(true);
     tempAllocas.push_back(temp);
     cgf.builder.createStore(val.getLoc(), val, temp);
   }
@@ -929,6 +931,8 @@ void CIRGenFunction::popCleanupBlocks(
 
       Address temp = createDefaultAlignTempAlloca(val.getType(), val.getLoc(),
                                                   "tmp.exprcleanup");
+      if (cgm.shouldPreserveLifetimeScopes())
+        temp.getUnderlyingAllocaOp().setLifetimeValueSpill(true);
       tempAllocas.push_back(temp);
       builder.createStore(val.getLoc(), val, temp);
     }

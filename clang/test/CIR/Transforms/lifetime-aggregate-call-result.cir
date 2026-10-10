@@ -1,0 +1,131 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %s --cir-canonicalize --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+!pair = !cir.struct<"Pair" {data !p, data !p}>
+!pairp = !cir.ptr<!pair>
+!indirect = !cir.struct<"Indirect" {data !pp}>
+!indirectp = !cir.ptr<!indirect>
+
+module {
+  cir.func private @make() -> !pair
+  cir.func private @make_indirect() -> !indirect
+  cir.func private @effect() attributes {nothrow}
+
+  // A record-valued call overwrites both tracked pointer slots. The callee
+  // is opaque: unknown contents must not retain the destination's old state.
+  cir.func @opaque_call_result() {
+    %pair = cir.alloca "pair" align(8) : !pairp
+    %result = cir.call @make() : () -> !pair
+    cir.store %result, %pair : !pair, !pairp
+    %first = cir.get_member %pair[0] {name = "first"} : !pairp -> !pp
+    %second = cir.get_member %pair[1] {name = "second"} : !pairp -> !pp
+    %a = cir.load deref %first : !pp, !p
+    %b = cir.load deref %second : !pp, !p
+    cir.return
+  }
+
+  // The store does not necessarily target left. Its null state remains a
+  // real alternative even though one possible destination gets a fresh value.
+  cir.func @may_destination(%choose : !cir.bool) {
+    %left = cir.alloca "left" align(8) : !pairp
+    %right = cir.alloca "right" align(8) : !pairp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %zero = cir.const #cir.zero : !pair
+    cir.store %zero, %left : !pair, !pairp
+    cir.store %zero, %right : !pair, !pairp
+    %destination = cir.select if %choose then %left else %right : (!cir.bool, !pairp, !pairp) -> !pairp
+    %result = cir.call @make() : () -> !pair
+    cir.store %result, %destination : !pair, !pairp
+    %field = cir.get_member %left[0] {name = "first"} : !pairp -> !pp
+    // expected-warning @below {{use of invalid pointer 'left.first'}}
+    %read = cir.load deref %field : !pp, !p
+    cir.return
+  }
+
+  // Joining a known null field with opaque returned contents retains the null
+  // witness. The call's result is never a proof of non-nullness.
+  cir.func @known_null_and_unknown_join(%choose : !cir.bool) {
+    %pair = cir.alloca "joined" align(8) : !pairp
+    cir.if %choose {
+      %result = cir.call @make() : () -> !pair
+      cir.store %result, %pair : !pair, !pairp
+      cir.yield
+    } else {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %zero = cir.const #cir.zero : !pair
+      cir.store %zero, %pair : !pair, !pairp
+      cir.yield
+    }
+    %field = cir.get_member %pair[0] {name = "first"} : !pairp -> !pp
+    // expected-warning @below {{use of invalid pointer 'joined.first'}}
+    %read = cir.load deref %field : !pp, !p
+    cir.return
+  }
+
+  // A call result overwrites this storage in only one branch. The other path
+  // still reaches the member use without initialization.
+  cir.func @uninitialized_and_unknown_join(%choose : !cir.bool) {
+    // expected-note @below {{uninitialized here}}
+    %pair = cir.alloca "partial" align(8) : !pairp
+    cir.if %choose {
+      %result = cir.call @make() : () -> !pair
+      cir.store %result, %pair : !pair, !pairp
+      cir.yield
+    }
+    %field = cir.get_member %pair[0] {name = "first"} : !pairp -> !pp
+    // expected-warning @below {{use of invalid pointer 'partial.first'}}
+    %read = cir.load deref %field : !pp, !p
+    cir.return
+  }
+
+  // The call may throw before its result store executes. Only the normal
+  // continuation can overwrite the previous null member contents.
+  cir.func @exception_before_result_store() {
+    %pair = cir.alloca "prior" align(8) : !pairp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %zero = cir.const #cir.zero : !pair
+    cir.store %zero, %pair : !pair, !pairp
+    cir.try {
+      %result = cir.call @make() : () -> !pair
+      cir.store %result, %pair : !pair, !pairp
+      cir.yield
+    } catch all (%token : !cir.eh_token) {
+      %catch, %exception = cir.begin_catch %token : !cir.eh_token -> (!cir.catch_token, !cir.ptr<!cir.void>)
+      %field = cir.get_member %pair[0] {name = "first"} : !pairp -> !pp
+      // expected-warning @below {{use of invalid pointer 'prior.first'}}
+      %read = cir.load deref %field : !pp, !p
+      cir.end_catch %catch : !cir.catch_token
+      cir.yield
+    }
+    cir.return
+  }
+
+  // Unknown contents joined with a known slot stay a may-alias even after a
+  // call synchronizes pointer summaries. Writing through the field cannot
+  // definitely initialize target, because the opaque pointer may be elsewhere.
+  cir.func @unknown_alias_survives_call(%choose : !cir.bool) {
+    %target = cir.alloca "target" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %target : !p, !pp
+    %live = cir.alloca "live" align(4) : !p
+    %pair = cir.alloca "indirect" align(8) : !indirectp
+    %result = cir.call @make_indirect() : () -> !indirect
+    cir.store %result, %pair : !indirect, !indirectp
+    %field = cir.get_member %pair[0] {name = "slot"} : !indirectp -> !cir.ptr<!pp>
+    cir.if %choose {
+      cir.store %target, %field : !pp, !cir.ptr<!pp>
+      cir.yield
+    }
+    cir.call @effect() nothrow : () -> ()
+    %slot = cir.load %field : !cir.ptr<!pp>, !pp
+    cir.store %live, %slot : !p, !pp
+    // expected-warning @below {{use of invalid pointer 'target'}}
+    %read = cir.load deref %target : !pp, !p
+    cir.return
+  }
+}

@@ -229,6 +229,57 @@ def CIR_RecordLayoutAttr : CIR_Attr<"RecordLayout", "record_layout", [
 // Lifetime metadata
 //===----------------------------------------------------------------------===//
 
+def CIR_LifetimeLibraryKind : CIR_I32Enum<
+    "LifetimeLibraryKind", "standard-library object semantics", [
+  I32EnumCase<"None", 0, "none">,
+  I32EnumCase<"UniquePointer", 1, "unique_ptr">,
+  I32EnumCase<"SharedPointer", 2, "shared_ptr">,
+  I32EnumCase<"WeakPointer", 3, "weak_ptr">,
+  I32EnumCase<"Optional", 4, "optional">,
+  I32EnumCase<"Any", 5, "any">,
+  I32EnumCase<"Container", 6, "container">,
+  I32EnumCase<"Tuple", 7, "tuple">
+]>;
+
+def CIR_LifetimeLibraryKindParameter : EnumParameter<CIR_LifetimeLibraryKind> {
+  let defaultValue = "::cir::LifetimeLibraryKind::None";
+}
+
+def CIR_LifetimeLibraryFunction : CIR_I32Enum<
+    "LifetimeLibraryFunction", "standard-library lifetime operation", [
+  I32EnumCase<"None", 0, "none">,
+  I32EnumCase<"Construct", 1, "construct">,
+  I32EnumCase<"Assign", 2, "assign">,
+  I32EnumCase<"Reset", 3, "reset">,
+  I32EnumCase<"Get", 4, "get">,
+  I32EnumCase<"Release", 5, "release">,
+  I32EnumCase<"Bool", 6, "bool">,
+  I32EnumCase<"Dereference", 7, "dereference">,
+  I32EnumCase<"HasValue", 8, "has_value">,
+  I32EnumCase<"Clear", 9, "clear">,
+  I32EnumCase<"Empty", 10, "empty">,
+  I32EnumCase<"Size", 11, "size">,
+  I32EnumCase<"Data", 12, "data">,
+  I32EnumCase<"Access", 13, "access">,
+  I32EnumCase<"Tie", 14, "tie">,
+  I32EnumCase<"TupleAssign", 15, "tuple_assign">,
+  I32EnumCase<"TryEmplace", 16, "try_emplace">,
+  I32EnumCase<"Expired", 17, "expired">,
+  I32EnumCase<"Lock", 18, "lock">,
+  I32EnumCase<"Destroy", 19, "destroy">,
+  I32EnumCase<"Disengage", 20, "disengage">,
+  I32EnumCase<"TryEmplaceHint", 21, "try_emplace_hint">,
+  I32EnumCase<"SharedAliasConstruct", 22, "shared_alias_construct">,
+  I32EnumCase<"MapSubscript", 23, "map_subscript">,
+  I32EnumCase<"MakeTuple", 24, "make_tuple">,
+  I32EnumCase<"TupleGet", 25, "tuple_get">
+]>;
+
+def CIR_LifetimeLibraryFunctionParameter
+    : EnumParameter<CIR_LifetimeLibraryFunction> {
+  let defaultValue = "::cir::LifetimeLibraryFunction::None";
+}
+
 def CIR_LifetimeRecordAttr : CIR_Attr<"LifetimeRecord", "lifetime_record"> {
   let summary = "Record properties used by lifetime analysis";
   let description = [{
@@ -249,6 +300,17 @@ def CIR_LifetimeRecordAttr : CIR_Attr<"LifetimeRecord", "lifetime_record"> {
 
     These facts are independent of ABI layout and survive textual CIR
     round-trips without retaining a Clang AST declaration.
+
+    `library_kind` identifies a canonical standard-library declaration whose
+    contracts are modeled by the lifetime pass. It is emitted only when
+    lifetime preservation is enabled. In particular, optional engagement and
+    smart-pointer nullness are different domains.
+
+    `tuple_element_kinds` preserves the logical element order of a canonical
+    std::tuple specialization, independently of its implementation's fields.
+    The values use LifetimeParameterKind: value, lvalue reference, or rvalue
+    reference. Absence means that logical element information is unavailable;
+    an empty array describes a known empty tuple.
   }];
 
   let parameters = (ins
@@ -256,10 +318,13 @@ def CIR_LifetimeRecordAttr : CIR_Attr<"LifetimeRecord", "lifetime_record"> {
     "bool":$pointer,
     "bool":$lambda,
     "bool":$promise_type,
-    DefaultValuedParameter<"bool", "false">:$smart_pointer
+    DefaultValuedParameter<"bool", "false">:$smart_pointer,
+    CIR_LifetimeLibraryKindParameter:$library_kind,
+    OptionalParameter<"mlir::DenseI32ArrayAttr">:$tuple_element_kinds
   );
   let assemblyFormat = [{
-    `<` struct($owner, $pointer, $lambda, $promise_type, $smart_pointer) `>`
+    `<` struct($owner, $pointer, $lambda, $promise_type, $smart_pointer,
+               $library_kind, $tuple_element_kinds) `>`
   }];
   let genVerifyDecl = 1;
   let canHaveIllegalCXXABIType = 0;
@@ -300,6 +365,45 @@ def CIR_LifetimeFunctionAttr : CIR_Attr<"LifetimeFunction", "lifetime_function">
 
     All fields are serializable semantic facts; analysis does not require a
     live Clang AST to interpret them.
+
+    `reinitializes` preserves the generic clang::reinitializes contract on a
+    non-static method. It promises reinitialization on normal return, not
+    nonnull contents. `returns_nonnull` describes the pointer result on normal
+    return. `library_function` describes a recognized standard-library
+    overload, not an arbitrary function with the same name. These additional
+    contracts are emitted only with lifetime preservation enabled.
+
+    `tuple_get` identifies a verified std::get overload on std::pair or
+    std::tuple. Its reference parameter is read without consuming the whole
+    object, even when the parameter is an rvalue reference. It does not
+    describe the returned element's storage identity or layout.
+
+    `guaranteed_move_params` lists source parameter indices for recognized
+    standard transfers performed on successful insertion by `try_emplace`.
+    Currently these are non-const rvalue references of the exact canonical
+    key or mapped type, where that type is a standard smart pointer with a
+    guaranteed empty moved-from state. A mapped transfer additionally requires
+    exactly one construction argument. Other constructors may inspect an
+    rvalue reference without consuming it; absent or empty metadata gives no
+    guarantee about them. Indices refer to `parameter_kinds`, not CIR operands.
+
+    `shared_alias_construct` describes the two-argument shared_ptr aliasing
+    constructor: source parameter 0 is the owner and parameter 1 is the stored
+    pointer. `map_subscript` denotes an insertion-capable map subscript, which
+    does not require a nonempty container.
+
+    `tuple_element_params` maps logical tuple elements to source parameter
+    indices for a recognized constructor or `make_tuple` call. It is emitted
+    only for matching canonical element types and expanded parameter arity;
+    allocator/tag and converting forms may have no mapping. Value elements
+    snapshot their input, whereas reference elements retain their referent.
+    The map never describes implementation fields. Copy/move constructors
+    retain their special-member semantics and need no element parameter map.
+
+    `insertion_result_index` maps the logical boolean second member returned
+    by non-hint `try_emplace` to its physical CIR record member. Base subobjects
+    and padding may also occupy record members. The index is required for
+    `try_emplace` and is -1 for other contracts.
   }];
 
   let parameters = (ins
@@ -310,12 +414,20 @@ def CIR_LifetimeFunctionAttr : CIR_Attr<"LifetimeFunction", "lifetime_function">
     DefaultValuedParameter<"bool", "false">:$has_implicit_object,
     StringRefParameter<"source method name", "\"\"">:$method_name,
     OptionalParameter<"mlir::DenseI32ArrayAttr">:$parameter_kinds,
-    OptionalParameter<"mlir::DenseI32ArrayAttr">:$parameter_indices
+    OptionalParameter<"mlir::DenseI32ArrayAttr">:$parameter_indices,
+    DefaultValuedParameter<"bool", "false">:$reinitializes,
+    DefaultValuedParameter<"bool", "false">:$returns_nonnull,
+    CIR_LifetimeLibraryFunctionParameter:$library_function,
+    OptionalParameter<"mlir::DenseI32ArrayAttr">:$guaranteed_move_params,
+    OptionalParameter<"mlir::DenseI32ArrayAttr">:$tuple_element_params,
+    DefaultValuedParameter<"int32_t", "-1">:$insertion_result_index
   );
   let assemblyFormat = [{
     `<` struct($is_method, $is_static, $is_const, $is_overloaded_operator,
                $has_implicit_object, $method_name, $parameter_kinds,
-               $parameter_indices) `>`
+               $parameter_indices, $reinitializes, $returns_nonnull,
+               $library_function, $guaranteed_move_params,
+               $tuple_element_params, $insertion_result_index) `>`
   }];
   let extraClassDeclaration = [{
     bool hasParameterInfo() const {
@@ -332,6 +444,13 @@ def CIR_LifetimeFunctionAttr : CIR_Attr<"LifetimeFunction", "lifetime_function">
     unsigned getParamOperandIndex(unsigned index) const {
       assert(index < getNumParams() && "source parameter index out of range");
       return static_cast<unsigned>(getParameterIndices()[index]);
+    }
+    bool isParamGuaranteedMove(unsigned index) const {
+      if (auto params = getGuaranteedMoveParams())
+        for (int32_t parameter : params.asArrayRef())
+          if (static_cast<unsigned>(parameter) == index)
+            return true;
+      return false;
     }
   }];
   let genVerifyDecl = 1;

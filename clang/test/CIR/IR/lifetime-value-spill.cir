@@ -1,0 +1,13 @@
+// RUN: cir-opt %s --verify-roundtrip | FileCheck %s
+// RUN: cir-opt %s --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --verify-roundtrip | FileCheck %s
+
+!s32i = !cir.int<s, 32>
+
+module {
+  cir.func @spill() {
+    // CHECK: cir.alloca "tmp" align(4) lifetime_value_spill
+    %tmp = cir.alloca "tmp" align(4) lifetime_value_spill : !cir.ptr<!s32i>
+    cir.return
+  }
+}

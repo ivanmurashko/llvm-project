@@ -17,11 +17,14 @@ The pass runs after CIR canonicalization and before simplification, library
 optimizations, ABI conversion, or control-flow lowering. It does not change the
 program. Record and function semantics are serialized in CIR attributes, so the
 analysis can also run through `cir-opt --cir-lifetime-check` on structured CIR
-without a live Clang AST. Generate such input with both
+without a live Clang AST. It follows emitted CIR operations and structured
+regions; it does not construct or analyze an AST control-flow graph. Generate
+such input with both
 `-fclangir-lifetime-check -clangir-disable-passes`: the first option preserves
 full-expression temporary scopes, while the second leaves the pass unrun. These
 source lifetime boundaries are needed for temporary-dependent diagnostics,
-including coroutine arguments. Ordinary compilation keeps its existing scopes.
+including coroutine arguments. These additional full-expression scopes are
+generated only when lifetime analysis is enabled.
 
 ## Options
 
@@ -37,11 +40,14 @@ uses the existing ClangIR diagnostic group.
 
 ## Coverage and limitations
 
-The move checks track arguments passed to rvalue-reference parameters, scalar
-initialization from moved values, and move construction and assignment of
-supported owner and pointer types. Function metadata maps source parameters to
-CIR operands, including the implicit object argument of an instance method.
-The checker skips argument-based move tracking when that mapping is unavailable.
+The move checks track local scalar, pointer, owner, and whole class objects,
+including reference parameters and local aliases. Assignments and supported
+library replacements restore the destination after evaluating source uses.
+Uncertain aliases retain all possible targets; writing through one does not
+prove that every possible target was reinitialized.
+By-value pointer-like record parameters arrive initialized. Their trivial
+copies retain tracked borrow lifetimes and invalidation history; copying a
+moved whole object also checks the source use.
 
 For example, with history notes enabled:
 
@@ -54,28 +60,98 @@ int example() {
 }
 ```
 
-For recognized `std::unique_ptr` and `std::shared_ptr` owners, dereferencing a
-moved-from object is diagnosed. Calls to `get`, `release`, `reset`, and
-`operator bool` are treated as safe observations or operations. Calling
-`reset(new T)` does not yet restore the tracked state for later dereferences.
+This scalar example illustrates the checker's policy for an opaque call accepting
+an rvalue reference. The reference binding itself does not change the integer.
+A standalone rvalue cast or local reference binding does not consume a value in
+the analysis. Repeated moves retain the existing diagnostic policy; a warning
+is not, by itself, proof of undefined behavior.
 
-This reviewed move model has known precision limits. A plain scalar copy into
-another local can incorrectly mark the source as moved-from, and assignment
-does not fully model reinitialization. Temporary suppression uses the existing
-`ref.tmp` naming convention and applies only to the reviewed move paths.
+Standard-library contracts distinguish initialized objects from usable contents.
+For example, `unique_ptr::reset(new T)` restores usable contents, whereas
+`reset()` leaves an initialized, empty pointer whose dereference is invalid.
+Safe observers remain valid after moves and resets. Optional engagement is a
+separate property from pointer nullness. The check also models supported weak
+pointer, optional, any, container, tuple-reference assignment, and conditional
+insertion operations. A generic `[[clang::reinitializes]]` contract applies on
+normal return; an arbitrary mutable-reference call does not prove restoration.
+The assignment policy also treats successful non-const value assignment
+overloads as reinitialization, including converting assignments. Compound and
+const assignment operators do not restore state, and a throwing assignment
+does not restore the receiver on its exceptional continuation. GSL pointer
+categories retain their separate points-to rules.
+These contracts use serialized declaration facts, not library implementation
+bodies or clang-tidy-specific annotations.
+The insertion-result contract maps the logical `pair::second` to its actual CIR
+member, so implementation bases and padding do not change predicate tracking.
+Verified `std::get` overloads for `std::pair` and `std::tuple` return element
+references without consuming the containing object. Existing invalid-source
+checks still apply. This contract does not provide precise element aliasing or
+memberwise move analysis. For modeled library calls, unavailable reference
+contents remain unknown; the argument's address is not treated as its contents.
+Passing a pointer by value does not itself read the pointed-to record. A
+reference observer still checks that record's moved-from state.
 
-The analysis tracks local pointer and owner state through supported structured
-scopes, branches, switches, and a bounded loop approximation. It recognizes
-explicit and Clang-inferred lifetime attributes. Aggregate support is limited
-to selected pointer fields; it is not general recursive field analysis. Passing
-an aggregate with a null pointer field to an implicit assignment can produce
-a conservative false positive even when that field is only copied.
+Path state captures pointer values when they are evaluated, so later writes to
+an alias do not change an earlier value snapshot. Structured conditionals, loop
+fixed points, and normal, return, break, continue, and exceptional continuations
+use that state. Direct local captures preserve their copy, alias, or transfer
+behavior. General memberwise move analysis and escaping callbacks remain outside
+this model. Selected aggregate pointer-field lifetime rules are retained and
+can produce conservative diagnostics for compound operations. Custom tuple-like
+accessors and opaque container calls do not acquire standard-library contracts
+merely because they participate in structured bindings or accept an rvalue.
 
-Cleanup scopes include their body and applicable normal cleanup. Exception-only
-cleanup is not treated as normal execution. General exception-flow analysis and
-conditional-expression regions are not modeled. Other limitations include
-indirect/interprocedural effects, arbitrary lambda escapes, and moves or lifetime
-effects through complex aliases and nested members.
+Range-for loop-variable and body-local storage has a separate lifetime for each
+iteration. Its cleanup precedes the increment and runs on exits such as continue,
+break, return, and exceptions. The range and begin/end objects remain in the
+enclosing loop scope. Borrows of iteration-local objects become invalid when
+that iteration ends.
+
+The analysis follows the order chosen by CIR generation. It does not enumerate
+other evaluation orders permitted by C++. For example:
+
+```cpp
+void consume(int, std::unique_ptr<int>);
+void example(std::unique_ptr<int> p) {
+  consume(*p, std::move(p));
+}
+```
+
+Assuming `p` initially owns an integer, evaluating `*p` before moving `p` into the
+second parameter is safe. Evaluating the second parameter first leaves `p`
+empty before the dereference. The checker can miss this invalid use if CIR
+emits the first ordering. It does not provide a general diagnosis of unsequenced
+expressions or promise to cover every real issue detected by
+`bugprone-use-after-move`.
+
+Explicit sequencing, short-circuit regions and supported cleanup scopes are
+analyzed in CIR. Serialized lifetime facts and compiler-generated value-spill
+markers preserve the needed object and value information through
+canonicalization and text/bytecode round trips. There is no source-order
+scheduler or associated exploration budget.
+
+Branch joins retain possible invalid states but can lose the relation between a
+condition and another object's state. This can produce a false positive when
+the invalid state cannot reach the reported use. The analysis does not provide
+general path-feasibility proofs. A nonempty observation of a standard smart
+pointer excludes its empty moved-from alternative. It does not restore other
+invalid storage, optional engagement, or arbitrary record state. Conditional
+transfers through unmodeled custom containers and relational loop invariants
+can still produce false positives.
+
+Native CIR loops use the loop analysis described above. Jumps into nested
+structured regions remain unsupported. Array constructor and destructor
+regions are not generally modeled; some forms can pass without analyzing their
+elements. General memberwise moves in compound classes, array-element move
+propagation, and escaping lambdas or callbacks are deferred. The supported
+returned-lambda and direct local-capture checks do not establish safety for
+arbitrary uses after captured locals leave scope. A successful translation unit
+therefore does not establish coverage of every operation.
+
+Function metadata maps source parameters to CIR operands, including implicit
+object and hidden arguments. Argument move tracking is unavailable where CIRGen
+cannot prove that mapping. Arbitrary interprocedural effects and general
+recursive field analysis are not provided.
 
 CIR generation itself remains incomplete for some C++ constructs. A generation,
 verification, or pass error is an analysis failure, not evidence that the input

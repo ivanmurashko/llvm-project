@@ -1,0 +1,159 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+
+module {
+  // An empty group does not add a default. The unmatched input must retain p's
+  // incoming null state even though every matching input initializes it.
+  cir.func @group_without_default(%selector: !i) {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %p : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(equal, [#cir.int<0> : !i]) { cir.yield }
+      cir.case(equal, [#cir.int<1> : !i]) { cir.yield }
+      cir.case(equal, [#cir.int<2> : !i]) {
+        cir.store %x, %p : !p, !pp
+        cir.break
+      }
+      cir.yield
+    }
+    %address = cir.load %p : !pp, !p
+    // expected-warning @below {{use of invalid pointer 'p'}}
+    %use = cir.load %address : !p, !i
+    cir.return
+  }
+
+  // Default remains exhaustive when it is an empty entry in the middle of a
+  // group. Every selector reaches the store, so no null path survives.
+  cir.func @default_in_empty_group(%selector: !i) {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %p : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(equal, [#cir.int<0> : !i]) { cir.yield }
+      cir.case(default, []) { cir.yield }
+      cir.case(equal, [#cir.int<1> : !i]) { cir.yield }
+      cir.case(equal, [#cir.int<2> : !i]) {
+        cir.store %x, %p : !p, !pp
+        cir.break
+      }
+      cir.yield
+    }
+    %address = cir.load %p : !pp, !p
+    %use = cir.load %address : !p, !i
+    cir.return
+  }
+
+  cir.func @default_starts_empty_group(%selector: !i) {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %p : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(default, []) { cir.yield }
+      cir.case(equal, [#cir.int<0> : !i]) { cir.yield }
+      cir.case(equal, [#cir.int<1> : !i]) {
+        cir.store %x, %p : !p, !pp
+        cir.break
+      }
+      cir.yield
+    }
+    %address = cir.load %p : !pp, !p
+    %use = cir.load %address : !p, !i
+    cir.return
+  }
+
+  // A final empty default is itself a reachable identity path. Skipping every
+  // empty entry would incorrectly leave only the valid-pointer case.
+  cir.func @terminal_empty_default(%selector: !i) {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %p : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(equal, [#cir.int<0> : !i]) {
+        cir.store %x, %p : !p, !pp
+        cir.break
+      }
+      cir.case(equal, [#cir.int<1> : !i]) { cir.yield }
+      cir.case(default, []) { cir.yield }
+      cir.yield
+    }
+    %address = cir.load %p : !pp, !p
+    // expected-warning @below {{use of invalid pointer 'p'}}
+    %use = cir.load %address : !p, !i
+    cir.return
+  }
+
+  // The only case can be empty. Its exit must still reach the following use.
+  cir.func @all_empty(%selector: !i) {
+    %p = cir.alloca "p" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %p : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(default, []) { cir.yield }
+      cir.yield
+    }
+    %address = cir.load %p : !pp, !p
+    // expected-warning @below {{use of invalid pointer 'p'}}
+    %use = cir.load %address : !p, !i
+    cir.return
+  }
+
+  // A nonempty predecessor changes p before crossing the empty group. Its
+  // invalid state must reach the shared use alongside valid direct entries.
+  cir.func @nonempty_fallthrough(%selector: !i) {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    cir.store %x, %p : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(equal, [#cir.int<0> : !i]) {
+        // expected-note @below {{'nullptr' invalidated here}}
+        %null = cir.const #cir.ptr<null> : !p
+        cir.store %null, %p : !p, !pp
+        cir.yield
+      }
+      cir.case(equal, [#cir.int<1> : !i]) { cir.yield }
+      cir.case(equal, [#cir.int<2> : !i]) { cir.yield }
+      cir.case(equal, [#cir.int<3> : !i]) {
+        %address = cir.load %p : !pp, !p
+        // expected-warning @below {{use of invalid pointer 'p'}}
+        %use = cir.load %address : !p, !i
+        cir.break
+      }
+      cir.case(default, []) { cir.break }
+      cir.yield
+    }
+    cir.return
+  }
+
+  // A break-only entry is not an identity fallthrough entry. Its invalid exit
+  // remains possible even when a following case repairs p.
+  cir.func @break_is_not_fallthrough(%selector: !i) {
+    %x = cir.alloca "x" align(4) : !p
+    %p = cir.alloca "p" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %p : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(equal, [#cir.int<0> : !i]) { cir.break }
+      cir.case(default, []) {
+        cir.store %x, %p : !p, !pp
+        cir.break
+      }
+      cir.yield
+    }
+    %address = cir.load %p : !pp, !p
+    // expected-warning @below {{use of invalid pointer 'p'}}
+    %use = cir.load %address : !p, !i
+    cir.return
+  }
+}

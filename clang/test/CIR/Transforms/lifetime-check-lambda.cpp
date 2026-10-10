@@ -33,3 +33,24 @@ auto g3(int val) {
   };
   return outer();
 }
+
+// Fixed-point analysis may visit the same return more than once.
+auto loop_return_by_reference(bool condition) {
+  int value = 0; // expected-note {{declared here but invalid after enclosing function ends}}
+  auto callback = [&] { return value; };
+again:
+  ++value;
+  if (condition)
+    goto again;
+  return callback; // expected-warning {{returned lambda captures local variable}}
+}
+
+auto loop_return_by_value(bool condition) {
+  int value = 0;
+  auto callback = [value] { return value; };
+again:
+  ++value;
+  if (condition)
+    goto again;
+  return callback;
+}

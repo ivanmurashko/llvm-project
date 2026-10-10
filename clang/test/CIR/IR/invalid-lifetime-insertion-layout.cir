@@ -1,0 +1,32 @@
+// RUN: cir-opt %s -verify-diagnostics -split-input-file
+
+// expected-error @below {{try_emplace requires an insertion result member index}}
+module attributes {facts = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [2], parameter_indices = [1], library_function = try_emplace>} {}
+
+// -----
+
+// expected-error @below {{try_emplace requires an insertion result member index}}
+module attributes {facts = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [2], parameter_indices = [1], library_function = try_emplace, insertion_result_index = -2>} {}
+
+// -----
+
+// expected-error @below {{an insertion result member index requires a try_emplace contract}}
+module attributes {facts = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, insertion_result_index = 0>} {}
+
+// -----
+
+!Map = !cir.struct<"Map" {data !cir.int<s, 32>}>
+!Pair = !cir.struct<"Pair" {data !cir.int<s, 32>, data !cir.bool}>
+module attributes {cir.lifetime_records = {Map = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, library_kind = container>}} {
+  // expected-error @below {{an insertion result member index must name a boolean record member}}
+  cir.func private @bad_index(!cir.ptr<!Map>) -> !Pair attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [], parameter_indices = [], library_function = try_emplace, insertion_result_index = 2>}
+}
+
+// -----
+
+!Map = !cir.struct<"Map" {data !cir.int<s, 32>}>
+!Pair = !cir.struct<"Pair" {data !cir.int<s, 32>, data !cir.bool}>
+module attributes {cir.lifetime_records = {Map = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = false, library_kind = container>}} {
+  // expected-error @below {{an insertion result member index must name a boolean record member}}
+  cir.func private @wrong_type(!cir.ptr<!Map>) -> !Pair attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [], parameter_indices = [], library_function = try_emplace, insertion_result_index = 0>}
+}

@@ -1,0 +1,63 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %s --cir-canonicalize --cir-lifetime-check="history=all" --verify-diagnostics --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+// Analyze the operation order recorded in CIR. An evaluated pointer is a
+// snapshot: overwriting its source slot cannot change that earlier value.
+// Passing the result to an external sink keeps each dereference observable.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module {
+  cir.func private @sink(!i)
+  cir.func @load_before_overwrite() {
+    %value = cir.alloca "value" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    cir.store %value, %pointer : !p, !pp
+    %snapshot = cir.load %pointer : !pp, !p
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    %use = cir.load %snapshot : !p, !i
+    cir.call @sink(%use) : (!i) -> ()
+    cir.return
+  }
+
+  cir.func @overwrite_before_load() {
+    %value = cir.alloca "value" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    cir.store %value, %pointer : !p, !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    %snapshot = cir.load %pointer : !pp, !p
+    // expected-warning @below {{use of invalid pointer}}
+    %use = cir.load %snapshot : !p, !i
+    cir.call @sink(%use) : (!i) -> ()
+    cir.return
+  }
+
+  // A later reset makes later uses valid; it must not erase the diagnostic or
+  // origin already recorded for the preceding invalid dereference.
+  cir.func @diagnostic_survives_reset() {
+    %value = cir.alloca "value" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    %before = cir.load %pointer : !pp, !p
+    // expected-warning @below {{use of invalid pointer}}
+    %invalid = cir.load %before : !p, !i
+    cir.call @sink(%invalid) : (!i) -> ()
+    cir.store %value, %pointer : !p, !pp
+    %after = cir.load %pointer : !pp, !p
+    %valid = cir.load %after : !p, !i
+    cir.call @sink(%valid) : (!i) -> ()
+    cir.return
+  }
+}

@@ -1,0 +1,88 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %s --cir-canonicalize --cir-lifetime-check="history=all" --verify-diagnostics --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+// Follow native CIR block edges and structured loops. These cases do not
+// imply general modeling of array constructor/destructor element regions.
+// External calls keep both invalid and valid dereferences live through folding.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module {
+  cir.func private @sink(!i)
+  cir.func @multiple_blocks_invalid() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    cir.scope {
+      cir.br ^next
+    ^next:
+      %address = cir.load %pointer : !pp, !p
+      // expected-warning @below {{use of invalid pointer}}
+      %use = cir.load %address : !p, !i
+      cir.call @sink(%use) : (!i) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+
+  cir.func @multiple_blocks_reset() {
+    %value = cir.alloca "value" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    cir.scope {
+      cir.store %value, %pointer : !p, !pp
+      cir.br ^next
+    ^next:
+      %address = cir.load %pointer : !pp, !p
+      %use = cir.load %address : !p, !i
+      cir.call @sink(%use) : (!i) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+
+  cir.func @loop_invalid_first_iteration(%condition: !cir.bool) {
+    %value = cir.alloca "value" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    // expected-note @below {{'nullptr' invalidated here}}
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    cir.while {
+      cir.condition(%condition)
+    } do {
+      %address = cir.load %pointer : !pp, !p
+      // expected-warning @below {{use of invalid pointer}}
+      %use = cir.load %address : !p, !i
+      cir.call @sink(%use) : (!i) -> ()
+      cir.store %value, %pointer : !p, !pp
+      cir.yield
+    }
+    cir.return
+  }
+
+  cir.func @loop_reset_before_use(%condition: !cir.bool) {
+    %value = cir.alloca "value" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    cir.while {
+      cir.condition(%condition)
+    } do {
+      cir.store %value, %pointer : !p, !pp
+      %address = cir.load %pointer : !pp, !p
+      %use = cir.load %address : !p, !i
+      cir.call @sink(%use) : (!i) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+}
