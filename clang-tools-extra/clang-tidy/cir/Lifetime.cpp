@@ -29,6 +29,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/ThreadPool.h"
 #include <optional>
 
 using namespace clang::ast_matchers;
@@ -180,10 +181,10 @@ static bool isUnusedMainFileRoot(const FunctionDecl *Definition,
          !Definition->hasAttr<OpenACCRoutineDeclAttr>();
 }
 
-static void collectUnusedMainFileRoots(
-    DeclContext *Context, const SourceManager &SourceMgr,
-    llvm::SmallPtrSetImpl<const FunctionDecl *> &Seen,
-    llvm::SmallVectorImpl<FunctionDecl *> &Roots) {
+static void
+collectUnusedMainFileRoots(DeclContext *Context, const SourceManager &SourceMgr,
+                           llvm::SmallPtrSetImpl<const FunctionDecl *> &Seen,
+                           llvm::SmallVectorImpl<FunctionDecl *> &Roots) {
   auto AddFunction = [&](FunctionDecl *Function) {
     FunctionDecl *Definition = Function->getDefinition();
     if (isUnusedMainFileRoot(Definition, SourceMgr) &&
@@ -216,6 +217,7 @@ Lifetime::Lifetime(StringRef Name, ClangTidyContext *Context)
       HistoryList(
           utils::options::parseStringList(Options.get("HistoryList", "all"))),
       HistLimit(Options.get("HistLimit", 1U)),
+      NumThreads(Options.get("NumThreads", 0U)),
       AnalyzeUnusedMainFileFunctions(
           Options.get("AnalyzeUnusedMainFileFunctions", false)) {}
 
@@ -225,6 +227,7 @@ void Lifetime::storeOptions(ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "HistoryList",
                 utils::options::serializeStringList(HistoryList));
   Options.store(Opts, "HistLimit", HistLimit);
+  Options.store(Opts, "NumThreads", NumThreads);
   Options.store(Opts, "AnalyzeUnusedMainFileFunctions",
                 AnalyzeUnusedMainFileFunctions);
 }
@@ -241,11 +244,21 @@ void Lifetime::check(const MatchFinder::MatchResult &Result) {
   SourceManager &SourceMgr = AST.getSourceManager();
   ScopedCIRGenDiagnosticConsumer CodeGenDiags(
       AST.getDiagnostics(), TidyContext.getDiagnosticsEngine());
+  // The supplied pool must outlive Generator's MLIRContext.
+  std::optional<llvm::DefaultThreadPool> Pool;
   ::cir::CIRGenerator Generator(
       AST.getDiagnostics(),
       SourceMgr.getFileManager().getVirtualFileSystemPtr(), CodeGenOpts,
       /*preserveLifetimeScopes=*/true);
   Generator.Initialize(AST);
+  auto &Context = Generator.getMLIRContext();
+  if (NumThreads == 1) {
+    Context.disableMultithreading();
+  } else if (NumThreads > 1) {
+    Context.disableMultithreading();
+    Pool.emplace(llvm::hardware_concurrency(NumThreads));
+    Context.setThreadPool(*Pool);
+  }
   if (AST.getDiagnostics().hasErrorOccurred())
     return;
   // User-facing diagnostics should not serialize entire CIR operations.

@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-// Included after LifetimeCheckPass's object and path-state helpers. Library
+// Included after LifetimeCheckAnalysis's object and path-state helpers. Library
 // contracts operate on those same states; they do not maintain another alias
 // analysis or recover source declarations from symbol spellings.
 //===----------------------------------------------------------------------===//
@@ -15,8 +15,8 @@
 // additional precondition. Queue the precondition witness without changing
 // the initialized object's state or inventing a move event.
 static void checkLibraryContents(
-    LifetimeCheckPass &pass, LifetimeCheckPass::PathState &state,
-    const LifetimeCheckPass::ObjectTargets &targets, Location location) {
+    LifetimeCheckAnalysis &pass, LifetimeCheckAnalysis::PathState &state,
+    const LifetimeCheckAnalysis::ObjectTargets &targets, Location location) {
   auto occupancy = pass.getOccupancy(state, targets);
   if (!occupancy.mayBeEmpty) {
     pass.checkUse(state, targets, location);
@@ -28,12 +28,12 @@ static void checkLibraryContents(
     // Existing move/null provenance already explains an invalid contents
     // access. Do not invent a second empty-state cause for the same event.
     if (diagnosticState.pmap[object].count(
-            LifetimeCheckPass::State::getInvalid()) ||
+            LifetimeCheckAnalysis::State::getInvalid()) ||
         diagnosticState.pmap[object].count(
-            LifetimeCheckPass::State::getNullPtr()))
+            LifetimeCheckAnalysis::State::getNullPtr()))
       continue;
     diagnosticState.pmap[object].insert(
-        LifetimeCheckPass::State::getNullPtr());
+        LifetimeCheckAnalysis::State::getNullPtr());
     if (!occupancy.emptyOrigins.empty())
       diagnosticState.nullHist[object] = occupancy.emptyOrigins.front();
   }
@@ -43,8 +43,8 @@ static void checkLibraryContents(
                            diagnosticState.diagnostics.end());
 }
 
-std::optional<LifetimeCheckPass::FlowResult>
-LifetimeCheckPass::modelLibraryCall(const CallInfo &call,
+std::optional<LifetimeCheckAnalysis::FlowResult>
+LifetimeCheckAnalysis::modelLibraryCall(const CallInfo &call,
                                         PathState &state) {
   using Kind = LifetimeLibraryKind;
   using Effect = LifetimeLibraryFunction;

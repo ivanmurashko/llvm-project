@@ -10,6 +10,7 @@ add_distinct_clang_unittest(CIRUnitTests
   FenvOpTest.cpp
   GetFloatingPointTypeTest.cpp
   IntTypeABIAlignTest.cpp
+  LifetimeCheckTest.cpp
   PointerLikeTest.cpp
   RecordMemberKindTest.cpp
   RecordTypeMetadataTest.cpp
@@ -22,8 +23,10 @@ add_distinct_clang_unittest(CIRUnitTests
   clangBasic
   clangCIRFrontendAction
   MLIRCIR
+  MLIRCIRTransforms
   CIROpenACCSupport
   MLIRIR
   MLIROpenACCDialect
   MLIRParser
+  MLIRPass
   )
