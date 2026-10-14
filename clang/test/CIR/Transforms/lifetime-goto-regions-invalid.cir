@@ -1,0 +1,326 @@
+// RUN: split-file %s %t
+//
+// The ten analysis-negative inputs first parse and verify as ordinary CIR.
+// Missing targets separately exercise their preexisting native-verifier error. Use text/bytecode without canonicalization,
+// which could intentionally erase unreachable invalid constructs.
+// ERROR: error: unsupported {{(control flow|CFG terminator)}} in lifetime analysis
+//
+// Duplicate/argument/indirect/inward/sibling controls have no switch. The
+// first three expose missing validation; inward/sibling already fail after
+// analysis and remain rejected. Symbol checks must not depend on hasSwitch.
+// Duplicate and argument-taking labels are deliberately unreferenced.
+// A sibling if region shares its parent operation with the source region; that
+// does not make it an ancestor. The nonlinear shell guards isSimpleForm's
+// first-block-only check. Existing lifetime-parallel-failure.cir separately
+// preserves function-local successor failure and other functions' diagnostics.
+
+// Missing targets are already rejected by FuncOp verification. This is a
+// native-verifier compatibility control, not a new lifetime-validation RED.
+// MISSING: error: 'cir.func' op goto/label mismatch
+// RUN: not cir-opt %t/missing.cir -o /dev/null 2>&1 | FileCheck %s --check-prefix=MISSING
+
+// duplicate
+// RUN: cir-opt %t/duplicate.cir --mlir-print-debuginfo -o %t/duplicate.text.cir
+// RUN: cir-opt %t/duplicate.cir --emit-bytecode -o %t/duplicate.bc
+// RUN: not cir-opt %t/duplicate.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/duplicate.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/duplicate.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/duplicate.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/duplicate.parallel
+// RUN: diff %t/duplicate.serial %t/duplicate.parallel
+// RUN: not cir-opt %t/duplicate.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/duplicate.text.serial
+// RUN: diff %t/duplicate.serial %t/duplicate.text.serial
+// RUN: not cir-opt %t/duplicate.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/duplicate.text.parallel
+// RUN: diff %t/duplicate.serial %t/duplicate.text.parallel
+// RUN: not cir-opt %t/duplicate.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/duplicate.bytecode.serial
+// RUN: diff %t/duplicate.serial %t/duplicate.bytecode.serial
+// RUN: not cir-opt %t/duplicate.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/duplicate.bytecode.parallel
+// RUN: diff %t/duplicate.serial %t/duplicate.bytecode.parallel
+
+// label-argument
+// RUN: cir-opt %t/label-argument.cir --mlir-print-debuginfo -o %t/label-argument.text.cir
+// RUN: cir-opt %t/label-argument.cir --emit-bytecode -o %t/label-argument.bc
+// RUN: not cir-opt %t/label-argument.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/label-argument.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/label-argument.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/label-argument.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/label-argument.parallel
+// RUN: diff %t/label-argument.serial %t/label-argument.parallel
+// RUN: not cir-opt %t/label-argument.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/label-argument.text.serial
+// RUN: diff %t/label-argument.serial %t/label-argument.text.serial
+// RUN: not cir-opt %t/label-argument.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/label-argument.text.parallel
+// RUN: diff %t/label-argument.serial %t/label-argument.text.parallel
+// RUN: not cir-opt %t/label-argument.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/label-argument.bytecode.serial
+// RUN: diff %t/label-argument.serial %t/label-argument.bytecode.serial
+// RUN: not cir-opt %t/label-argument.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/label-argument.bytecode.parallel
+// RUN: diff %t/label-argument.serial %t/label-argument.bytecode.parallel
+
+// indirect
+// RUN: cir-opt %t/indirect.cir --mlir-print-debuginfo -o %t/indirect.text.cir
+// RUN: cir-opt %t/indirect.cir --emit-bytecode -o %t/indirect.bc
+// RUN: not cir-opt %t/indirect.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/indirect.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/indirect.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/indirect.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/indirect.parallel
+// RUN: diff %t/indirect.serial %t/indirect.parallel
+// RUN: not cir-opt %t/indirect.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/indirect.text.serial
+// RUN: diff %t/indirect.serial %t/indirect.text.serial
+// RUN: not cir-opt %t/indirect.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/indirect.text.parallel
+// RUN: diff %t/indirect.serial %t/indirect.text.parallel
+// RUN: not cir-opt %t/indirect.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/indirect.bytecode.serial
+// RUN: diff %t/indirect.serial %t/indirect.bytecode.serial
+// RUN: not cir-opt %t/indirect.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/indirect.bytecode.parallel
+// RUN: diff %t/indirect.serial %t/indirect.bytecode.parallel
+
+// inward-scope
+// RUN: cir-opt %t/inward-scope.cir --mlir-print-debuginfo -o %t/inward-scope.text.cir
+// RUN: cir-opt %t/inward-scope.cir --emit-bytecode -o %t/inward-scope.bc
+// RUN: not cir-opt %t/inward-scope.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/inward-scope.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/inward-scope.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/inward-scope.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/inward-scope.parallel
+// RUN: diff %t/inward-scope.serial %t/inward-scope.parallel
+// RUN: not cir-opt %t/inward-scope.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/inward-scope.text.serial
+// RUN: diff %t/inward-scope.serial %t/inward-scope.text.serial
+// RUN: not cir-opt %t/inward-scope.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/inward-scope.text.parallel
+// RUN: diff %t/inward-scope.serial %t/inward-scope.text.parallel
+// RUN: not cir-opt %t/inward-scope.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/inward-scope.bytecode.serial
+// RUN: diff %t/inward-scope.serial %t/inward-scope.bytecode.serial
+// RUN: not cir-opt %t/inward-scope.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/inward-scope.bytecode.parallel
+// RUN: diff %t/inward-scope.serial %t/inward-scope.bytecode.parallel
+
+// incoming-case
+// RUN: cir-opt %t/incoming-case.cir --mlir-print-debuginfo -o %t/incoming-case.text.cir
+// RUN: cir-opt %t/incoming-case.cir --emit-bytecode -o %t/incoming-case.bc
+// RUN: not cir-opt %t/incoming-case.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/incoming-case.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/incoming-case.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/incoming-case.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/incoming-case.parallel
+// RUN: diff %t/incoming-case.serial %t/incoming-case.parallel
+// RUN: not cir-opt %t/incoming-case.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/incoming-case.text.serial
+// RUN: diff %t/incoming-case.serial %t/incoming-case.text.serial
+// RUN: not cir-opt %t/incoming-case.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/incoming-case.text.parallel
+// RUN: diff %t/incoming-case.serial %t/incoming-case.text.parallel
+// RUN: not cir-opt %t/incoming-case.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/incoming-case.bytecode.serial
+// RUN: diff %t/incoming-case.serial %t/incoming-case.bytecode.serial
+// RUN: not cir-opt %t/incoming-case.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/incoming-case.bytecode.parallel
+// RUN: diff %t/incoming-case.serial %t/incoming-case.bytecode.parallel
+
+// cross-case
+// RUN: cir-opt %t/cross-case.cir --mlir-print-debuginfo -o %t/cross-case.text.cir
+// RUN: cir-opt %t/cross-case.cir --emit-bytecode -o %t/cross-case.bc
+// RUN: not cir-opt %t/cross-case.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/cross-case.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/cross-case.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/cross-case.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/cross-case.parallel
+// RUN: diff %t/cross-case.serial %t/cross-case.parallel
+// RUN: not cir-opt %t/cross-case.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/cross-case.text.serial
+// RUN: diff %t/cross-case.serial %t/cross-case.text.serial
+// RUN: not cir-opt %t/cross-case.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/cross-case.text.parallel
+// RUN: diff %t/cross-case.serial %t/cross-case.text.parallel
+// RUN: not cir-opt %t/cross-case.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/cross-case.bytecode.serial
+// RUN: diff %t/cross-case.serial %t/cross-case.bytecode.serial
+// RUN: not cir-opt %t/cross-case.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/cross-case.bytecode.parallel
+// RUN: diff %t/cross-case.serial %t/cross-case.bytecode.parallel
+
+// sibling-if
+// RUN: cir-opt %t/sibling-if.cir --mlir-print-debuginfo -o %t/sibling-if.text.cir
+// RUN: cir-opt %t/sibling-if.cir --emit-bytecode -o %t/sibling-if.bc
+// RUN: not cir-opt %t/sibling-if.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/sibling-if.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/sibling-if.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/sibling-if.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/sibling-if.parallel
+// RUN: diff %t/sibling-if.serial %t/sibling-if.parallel
+// RUN: not cir-opt %t/sibling-if.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/sibling-if.text.serial
+// RUN: diff %t/sibling-if.serial %t/sibling-if.text.serial
+// RUN: not cir-opt %t/sibling-if.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/sibling-if.text.parallel
+// RUN: diff %t/sibling-if.serial %t/sibling-if.text.parallel
+// RUN: not cir-opt %t/sibling-if.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/sibling-if.bytecode.serial
+// RUN: diff %t/sibling-if.serial %t/sibling-if.bytecode.serial
+// RUN: not cir-opt %t/sibling-if.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/sibling-if.bytecode.parallel
+// RUN: diff %t/sibling-if.serial %t/sibling-if.bytecode.parallel
+
+// nested-case
+// RUN: cir-opt %t/nested-case.cir --mlir-print-debuginfo -o %t/nested-case.text.cir
+// RUN: cir-opt %t/nested-case.cir --emit-bytecode -o %t/nested-case.bc
+// RUN: not cir-opt %t/nested-case.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/nested-case.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/nested-case.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/nested-case.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/nested-case.parallel
+// RUN: diff %t/nested-case.serial %t/nested-case.parallel
+// RUN: not cir-opt %t/nested-case.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/nested-case.text.serial
+// RUN: diff %t/nested-case.serial %t/nested-case.text.serial
+// RUN: not cir-opt %t/nested-case.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/nested-case.text.parallel
+// RUN: diff %t/nested-case.serial %t/nested-case.text.parallel
+// RUN: not cir-opt %t/nested-case.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/nested-case.bytecode.serial
+// RUN: diff %t/nested-case.serial %t/nested-case.bytecode.serial
+// RUN: not cir-opt %t/nested-case.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/nested-case.bytecode.parallel
+// RUN: diff %t/nested-case.serial %t/nested-case.bytecode.parallel
+
+// unsupported-successor
+// RUN: cir-opt %t/unsupported-successor.cir --mlir-print-debuginfo -o %t/unsupported-successor.text.cir
+// RUN: cir-opt %t/unsupported-successor.cir --emit-bytecode -o %t/unsupported-successor.bc
+// RUN: not cir-opt %t/unsupported-successor.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/unsupported-successor.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/unsupported-successor.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/unsupported-successor.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/unsupported-successor.parallel
+// RUN: diff %t/unsupported-successor.serial %t/unsupported-successor.parallel
+// RUN: not cir-opt %t/unsupported-successor.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/unsupported-successor.text.serial
+// RUN: diff %t/unsupported-successor.serial %t/unsupported-successor.text.serial
+// RUN: not cir-opt %t/unsupported-successor.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/unsupported-successor.text.parallel
+// RUN: diff %t/unsupported-successor.serial %t/unsupported-successor.text.parallel
+// RUN: not cir-opt %t/unsupported-successor.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/unsupported-successor.bytecode.serial
+// RUN: diff %t/unsupported-successor.serial %t/unsupported-successor.bytecode.serial
+// RUN: not cir-opt %t/unsupported-successor.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/unsupported-successor.bytecode.parallel
+// RUN: diff %t/unsupported-successor.serial %t/unsupported-successor.bytecode.parallel
+
+// nonlinear-shell
+// RUN: cir-opt %t/nonlinear-shell.cir --mlir-print-debuginfo -o %t/nonlinear-shell.text.cir
+// RUN: cir-opt %t/nonlinear-shell.cir --emit-bytecode -o %t/nonlinear-shell.bc
+// RUN: not cir-opt %t/nonlinear-shell.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/nonlinear-shell.serial
+// RUN: FileCheck %s --check-prefix=ERROR --input-file=%t/nonlinear-shell.serial --implicit-check-not='error:' --implicit-check-not='warning:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: not cir-opt %t/nonlinear-shell.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/nonlinear-shell.parallel
+// RUN: diff %t/nonlinear-shell.serial %t/nonlinear-shell.parallel
+// RUN: not cir-opt %t/nonlinear-shell.text.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/nonlinear-shell.text.serial
+// RUN: diff %t/nonlinear-shell.serial %t/nonlinear-shell.text.serial
+// RUN: not cir-opt %t/nonlinear-shell.text.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/nonlinear-shell.text.parallel
+// RUN: diff %t/nonlinear-shell.serial %t/nonlinear-shell.text.parallel
+// RUN: not cir-opt %t/nonlinear-shell.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t/nonlinear-shell.bytecode.serial
+// RUN: diff %t/nonlinear-shell.serial %t/nonlinear-shell.bytecode.serial
+// RUN: not cir-opt %t/nonlinear-shell.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t/nonlinear-shell.bytecode.parallel
+// RUN: diff %t/nonlinear-shell.serial %t/nonlinear-shell.bytecode.parallel
+
+//--- missing.cir
+module {
+  cir.func @missing() {
+    cir.goto "not_defined" loc("goto-missing":1:1)
+  }
+}
+
+//--- duplicate.cir
+module {
+  cir.func @duplicate() {
+    cir.label "same" loc("goto-first-label":1:1)
+    cir.return
+  ^other:
+    cir.label "same" loc("goto-duplicate-label":1:1)
+    cir.return
+  }
+}
+
+//--- label-argument.cir
+module {
+  cir.func @label_argument() {
+    cir.return
+  ^unused(%argument: !cir.int<s, 32>):
+    cir.label "unused" loc("goto-label-argument":1:1)
+    cir.return
+  }
+}
+
+//--- indirect.cir
+module {
+  cir.func @indirect(%address: !cir.ptr<!cir.void>) {
+    cir.indirect_goto %address : !cir.ptr<!cir.void> loc("goto-indirect":1:1)
+  }
+}
+
+//--- inward-scope.cir
+module {
+  cir.func @inward_scope() {
+    cir.goto "inside" loc("goto-inward-scope":1:1)
+  ^otherwise_unreachable:
+    cir.scope {
+      cir.label "inside"
+      cir.yield
+    }
+    cir.return
+  }
+}
+
+//--- incoming-case.cir
+module {
+  cir.func @incoming_case(%selector: !cir.int<s, 32>) {
+    cir.goto "inside_case" loc("goto-incoming-case":1:1)
+  ^otherwise_unreachable:
+    cir.switch (%selector : !cir.int<s, 32>) {
+      cir.case(default, []) {
+        cir.label "inside_case"
+        cir.break
+      }
+      cir.yield
+    } loc("goto-incoming-switch":1:1)
+    cir.return
+  }
+}
+
+//--- cross-case.cir
+module {
+  cir.func @cross_case(%selector: !cir.int<s, 32>) {
+    cir.switch (%selector : !cir.int<s, 32>) {
+      cir.case(equal, [#cir.int<0> : !cir.int<s, 32>]) {
+        cir.goto "other_case" loc("goto-cross-case":1:1)
+      }
+      cir.case(default, []) {
+        cir.label "other_case"
+        cir.break
+      }
+      cir.yield
+    } loc("goto-cross-case-switch":1:1)
+    cir.return
+  }
+}
+
+//--- sibling-if.cir
+module {
+  cir.func @sibling_if(%condition: !cir.bool) {
+    cir.if %condition {
+      cir.goto "sibling" loc("goto-sibling-region":1:1)
+    } else {
+      cir.label "sibling"
+      cir.yield
+    }
+    cir.return
+  }
+}
+
+//--- nested-case.cir
+module {
+  cir.func @nested_case(%selector: !cir.int<s, 32>) {
+    cir.switch (%selector : !cir.int<s, 32>) {
+      cir.case(equal, [#cir.int<0> : !cir.int<s, 32>]) {
+        cir.scope {
+          cir.case(equal, [#cir.int<1> : !cir.int<s, 32>]) {
+            cir.break
+          }
+          cir.yield
+        }
+        cir.break
+      }
+      cir.case(default, []) { cir.break }
+      cir.yield
+    } loc("goto-nested-case":1:1)
+    cir.return
+  }
+}
+
+//--- unsupported-successor.cir
+module {
+  cir.func @unsupported_successor(%selector: !cir.int<s, 32>, %condition: !cir.bool) {
+    cir.switch (%selector : !cir.int<s, 32>) {
+      cir.case(default, []) {
+        cir.brcond %condition ^left, ^right loc("goto-unsupported-successor":1:1)
+      ^left:
+        cir.break
+      ^right:
+        cir.break
+      }
+      cir.yield
+    } loc("goto-unsupported-successor-switch":1:1)
+    cir.return
+  }
+}
+
+//--- nonlinear-shell.cir
+module {
+  cir.func private @side_effect() attributes {nothrow}
+  cir.func @nonlinear_shell(%selector: !cir.int<s, 32>) {
+    cir.switch (%selector : !cir.int<s, 32>) {
+      cir.case(default, []) { cir.break }
+      cir.yield
+    ^extra_shell:
+      cir.call @side_effect() nothrow : () -> ()
+      cir.yield
+    } loc("goto-nonlinear-shell":1:1)
+    cir.return
+  }
+}

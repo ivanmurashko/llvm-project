@@ -1,0 +1,290 @@
+// RUN: cir-opt %s --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.serial
+// RUN: FileCheck %s --input-file=%t.serial --implicit-check-not='warning:' --implicit-check-not='error:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: cir-opt %s --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.parallel
+// RUN: diff %t.serial %t.parallel
+// RUN: cir-opt %s --cir-canonicalize --mlir-print-debuginfo -o %t.canonical.cir
+// RUN: cir-opt %t.canonical.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.canonical.serial
+// RUN: diff %t.serial %t.canonical.serial
+// RUN: cir-opt %t.canonical.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.canonical.parallel
+// RUN: diff %t.serial %t.canonical.parallel
+// RUN: cir-opt %t.canonical.cir --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.bytecode.serial
+// RUN: diff %t.serial %t.bytecode.serial
+// RUN: cir-opt %t.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.bytecode.parallel
+// RUN: diff %t.serial %t.bytecode.parallel
+
+// Source parameter categories affect call policy, not pointer validity facts.
+// Stable locations make all six diagnostic streams exactly comparable. Sink
+// calls keep the observable loads through canonicalization.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+!consume = !cir.ptr<!cir.func<(!p)>>
+!pointer_call = !cir.ptr<!cir.func<(!pp)>>
+!pair_call = !cir.ptr<!cir.func<(!pp, !pp)>>
+!record = !cir.struct<"WithPointer" {data !p}>
+!recordp = !cir.ptr<!record>
+!record_call = !cir.ptr<!cir.func<(!recordp)>>
+!task = !cir.struct<"Task" {data !i}>
+!taskp = !cir.ptr<!task>
+!task_call = !cir.ptr<!cir.func<(!taskp)>>
+module attributes {cir.lifetime_records = {
+  Task = #cir.lifetime_record<owner = false, pointer = false, lambda = false, promise_type = true>
+}} {
+  cir.func private @make_task(!p) -> !task attributes {nothrow}
+  cir.func private @use_task(!taskp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [1], parameter_indices = [0]>}
+  cir.func private @use_record(!recordp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [1], parameter_indices = [0]>}
+  cir.func private @observe(!i) attributes {nothrow}
+  cir.func private @observe_pointer(!p) attributes {nothrow}
+  cir.func private @unknown(!p) attributes {nothrow}
+  cir.func private @unknown_pointer(!pp) attributes {nothrow}
+  cir.func private @lvalue_value(!pp, !pp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [1, 0], parameter_indices = [0, 1]>}
+  cir.func private @value_lvalue(!pp, !pp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0, 1], parameter_indices = [0, 1]>}
+  cir.func private @move_pointer(!pp) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = [0]>}
+  cir.func private @direct_rvalue(!p) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = [0]>}
+
+  cir.func @indirect_rvalue(%callee : !consume) {
+    %value = cir.alloca "value" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    cir.call %callee(%value) nothrow : (!consume, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}) -> () loc("indirect.cir":10:1)
+    %read = cir.load %value : !p, !i loc("indirect.cir":11:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  cir.func @indirect_lvalue_does_not_move(%callee : !consume) {
+    %value = cir.alloca "value" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    cir.call %callee(%value) nothrow : (!consume, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> () loc("indirect.cir":20:1)
+    %read = cir.load %value : !p, !i loc("indirect.cir":21:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  cir.func @indirect_absent_kind_stays_unknown(%callee : !consume) {
+    %value = cir.alloca "value" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    cir.call %callee(%value) nothrow : (!consume, !p) -> () loc("indirect.cir":30:1)
+    %read = cir.load %value : !p, !i loc("indirect.cir":31:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  cir.func @direct_mapping_without_call_attr() {
+    %value = cir.alloca "value" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    cir.call @direct_rvalue(%value) nothrow : (!p) -> () loc("indirect.cir":40:1)
+    %read = cir.load %value : !p, !i loc("indirect.cir":41:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  cir.func @direct_callsite_fallback() {
+    %value = cir.alloca "value" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    cir.call @unknown(%value) nothrow : (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}) -> () loc("indirect.cir":50:1)
+    %read = cir.load %value : !p, !i loc("indirect.cir":51:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  cir.func @direct_absent_kind_stays_unknown() {
+    %value = cir.alloca "value" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    cir.call @unknown(%value) nothrow : (!p) -> () loc("indirect.cir":60:1)
+    %read = cir.load %value : !p, !i loc("indirect.cir":61:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  // A null-valued pointer can bind to T& without proving valid contents.
+  cir.func @lvalue_binding_preserves_null(%callee : !pointer_call) {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":70:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.call %callee(%pointer) nothrow : (!pointer_call, !pp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> ()
+    %read = cir.load deref %pointer : !pp, !p loc("indirect.cir":71:1)
+    cir.call @observe_pointer(%read) nothrow : (!p) -> ()
+    cir.return
+  }
+
+  // Passing initialized output storage is valid even when its contents are
+  // null. A known Value category does not prove an indirect pointee read.
+  cir.func @known_value_output_storage(%callee : !pointer_call) {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":80:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.call %callee(%pointer) nothrow : (!pointer_call, !pp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<value>}) -> () loc("indirect.cir":81:1)
+    cir.return
+  }
+
+  // Rvalue-reference consumption still checks the source before marking it
+  // moved. Its null warning comes from UseAfterMove, not generic call policy.
+  cir.func @known_rvalue_checks_source(%callee : !pointer_call) {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":90:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.call %callee(%pointer) nothrow : (!pointer_call, !pp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}) -> () loc("indirect.cir":91:1)
+    cir.return
+  }
+
+  cir.func @unknown_indirect_retains_nullable_policy(%callee : !pointer_call) {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":100:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.call %callee(%pointer) nothrow : (!pointer_call, !pp) -> () loc("indirect.cir":101:1)
+    cir.return
+  }
+
+  cir.func @direct_lvalue_fallback() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":110:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.call @unknown_pointer(%pointer) nothrow : (!pp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> () loc("indirect.cir":111:1)
+    cir.return
+  }
+
+  // Preserve existing direct-call policy: a nullable position must not hide
+  // a strict position of the same operand, in either parameter order.
+  cir.func @lvalue_then_strict() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":120:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.call @lvalue_value(%pointer, %pointer) nothrow : (!pp, !pp) -> () loc("indirect.cir":121:1)
+    cir.return
+  }
+
+  cir.func @strict_then_lvalue() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":130:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.call @value_lvalue(%pointer, %pointer) nothrow : (!pp, !pp) -> () loc("indirect.cir":131:1)
+    cir.return
+  }
+
+  // Neither known nor unknown indirect slots introduce a pointee-read fact.
+  cir.func @unknown_then_value_stays_nullable(%callee : !pair_call) {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":140:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.call %callee(%pointer, %pointer) nothrow : (!pair_call, !pp, !pp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<value>}) -> () loc("indirect.cir":141:1)
+    cir.return
+  }
+  // Lvalue binding exempts null contents only, never moved or expired state.
+  cir.func @moved_pointer_through_lvalue(%callee : !pointer_call) {
+    %live = cir.alloca "live" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.store %live, %pointer : !p, !pp
+    cir.call @move_pointer(%pointer) nothrow : (!pp) -> () loc("indirect.cir":150:1)
+    cir.call %callee(%pointer) nothrow : (!pointer_call, !pp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> () loc("indirect.cir":151:1)
+    cir.return
+  }
+
+  cir.func @dangling_pointer_through_lvalue(%callee : !pointer_call) {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.scope {
+      %local = cir.alloca "local" align(4) : !p
+      cir.store %local, %pointer : !p, !pp
+      cir.yield
+    } loc("indirect.cir":160:1)
+    cir.call %callee(%pointer) nothrow : (!pointer_call, !pp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> () loc("indirect.cir":161:1)
+    cir.return
+  }
+  // Known indirect bindings retain nullable aggregate-member checks too.
+  // The corresponding direct call below keeps its existing strict policy.
+  cir.func @known_lvalue_aggregate(%callee : !record_call) {
+    %record = cir.alloca "record" align(8) : !recordp
+    %zero = cir.const #cir.zero : !record loc("indirect.cir":170:1)
+    cir.store %zero, %record : !record, !recordp
+    %field = cir.get_member %record[0] {name = "data"} : !recordp -> !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":170:1)
+    cir.store %null, %field : !p, !pp
+    cir.call %callee(%record) nothrow : (!record_call, !recordp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> () loc("indirect.cir":171:1)
+    cir.return
+  }
+
+  // Missing source kinds retain the same nullable indirect policy.
+  cir.func @unknown_aggregate(%callee : !record_call) {
+    %record = cir.alloca "record" align(8) : !recordp
+    %zero = cir.const #cir.zero : !record
+    cir.store %zero, %record : !record, !recordp
+    %field = cir.get_member %record[0] {name = "data"} : !recordp -> !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":170:1)
+    cir.store %null, %field : !p, !pp
+    cir.call %callee(%record) nothrow : (!record_call, !recordp) -> ()
+    cir.return
+  }
+  cir.func @direct_lvalue_aggregate() {
+    %record = cir.alloca "record" align(8) : !recordp
+    %zero = cir.const #cir.zero : !record
+    cir.store %zero, %record : !record, !recordp
+    %field = cir.get_member %record[0] {name = "data"} : !recordp -> !pp
+    %null = cir.const #cir.ptr<null> : !p loc("indirect.cir":180:1)
+    cir.store %null, %field : !p, !pp
+    cir.call @use_record(%record) nothrow : (!recordp) -> () loc("indirect.cir":181:1)
+    cir.return
+  }
+
+  // A task's dangling capture remains invalid through direct and known
+  // indirect lvalue-reference calls; binding is not task reinitialization.
+  cir.func @direct_task() {
+    %task = cir.alloca "task" align(4) : !taskp
+    cir.scope {
+      %local = cir.alloca "local" align(4) : !p loc("indirect.cir":190:1)
+      %one = cir.const #cir.int<1> : !i
+      cir.store %one, %local : !i, !p
+      %created = cir.call @make_task(%local) nothrow : (!p) -> !task
+      cir.store %created, %task : !task, !taskp
+      cir.yield
+    } loc("indirect.cir":191:1)
+    cir.call @use_task(%task) nothrow : (!taskp) -> () loc("indirect.cir":192:1)
+    cir.return
+  }
+
+  cir.func @known_indirect_task(%callee : !task_call) {
+    %task = cir.alloca "task" align(4) : !taskp
+    cir.scope {
+      %local = cir.alloca "local" align(4) : !p loc("indirect.cir":200:1)
+      %one = cir.const #cir.int<1> : !i
+      cir.store %one, %local : !i, !p
+      %created = cir.call @make_task(%local) nothrow : (!p) -> !task
+      cir.store %created, %task : !task, !taskp
+      cir.yield
+    } loc("indirect.cir":201:1)
+    cir.call %callee(%task) nothrow : (!task_call, !taskp {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> () loc("indirect.cir":202:1)
+    cir.return
+  }
+}
+
+// CHECK: indirect.cir:11:1: warning: use of moved-from value 'value'
+// CHECK: indirect.cir:10:1: note: moved here via std::move or rvalue reference
+// CHECK: indirect.cir:41:1: warning: use of moved-from value 'value'
+// CHECK: indirect.cir:40:1: note: moved here via std::move or rvalue reference
+// CHECK: indirect.cir:51:1: warning: use of moved-from value 'value'
+// CHECK: indirect.cir:50:1: note: moved here via std::move or rvalue reference
+// CHECK: indirect.cir:71:1: warning: use of invalid pointer 'pointer'
+// CHECK: indirect.cir:70:1: note: 'nullptr' invalidated here
+// CHECK: indirect.cir:91:1: warning: use of invalid pointer 'pointer'
+// CHECK: indirect.cir:90:1: note: 'nullptr' invalidated here
+// CHECK: indirect.cir:121:1: warning: passing invalid pointer 'pointer'
+// CHECK: indirect.cir:120:1: note: 'nullptr' invalidated here
+// CHECK: indirect.cir:131:1: warning: passing invalid pointer 'pointer'
+// CHECK: indirect.cir:130:1: note: 'nullptr' invalidated here
+// CHECK: indirect.cir:151:1: warning: passing invalid pointer 'pointer'
+// CHECK: indirect.cir:150:1: note: moved here via std::move or rvalue reference
+// CHECK: indirect.cir:161:1: warning: passing invalid pointer 'pointer'
+// CHECK: indirect.cir:160:1: note: pointee 'local' invalidated at end of scope
+// CHECK: indirect.cir:181:1: warning: passing aggregate containing invalid pointer member 'record.data'
+// CHECK: indirect.cir:180:1: note: 'nullptr' invalidated here
+// CHECK: indirect.cir:192:1: warning: use of coroutine 'task' with dangling reference
+// CHECK: indirect.cir:190:1: note: coroutine bound to resource with expired lifetime
+// CHECK: indirect.cir:191:1: note: at the end of scope or full-expression
+// CHECK: indirect.cir:202:1: warning: use of coroutine 'task' with dangling reference
+// CHECK: indirect.cir:200:1: note: coroutine bound to resource with expired lifetime
+// CHECK: indirect.cir:201:1: note: at the end of scope or full-expression

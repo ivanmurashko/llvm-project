@@ -17,7 +17,9 @@
 #include "clang/AST/ASTConsumer.h"
 #include "clang/Basic/CodeGenOptions.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/VirtualFileSystem.h"
 
 #include <memory>
@@ -26,6 +28,7 @@ namespace clang {
 class Decl;
 class DeclGroupRef;
 class DiagnosticsEngine;
+class FunctionDecl;
 namespace CIRGen {
 class CIRGenModule;
 } // namespace CIRGen
@@ -71,6 +74,7 @@ protected:
 
 private:
   llvm::SmallVector<clang::FunctionDecl *, 8> deferredInlineMemberFuncDefs;
+  llvm::SmallVector<clang::FunctionDecl *, 8> lifetimeAnalysisRoots;
 
 public:
   CIRGenerator(clang::DiagnosticsEngine &diags,
@@ -96,6 +100,12 @@ public:
   const mlir::MLIRContext &getMLIRContext() const { return *mlirContext; };
 
   bool verifyModule() const;
+
+  /// Register selected definitions with bodies after Initialize and before
+  /// declaration replay. They use normal CIRGen eligibility and dependencies,
+  /// then are replayed before finalization if not already emitted.
+  void
+  addLifetimeAnalysisRoots(llvm::ArrayRef<clang::FunctionDecl *> functions);
 
   /// Return the Decl that generated the given mangled name, if known. Used
   /// to recover a source location for backend diagnostics (e.g. frame-size

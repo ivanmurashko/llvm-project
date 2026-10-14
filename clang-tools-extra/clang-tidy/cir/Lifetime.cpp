@@ -16,11 +16,17 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/PassManager.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
+#include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclFriend.h"
 #include "clang/AST/DeclGroup.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/CIR/CIRGenerator.h"
 #include "clang/CIR/Dialect/Passes.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <optional>
@@ -133,6 +139,73 @@ private:
   SourceManager &SourceMgr;
 };
 
+// Root selection only visits declarations, never statement bodies or templates.
+static bool isOrdinaryRecord(const CXXRecordDecl *Record) {
+  return !Record->isImplicit() && !Record->isLambda() &&
+         !Record->isLocalClass() && !Record->isDependentContext() &&
+         !Record->getDescribedClassTemplate() &&
+         Record->getTemplateSpecializationKind() == TSK_Undeclared;
+}
+
+static bool isUnusedMainFileRoot(const FunctionDecl *Definition,
+                                 const SourceManager &SourceMgr) {
+  if (!Definition || !Definition->doesThisDeclarationHaveABody() ||
+      !Definition->isInlined() || Definition->isImplicit() ||
+      Definition->isDefaulted() || Definition->isDeleted() ||
+      Definition->isConsteval() ||
+      Definition->getTemplatedKind() != FunctionDecl::TK_NonTemplate ||
+      !SourceMgr.isWrittenInMainFile(
+          SourceMgr.getExpansionLoc(Definition->getLocation())))
+    return false;
+  if (const auto *Method = dyn_cast<CXXMethodDecl>(Definition))
+    if (isa<CXXConstructorDecl, CXXDestructorDecl>(Method) ||
+        Method->isVirtual())
+      return false;
+  for (const DeclContext *Context = Definition->getDeclContext(); Context;
+       Context = Context->getParent()) {
+    if (Context->isFunctionOrMethod() || Context->isDependentContext())
+      return false;
+    if (const auto *Record = dyn_cast<CXXRecordDecl>(Context))
+      if (!isOrdinaryRecord(Record))
+        return false;
+  }
+  return !Definition->hasAttr<CUDAHostAttr>() &&
+         !Definition->hasAttr<CUDADeviceAttr>() &&
+         !Definition->hasAttr<CUDAGlobalAttr>() &&
+         !Definition->hasAttr<DeviceKernelAttr>() &&
+         !Definition->hasAttr<SYCLKernelAttr>() &&
+         !Definition->hasAttr<SYCLExternalAttr>() &&
+         !Definition->hasAttr<SYCLKernelEntryPointAttr>() &&
+         !OMPDeclareTargetDeclAttr::isDeclareTargetDeclaration(Definition) &&
+         !Definition->hasAttr<OpenACCRoutineDeclAttr>();
+}
+
+static void collectUnusedMainFileRoots(
+    DeclContext *Context, const SourceManager &SourceMgr,
+    llvm::SmallPtrSetImpl<const FunctionDecl *> &Seen,
+    llvm::SmallVectorImpl<FunctionDecl *> &Roots) {
+  auto AddFunction = [&](FunctionDecl *Function) {
+    FunctionDecl *Definition = Function->getDefinition();
+    if (isUnusedMainFileRoot(Definition, SourceMgr) &&
+        Seen.insert(Definition->getCanonicalDecl()).second)
+      Roots.push_back(Definition);
+  };
+  for (Decl *D : Context->decls()) {
+    if (auto *Function = dyn_cast<FunctionDecl>(D)) {
+      AddFunction(Function);
+    } else if (auto *Friend = dyn_cast<FriendDecl>(D)) {
+      if (auto *Function =
+              dyn_cast_or_null<FunctionDecl>(Friend->getFriendDecl()))
+        AddFunction(Function);
+    } else if (isa<NamespaceDecl, LinkageSpecDecl, ExportDecl>(D)) {
+      collectUnusedMainFileRoots(cast<DeclContext>(D), SourceMgr, Seen, Roots);
+    } else if (auto *Record = dyn_cast<CXXRecordDecl>(D)) {
+      if (isOrdinaryRecord(Record))
+        collectUnusedMainFileRoots(Record, SourceMgr, Seen, Roots);
+    }
+  }
+}
+
 } // namespace
 
 Lifetime::Lifetime(StringRef Name, ClangTidyContext *Context)
@@ -142,7 +215,9 @@ Lifetime::Lifetime(StringRef Name, ClangTidyContext *Context)
           utils::options::parseStringList(Options.get("RemarksList", ""))),
       HistoryList(
           utils::options::parseStringList(Options.get("HistoryList", "all"))),
-      HistLimit(Options.get("HistLimit", 1U)) {}
+      HistLimit(Options.get("HistLimit", 1U)),
+      AnalyzeUnusedMainFileFunctions(
+          Options.get("AnalyzeUnusedMainFileFunctions", false)) {}
 
 void Lifetime::storeOptions(ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "RemarksList",
@@ -150,6 +225,8 @@ void Lifetime::storeOptions(ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "HistoryList",
                 utils::options::serializeStringList(HistoryList));
   Options.store(Opts, "HistLimit", HistLimit);
+  Options.store(Opts, "AnalyzeUnusedMainFileFunctions",
+                AnalyzeUnusedMainFileFunctions);
 }
 
 void Lifetime::registerMatchers(MatchFinder *Finder) {
@@ -175,6 +252,17 @@ void Lifetime::check(const MatchFinder::MatchResult &Result) {
   Generator.getMLIRContext().printOpOnDiagnostic(false);
   CIRTidyDiagnosticHandler Handler(Generator.getMLIRContext(), *this,
                                    SourceMgr);
+
+  if (AnalyzeUnusedMainFileFunctions && !AST.getLangOpts().CUDAIsDevice &&
+      !AST.getLangOpts().SYCLIsDevice &&
+      !AST.getLangOpts().OpenMPIsTargetDevice && !AST.getLangOpts().OpenCL &&
+      !AST.getLangOpts().HLSL) {
+    llvm::SmallVector<FunctionDecl *, 8> Roots;
+    llvm::SmallPtrSet<const FunctionDecl *, 16> Seen;
+    collectUnusedMainFileRoots(AST.getTranslationUnitDecl(), SourceMgr, Seen,
+                               Roots);
+    Generator.addLifetimeAnalysisRoots(Roots);
+  }
 
   // CIRGenerator consumes top-level declarations, not a TranslationUnitDecl.
   // Reuse the AST already parsed by clang-tidy and the active compilation's

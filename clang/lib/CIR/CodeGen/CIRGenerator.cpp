@@ -96,7 +96,28 @@ bool CIRGenerator::HandleTopLevelDecl(DeclGroupRef group) {
   return true;
 }
 
+void CIRGenerator::addLifetimeAnalysisRoots(
+    llvm::ArrayRef<FunctionDecl *> functions) {
+  assert(cgm && preserveLifetimeScopes &&
+         "initialize lifetime CIR generation before registering roots");
+  for (FunctionDecl *function : functions) {
+    assert(function->doesThisDeclarationHaveABody() &&
+           "analysis roots must be definitions");
+    if (cgm->addLifetimeAnalysisRoot(function))
+      lifetimeAnalysisRoots.push_back(function);
+  }
+}
+
 void CIRGenerator::HandleTranslationUnit(ASTContext &astContext) {
+  // Ordinary record replay does not emit every unused inline method or friend.
+  // Reuse the normal declaration path, including duplicate-definition checks.
+  for (FunctionDecl *function : lifetimeAnalysisRoots) {
+    if (diags.hasErrorOccurred())
+      break;
+    HandleTopLevelDecl(DeclGroupRef(function));
+  }
+  lifetimeAnalysisRoots.clear();
+
   // Release the Builder when there is no error.
   if (!diags.hasErrorOccurred() && cgm)
     cgm->release();

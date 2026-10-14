@@ -1,0 +1,138 @@
+// RUN: cir-opt %s --verify-diagnostics --split-input-file -o /dev/null
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+cir.func private @one(!p)
+cir.func @count(%value : !p) {
+  // expected-error @below {{call argument attributes must match the number of argument operands}}
+  "cir.call"(%value) <{callee = @one, arg_attrs = [{cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}, {}]}> : (!p) -> ()
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+cir.func private @one(!p)
+cir.func @wrong_type(%value : !p) {
+  // expected-error @below {{cir.lifetime_parameter_kind must be a #cir.lifetime_parameter_kind attribute}}
+  cir.call @one(%value) : (!p {cir.lifetime_parameter_kind = 2 : i32}) -> ()
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+cir.func private @one(!i)
+cir.func @reference_requires_pointer(%value : !i) {
+  // expected-error @below {{a lifetime reference argument must have pointer type}}
+  cir.call @one(%value) : (!i {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> ()
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+cir.func private @one(!p) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = [0]>}
+cir.func @direct_conflict(%value : !p) {
+  // expected-error @below {{call lifetime parameter kind conflicts with callee metadata}}
+  cir.call @one(%value) : (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> ()
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!fn = !cir.ptr<!cir.func<(!p)>>
+cir.func @callee_is_not_an_argument(%callee : !fn, %value : !p) {
+  // expected-error @below {{cir.lifetime_parameter_kind cannot annotate an indirect callee}}
+  cir.call %callee(%value) : (!fn {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}, !p) -> ()
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!fn = !cir.ptr<!cir.func<(!p)>>
+cir.func @indirect_count_excludes_callee(%callee : !fn, %value : !p) {
+  // expected-error @below {{call argument attributes must match the number of argument operands}}
+  "cir.call"(%callee, %value) <{arg_attrs = [{}, {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}]}> : (!fn, !p) -> ()
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+cir.func private @result() -> !p
+cir.func @not_result_metadata() {
+  // expected-error @below {{cir.lifetime_parameter_kind is only valid on call arguments}}
+  %result = cir.call @result() : () -> (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>})
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+cir.func private @one(!p)
+cir.func @not_operation_metadata(%value : !p) {
+  // expected-error @below {{cir.lifetime_parameter_kind is only valid on call arguments}}
+  cir.call @one(%value) {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>} : (!p) -> ()
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+// Function metadata continues to use lifetime_function, not this call-site key.
+// expected-error @below {{cir.lifetime_parameter_kind is only valid on call arguments}}
+cir.func private @not_function_argument(!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>})
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+// expected-error @below {{cir.lifetime_parameter_kind is only valid on call arguments}}
+cir.func private @not_function_result() -> (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>})
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+cir.func private @one(!p)
+cir.func @try_call_wrong_type(%value : !p) {
+  // expected-error @below {{cir.lifetime_parameter_kind must be a #cir.lifetime_parameter_kind attribute}}
+  cir.try_call @one(%value) ^normal, ^unwind : (!p {cir.lifetime_parameter_kind = "rvalue_ref"}) -> ()
+^normal:
+  cir.return
+^unwind:
+  %exception, %type = cir.eh.inflight_exception cleanup
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+cir.func private @method(!p, !p) attributes {lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = false, has_implicit_object = true, parameter_kinds = [2], parameter_indices = [1]>}
+cir.func @implicit_object_is_not_a_source_parameter(%receiver : !p, %value : !p) {
+  // expected-error @below {{call lifetime parameter kind does not name a mapped source parameter}}
+  cir.call @method(%receiver, %value) : (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}, !p) -> ()
+  cir.return
+}
+
+// -----
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+cir.func private @hidden(!p, !i, !p) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0, 2], parameter_indices = [0, 2]>}
+cir.func @hidden_slot_is_not_a_source_parameter(%pointer : !p, %size : !i, %value : !p) {
+  // expected-error @below {{call lifetime parameter kind does not name a mapped source parameter}}
+  cir.call @hidden(%pointer, %size, %value) : (!p, !i {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<value>}, !p) -> ()
+  cir.return
+}

@@ -12,10 +12,10 @@ void unsupported_switch(int n) {
     break;
   }
 }
-// CHECK-DAG: :[[@LINE-9]]:3: error: unsupported control flow in lifetime analysis: switch requires linear case blocks [cir-lifetime-check]
+// CHECK-DAG: :[[@LINE-9]]:3: error: unsupported control flow in lifetime analysis: switch requires a simple direct-case shell [cir-lifetime-check]
 // CHECK-DAG: error: CIR lifetime analysis failed [cir-lifetime-check]
 // CHECK-NOT: see current operation
 // YAML: DiagnosticName:  cir-lifetime-check
-// YAML: Message:{{.*}}unsupported control flow in lifetime analysis: switch requires linear case blocks
+// YAML: Message:{{.*}}unsupported control flow in lifetime analysis: switch requires a simple direct-case shell
 // YAML: FilePath:{{.*}}lifetime-control-flow.cpp
 // YAML: Level:           Error

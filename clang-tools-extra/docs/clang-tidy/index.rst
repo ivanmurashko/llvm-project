@@ -9,6 +9,7 @@ See also:
 
    List of Clang-Tidy Checks <checks/list>
    Query Based Custom Clang-Tidy Checks <QueryBasedCustomChecks>
+   Comparing CIR Lifetime Builds and Use-After-Move Checks <CIRLifetimeBenchmark>
    Clang-tidy IDE/Editor Integrations <Integrations>
    Getting Involved <Contributing>
    External Clang-Tidy Examples <ExternalClang-TidyExamples>

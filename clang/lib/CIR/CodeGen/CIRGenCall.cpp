@@ -1415,6 +1415,48 @@ RValue CIRGenFunction::emitCall(const CIRGenFunctionInfo &funcInfo,
   assert(!cir::MissingFeatures::functionUsesSEHTry());
   assert(!cir::MissingFeatures::nothrowAttr());
 
+  // Direct calls use their declaration's lifetime metadata. For an ordinary
+  // indirect call, retain source categories only when all representations
+  // prove the same argument mapping before ABI signature rewriting.
+  if (cgm.shouldPreserveLifetimeScopes() && callee.isOrdinary() &&
+      indirectFuncTy && callingConv == cir::CallingConv::C &&
+      !funcInfo.isInstanceMethod() && !funcInfo.isVariadic() &&
+      (!calleeDecl ||
+       (!isa<CXXMethodDecl>(calleeDecl) && !calleeDecl->getBuiltinID()))) {
+    const auto *proto = callee.getAbstractInfo().getCalleeFunctionProtoType();
+    if (!proto && calleeDecl)
+      proto = calleeDecl->getType()->getAs<FunctionProtoType>();
+    bool identityMapping =
+        proto && !proto->isVariadic() && proto->getNumParams() == args.size() &&
+        args.size() == funcInfo.arguments().size() &&
+        args.size() == cirCallArgs.size() && args.size() == argAttrs.size();
+    if (identityMapping) {
+      for (unsigned index = 0; index < args.size(); ++index) {
+        auto sourceType =
+            getContext().getCanonicalParamType(proto->getParamType(index));
+        if (sourceType != getContext().getCanonicalParamType(args[index].ty) ||
+            sourceType != funcInfo.arguments()[index] ||
+            convertType(sourceType) != cirCallArgs[index].getType()) {
+          identityMapping = false;
+          break;
+        }
+      }
+    }
+    if (identityMapping) {
+      for (unsigned index = 0; index < args.size(); ++index) {
+        QualType type = proto->getParamType(index);
+        auto kind = type->isLValueReferenceType()
+                        ? cir::LifetimeParameterKind::LValueReference
+                    : type->isRValueReferenceType()
+                        ? cir::LifetimeParameterKind::RValueReference
+                        : cir::LifetimeParameterKind::Value;
+        argAttrs[index].append(
+            cir::getLifetimeParameterKindAttrName(),
+            cir::LifetimeParameterKindAttr::get(builder.getContext(), kind));
+      }
+    }
+  }
+
   bool cannotThrow = attrs.getNamed("nothrow").has_value();
   bool isInvoke = !cannotThrow && isCatchOrCleanupRequired();
 

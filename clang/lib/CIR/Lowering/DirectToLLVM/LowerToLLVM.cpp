@@ -2207,6 +2207,7 @@ mlir::LogicalResult CIRToLLVMRotateOpLowering::matchAndRewrite(
 static std::optional<mlir::ArrayAttr> convertTypedArgAttrs(
     mlir::ArrayAttr argAttrs, const mlir::TypeConverter &converter,
     const mlir::DataLayout &dataLayout, mlir::MLIRContext *ctx) {
+  argAttrs = cir::stripLifetimeParameterKindAttrs(argAttrs);
   if (!argAttrs)
     return argAttrs;
   bool changed = false;
