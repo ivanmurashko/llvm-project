@@ -1,0 +1,18 @@
+// REQUIRES: thread_support
+// RUN: %python %S/Inputs/lifetime-parallel-deep.py > %t.cir
+// RUN: not cir-opt %t.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.serial
+// RUN: FileCheck %s --input-file=%t.serial --implicit-check-not='warning:' --implicit-check-not='error:' --implicit-check-not='note:'
+// RUN: not cir-opt %t.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.parallel
+// RUN: diff %t.serial %t.parallel
+
+// Generate enough nested scopes to exercise the sufficient-stack continuation.
+// The error is emitted inside the deep region; its warning witness survives
+// unwinding, and the following function must still be analyzed. A pool-thread
+// diagnostic handler alone cannot order a fresh stack thread's diagnostics.
+// CHECK: parallel-before{{.*}}warning: use of invalid pointer 'pointer'
+// CHECK: parallel-before{{.*}}note: 'nullptr' invalidated here
+// CHECK: parallel-deep{{.*}}error: unsupported CFG terminator in lifetime analysis
+// CHECK: parallel-deep{{.*}}warning: use of invalid pointer 'pointer'
+// CHECK: parallel-deep{{.*}}note: 'nullptr' invalidated here
+// CHECK: parallel-after{{.*}}warning: use of invalid pointer 'pointer'
+// CHECK: parallel-after{{.*}}note: 'nullptr' invalidated here

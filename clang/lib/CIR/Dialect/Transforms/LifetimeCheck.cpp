@@ -9,6 +9,7 @@
 #include "PassDetail.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Threading.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "clang/Basic/Stack.h"
@@ -56,13 +57,15 @@ struct LocOrdering {
   }
 };
 
+struct FunctionAnalysisResult {
+  std::vector<mlir::Diagnostic> diagnostics;
+  bool failed = false;
+};
+
 using CallParameterKinds = SmallVector<std::optional<LifetimeParameterKind>, 8>;
 using FunctionLabelMap = DenseMap<StringAttr, Block *>;
 
-struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
-  LifetimeCheckPass() = default;
-  void runOnOperation() override;
-
+struct LifetimeCheckAnalysis {
   void checkFunc(cir::FuncOp fnOp);
   void checkCall(CallOp callOp,
                  ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds);
@@ -142,8 +145,8 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   // Tracks current module.
   ModuleOp theModule;
   // The module is read-only throughout lifetime analysis.
-  mlir::SymbolTable *moduleSymbols = nullptr;
-  const FunctionLabelMap *labelTargets = nullptr;
+  const mlir::SymbolTable *moduleSymbols = nullptr;
+  const FunctionLabelMap &labelTargets;
   // Track current function under analysis
   std::optional<FuncOp> currFunc;
 
@@ -213,33 +216,36 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
       histLimit = hist_limit;
     }
 
-    void parseOptions(LifetimeCheckPass &pass) {
-      llvm::SmallVector<llvm::StringRef, 4> remarks;
-      llvm::SmallVector<llvm::StringRef, 4> hists;
-
-      for (auto &r : pass.remarksList)
-        remarks.push_back(r);
-
-      for (auto &h : pass.historyList)
-        hists.push_back(h);
-
-      parseOptions(remarks, hists, pass.historyLimit);
-    }
-
-    bool emitRemarkAll() { return val & RemarkAll; }
-    bool emitRemarkPsetInvalid() {
+    bool emitRemarkAll() const { return val & RemarkAll; }
+    bool emitRemarkPsetInvalid() const {
       return emitRemarkAll() || val & RemarkPsetInvalid;
     }
-    bool emitRemarkPsetAlways() {
+    bool emitRemarkPsetAlways() const {
       return emitRemarkAll() || val & RemarkPsetAlways;
     }
 
-    bool emitHistoryAll() { return val & HistoryAll; }
-    bool emitHistoryNull() { return emitHistoryAll() || val & HistoryNull; }
-    bool emitHistoryInvalid() {
+    bool emitHistoryAll() const { return val & HistoryAll; }
+    bool emitHistoryNull() const {
+      return emitHistoryAll() || val & HistoryNull;
+    }
+    bool emitHistoryInvalid() const {
       return emitHistoryAll() || val & HistoryInvalid;
     }
-  } opts;
+  };
+  const Options opts;
+  FunctionAnalysisResult &functionResult;
+
+  LifetimeCheckAnalysis(ModuleOp module, const mlir::SymbolTable &symbols,
+                        const FunctionLabelMap &labels, const Options &options,
+                        FunctionAnalysisResult &result)
+      : theModule(module), moduleSymbols(&symbols), labelTargets(labels),
+        opts(options), functionResult(result) {}
+
+  void recordDiagnostic(mlir::InFlightDiagnostic &&diagnostic) {
+    functionResult.diagnostics.push_back(
+        std::move(*diagnostic.getUnderlyingDiagnostic()));
+    diagnostic.abandon();
+  }
 
   ///
   /// State
@@ -686,7 +692,7 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   // The legacy lifetime rules operate on the currently installed map. Install
   // all path-dependent maps together while applying one of those rules.
   class StateGuard {
-    LifetimeCheckPass &pass;
+    LifetimeCheckAnalysis &pass;
     PathState &state;
     PMapType *oldMap;
     PathState *oldState;
@@ -694,7 +700,7 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
     PMapNullHistType oldNullHistory;
 
   public:
-    StateGuard(LifetimeCheckPass &pass, PathState &state)
+    StateGuard(LifetimeCheckAnalysis &pass, PathState &state)
         : pass(pass), state(state), oldMap(pass.currPmap),
           oldState(pass.activeState), oldHistory(std::move(pass.invalidHist)),
           oldNullHistory(std::move(pass.pmapNullHist)) {
@@ -902,10 +908,10 @@ static Location getEndLocForHist(Operation *op) {
   return op->getLoc();
 }
 
-void LifetimeCheckPass::killInPset(mlir::Value ptrKey, const State &s,
-                                   InvalidStyle invalidStyle,
-                                   mlir::Location loc,
-                                   std::optional<mlir::Value> extraVal) {
+void LifetimeCheckAnalysis::killInPset(mlir::Value ptrKey, const State &s,
+                                       InvalidStyle invalidStyle,
+                                       mlir::Location loc,
+                                       std::optional<mlir::Value> extraVal) {
   auto &pset = getPmap()[ptrKey];
   if (pset.contains(s)) {
     pset.erase(s);
@@ -917,8 +923,8 @@ void LifetimeCheckPass::killInPset(mlir::Value ptrKey, const State &s,
 // in the pmap with invalid. For example, if pmap is {(p1,{a}), (p2,{a'})},
 // KILL(a') would invalidate only p2, and KILL(a) would invalidate both p1 and
 // p2.
-void LifetimeCheckPass::kill(const State &s, InvalidStyle invalidStyle,
-                             mlir::Location loc) {
+void LifetimeCheckAnalysis::kill(const State &s, InvalidStyle invalidStyle,
+                                 mlir::Location loc) {
   assert(s.hasValue() && "does not know how to kill other data types");
   mlir::Value v = s.getData();
   std::optional<mlir::Value> extraVal;
@@ -976,7 +982,8 @@ void LifetimeCheckPass::kill(const State &s, InvalidStyle invalidStyle,
   }
 }
 
-void LifetimeCheckPass::checkFunc(cir::FuncOp fnOp) {
+void LifetimeCheckAnalysis::checkFunc(cir::FuncOp fnOp) {
+  clang::noteBottomOfStack();
   currFunc = fnOp;
   pmapNullHist.clear();
   invalidHist.clear();
@@ -991,17 +998,17 @@ void LifetimeCheckPass::checkFunc(cir::FuncOp fnOp) {
       initializeObject(initial, entry.first, fnOp.getLoc());
   auto result = analyzeRegion(fnOp.getBody(), std::move(initial));
   if (!result.gotos.empty()) {
-    mlir::emitError(
+    recordDiagnostic(mlir::emitError(
         fnOp.getLoc(),
-        "unsupported jump into a nested region in lifetime analysis");
-    signalPassFailure();
+        "unsupported jump into a nested region in lifetime analysis"));
+    functionResult.failed = true;
   }
   result = leaveOperationScope(fnOp, std::move(result));
   emitWitnesses(result);
   currFunc.reset();
 }
 
-void LifetimeCheckPass::copyPset(mlir::Value dst, mlir::Value src) {
+void LifetimeCheckAnalysis::copyPset(mlir::Value dst, mlir::Value src) {
   if (dst == src)
     return;
 
@@ -1026,7 +1033,7 @@ void LifetimeCheckPass::copyPset(mlir::Value dst, mlir::Value src) {
   getPmap()[dst] = std::move(pset);
 }
 
-void LifetimeCheckPass::checkReturn(ReturnOp retOp) {
+void LifetimeCheckAnalysis::checkReturn(ReturnOp retOp) {
   // Upon return invalidate all local values. Since some return
   // values might depend on other local address, check for the
   // dangling aspects for this.
@@ -1051,7 +1058,7 @@ void LifetimeCheckPass::checkReturn(ReturnOp retOp) {
   currScope->localRetLambdas.try_emplace(loadOp.getAddr(), loadOp.getLoc());
 }
 
-bool LifetimeCheckPass::isOwnerType(mlir::Type ty) {
+bool LifetimeCheckAnalysis::isOwnerType(mlir::Type ty) {
   // From 2.1:
   //
   // An Owner uniquely owns another object (cannot dangle). An Owner type is
@@ -1081,7 +1088,7 @@ bool LifetimeCheckPass::isOwnerType(mlir::Type ty) {
   return lifetime && lifetime.getOwner();
 }
 
-bool LifetimeCheckPass::isSmartPointerType(mlir::Type ty) {
+bool LifetimeCheckAnalysis::isSmartPointerType(mlir::Type ty) {
   auto originalTy = ty;
   if (IsSmartPointerTyCache.count(originalTy))
     return IsSmartPointerTyCache[originalTy];
@@ -1096,7 +1103,7 @@ bool LifetimeCheckPass::isSmartPointerType(mlir::Type ty) {
   return result;
 }
 
-bool LifetimeCheckPass::isSkippableTemporary(mlir::Value v) {
+bool LifetimeCheckAnalysis::isSkippableTemporary(mlir::Value v) {
   auto allocaOp = v.getDefiningOp<cir::AllocaOp>();
   if (!allocaOp)
     return false;
@@ -1124,7 +1131,7 @@ static bool containsPointerElts(cir::RecordType s) {
   });
 }
 
-static bool isAggregateType(LifetimeCheckPass *pass, mlir::Type agg) {
+static bool isAggregateType(LifetimeCheckAnalysis *pass, mlir::Type agg) {
   auto t = mlir::dyn_cast<cir::RecordType>(agg);
   if (!t)
     return false;
@@ -1143,7 +1150,7 @@ static bool isAggregateType(LifetimeCheckPass *pass, mlir::Type agg) {
   return containsPointerElts(t);
 }
 
-bool LifetimeCheckPass::isPointerType(mlir::Type t) {
+bool LifetimeCheckAnalysis::isPointerType(mlir::Type t) {
   // From 2.1:
   //
   // A Pointer is not an Owner and provides indirect access to an object it does
@@ -1184,7 +1191,7 @@ bool LifetimeCheckPass::isPointerType(mlir::Type t) {
   return lifetime && lifetime.getPointer();
 }
 
-void LifetimeCheckPass::checkCoroTaskStore(StoreOp storeOp) {
+void LifetimeCheckAnalysis::checkCoroTaskStore(StoreOp storeOp) {
   // Given:
   //  auto task = [init task];
   // Extend pset(task) such that:
@@ -1226,7 +1233,7 @@ void LifetimeCheckPass::checkCoroTaskStore(StoreOp storeOp) {
   llvm_unreachable("expecting cir.call defining op");
 }
 
-mlir::Value LifetimeCheckPass::getLambdaFromMemberAccess(mlir::Value addr) {
+mlir::Value LifetimeCheckAnalysis::getLambdaFromMemberAccess(mlir::Value addr) {
   // FIXME: we likely want to consider more indirections here...
   auto op = addr.getDefiningOp<cir::GetMemberOp>();
   if (!op)
@@ -1237,7 +1244,7 @@ mlir::Value LifetimeCheckPass::getLambdaFromMemberAccess(mlir::Value addr) {
   return allocaOp;
 }
 
-void LifetimeCheckPass::checkLambdaCaptureStore(StoreOp storeOp) {
+void LifetimeCheckAnalysis::checkLambdaCaptureStore(StoreOp storeOp) {
   auto localByRefAddr = storeOp.getValue();
   auto lambdaCaptureAddr = storeOp.getAddr();
 
@@ -1251,9 +1258,8 @@ void LifetimeCheckPass::checkLambdaCaptureStore(StoreOp storeOp) {
     getPmap()[lambdaAddr].insert(State::getLocalValue(localByRefAddr));
 }
 
-void LifetimeCheckPass::updatePointsToForConstRecord(mlir::Value addr,
-                                                     cir::ConstRecordAttr value,
-                                                     mlir::Location loc) {
+void LifetimeCheckAnalysis::updatePointsToForConstRecord(
+    mlir::Value addr, cir::ConstRecordAttr value, mlir::Location loc) {
   assert(aggregates.count(addr) && "expected association with aggregate");
   int memberIdx = 0;
   for (auto &attr : value.getMembers()) {
@@ -1268,9 +1274,9 @@ void LifetimeCheckPass::updatePointsToForConstRecord(mlir::Value addr,
   }
 }
 
-void LifetimeCheckPass::updatePointsToForConstPointer(mlir::Value addr,
-                                                      mlir::TypedAttr value,
-                                                      mlir::Location loc) {
+void LifetimeCheckAnalysis::updatePointsToForConstPointer(mlir::Value addr,
+                                                          mlir::TypedAttr value,
+                                                          mlir::Location loc) {
   if (isa<cir::UndefAttr, cir::PoisonAttr>(value)) {
     getPmap()[addr].clear();
     markPsetInvalid(addr, InvalidStyle::NotInitialized, loc);
@@ -1289,9 +1295,9 @@ void LifetimeCheckPass::updatePointsToForConstPointer(mlir::Value addr,
   getPmap()[addr].insert(State::getGlobal());
 }
 
-void LifetimeCheckPass::updatePointsToForZeroRecord(mlir::Value addr,
-                                                    RecordType sTy,
-                                                    mlir::Location loc) {
+void LifetimeCheckAnalysis::updatePointsToForZeroRecord(mlir::Value addr,
+                                                        RecordType sTy,
+                                                        mlir::Location loc) {
   assert(aggregates.count(addr) && "expected association with aggregate");
   int memberIdx = 0;
   for (auto &t : sTy.getMembers()) {
@@ -1317,8 +1323,8 @@ static mlir::Operation *ignoreBitcasts(mlir::Operation *op) {
   return op;
 }
 
-void LifetimeCheckPass::updatePointsTo(mlir::Value addr, mlir::Value data,
-                                       mlir::Location loc) {
+void LifetimeCheckAnalysis::updatePointsTo(mlir::Value addr, mlir::Value data,
+                                           mlir::Location loc) {
 
   auto getArrayFromSubscript = [&](PtrStrideOp strideOp) -> mlir::Value {
     auto castOp = strideOp.getBase().getDefiningOp<cir::CastOp>();
@@ -1421,10 +1427,10 @@ void LifetimeCheckPass::updatePointsTo(mlir::Value addr, mlir::Value data,
   // What should we add next?
 }
 
-void LifetimeCheckPass::emitInvalidHistory(mlir::InFlightDiagnostic &D,
-                                           mlir::Value histKey,
-                                           mlir::Location warningLoc,
-                                           DerefStyle derefStyle) {
+void LifetimeCheckAnalysis::emitInvalidHistory(mlir::InFlightDiagnostic &D,
+                                               mlir::Value histKey,
+                                               mlir::Location warningLoc,
+                                               DerefStyle derefStyle) {
   assert(invalidHist.count(histKey) && "expected invalid hist");
   auto &hist = invalidHist[histKey];
   unsigned limit = opts.histLimit;
@@ -1475,8 +1481,9 @@ void LifetimeCheckPass::emitInvalidHistory(mlir::InFlightDiagnostic &D,
   }
 }
 
-bool LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
-                                          DerefStyle derefStyle) {
+bool LifetimeCheckAnalysis::checkPointerDeref(mlir::Value addr,
+                                              mlir::Location loc,
+                                              DerefStyle derefStyle) {
   bool hasInvalid = getPmap()[addr].count(State::getInvalid());
   bool hasNullptr = getPmap()[addr].count(State::getNullPtr());
 
@@ -1504,7 +1511,7 @@ bool LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
     llvm::SmallString<128> psetStr;
     llvm::raw_svector_ostream Out(psetStr);
     printPset(getPmap()[addr], Out);
-    emitRemark(loc) << "pset => " << Out.str();
+    recordDiagnostic(emitRemark(loc) << "pset => " << Out.str());
   };
 
   bool psetRemarkEmitted = false;
@@ -1574,17 +1581,18 @@ bool LifetimeCheckPass::checkPointerDeref(mlir::Value addr, mlir::Location loc,
   if (!psetRemarkEmitted && opts.emitRemarkPsetInvalid())
     emitPsetRemark();
 
+  recordDiagnostic(std::move(D));
   return true; // Error was reported
 }
 
-static FuncOp getCalleeFromSymbol(mlir::SymbolTable &symbols,
+static FuncOp getCalleeFromSymbol(const mlir::SymbolTable &symbols,
                                   llvm::StringRef name) {
   auto global = symbols.lookup(name);
   assert(global && "expected to find symbol for function");
   return dyn_cast<FuncOp>(global);
 }
 
-static cir::LifetimeFunctionAttr getMethod(mlir::SymbolTable &symbols,
+static cir::LifetimeFunctionAttr getMethod(const mlir::SymbolTable &symbols,
                                            CallOp callOp) {
   if (!callOp.getCallee())
     return nullptr;
@@ -1597,7 +1605,7 @@ static cir::LifetimeFunctionAttr getMethod(mlir::SymbolTable &symbols,
                                             : cir::LifetimeFunctionAttr{};
 }
 
-mlir::Value LifetimeCheckPass::getThisParamPointerCategory(CallOp callOp) {
+mlir::Value LifetimeCheckAnalysis::getThisParamPointerCategory(CallOp callOp) {
   if (callOp.getNumArgOperands() == 0)
     return {};
   auto thisptr = callOp.getArgOperand(0);
@@ -1617,7 +1625,7 @@ mlir::Value LifetimeCheckPass::getThisParamPointerCategory(CallOp callOp) {
   return {};
 }
 
-mlir::Value LifetimeCheckPass::getThisParamOwnerCategory(CallOp callOp) {
+mlir::Value LifetimeCheckAnalysis::getThisParamOwnerCategory(CallOp callOp) {
   if (callOp.getNumArgOperands() == 0)
     return {};
   auto thisptr = callOp.getArgOperand(0);
@@ -1637,8 +1645,8 @@ mlir::Value LifetimeCheckPass::getThisParamOwnerCategory(CallOp callOp) {
   return {};
 }
 
-void LifetimeCheckPass::checkMoveAssignment(CallOp callOp,
-                                            cir::LifetimeFunctionAttr m) {
+void LifetimeCheckAnalysis::checkMoveAssignment(CallOp callOp,
+                                                cir::LifetimeFunctionAttr m) {
   if (callOp.getNumArgOperands() < 2)
     return;
   // MyPointer::operator=(MyPointer&&)(%dst, %src)
@@ -1677,8 +1685,8 @@ void LifetimeCheckPass::checkMoveAssignment(CallOp callOp,
   }
 }
 
-void LifetimeCheckPass::checkCopyAssignment(CallOp callOp,
-                                            cir::LifetimeFunctionAttr m) {
+void LifetimeCheckAnalysis::checkCopyAssignment(CallOp callOp,
+                                                cir::LifetimeFunctionAttr m) {
   if (callOp.getNumArgOperands() < 2)
     return;
   // MyIntOwner::operator=(MyIntOwner&)(%dst, %src)
@@ -1703,7 +1711,7 @@ void LifetimeCheckPass::checkCopyAssignment(CallOp callOp,
 // Example:
 //  MyIntPointer::MyIntPointer(MyIntOwner const&)(%5, %4)
 //
-bool LifetimeCheckPass::isCtorInitPointerFromOwner(CallOp callOp) {
+bool LifetimeCheckAnalysis::isCtorInitPointerFromOwner(CallOp callOp) {
   if (callOp.getNumArgOperands() < 2)
     return false;
 
@@ -1717,7 +1725,7 @@ bool LifetimeCheckPass::isCtorInitPointerFromOwner(CallOp callOp) {
   return false;
 }
 
-void LifetimeCheckPass::checkCtor(CallOp callOp, cir::CXXCtorAttr ctor) {
+void LifetimeCheckAnalysis::checkCtor(CallOp callOp, cir::CXXCtorAttr ctor) {
   if (callOp.getNumArgOperands() == 0)
     return;
   if ((ctor.getCtorKind() == cir::CtorKind::Copy ||
@@ -1778,8 +1786,8 @@ void LifetimeCheckPass::checkCtor(CallOp callOp, cir::CXXCtorAttr ctor) {
   }
 }
 
-void LifetimeCheckPass::checkOperators(CallOp callOp,
-                                       cir::LifetimeFunctionAttr m) {
+void LifetimeCheckAnalysis::checkOperators(CallOp callOp,
+                                           cir::LifetimeFunctionAttr m) {
   auto addr = getThisParamOwnerCategory(callOp);
 
   if (addr) {
@@ -1823,15 +1831,15 @@ void LifetimeCheckPass::checkOperators(CallOp callOp,
 }
 
 mlir::Value
-LifetimeCheckPass::getNonConstUseOfOwner(CallOp callOp,
-                                         cir::LifetimeFunctionAttr m) {
+LifetimeCheckAnalysis::getNonConstUseOfOwner(CallOp callOp,
+                                             cir::LifetimeFunctionAttr m) {
   if (m.getIsConst())
     return {};
   return getThisParamOwnerCategory(callOp);
 }
 
-void LifetimeCheckPass::checkNonConstUseOfOwner(mlir::Value ownerAddr,
-                                                mlir::Location loc) {
+void LifetimeCheckAnalysis::checkNonConstUseOfOwner(mlir::Value ownerAddr,
+                                                    mlir::Location loc) {
   // 2.4.2 - On every non-const use of a local Owner o:
   //
   // - For each entry e in pset(s): Remove e from pset(s), and if no other
@@ -1846,8 +1854,8 @@ void LifetimeCheckPass::checkNonConstUseOfOwner(mlir::Value ownerAddr,
   return;
 }
 
-void LifetimeCheckPass::markOwnerAsMovedFrom(mlir::Value addr,
-                                             mlir::Location loc) {
+void LifetimeCheckAnalysis::markOwnerAsMovedFrom(mlir::Value addr,
+                                                 mlir::Location loc) {
   // Don't mark temporaries as moved-from - they're about to be destroyed
   if (isSkippableTemporary(addr))
     return;
@@ -1858,16 +1866,16 @@ void LifetimeCheckPass::markOwnerAsMovedFrom(mlir::Value addr,
   markPsetInvalid(addr, InvalidStyle::MovedFrom, loc);
 }
 
-bool LifetimeCheckPass::isValueType(mlir::Value addr) {
+bool LifetimeCheckAnalysis::isValueType(mlir::Value addr) {
   return !owners.count(addr) && !ptrs.count(addr);
 }
 
-bool LifetimeCheckPass::hasInvalidState(mlir::Value addr) {
+bool LifetimeCheckAnalysis::hasInvalidState(mlir::Value addr) {
   return getPmap().count(addr) && getPmap()[addr].count(State::getInvalid());
 }
 
-void LifetimeCheckPass::markPointerOrValueTypeAsMovedFrom(mlir::Value addr,
-                                                          mlir::Location loc) {
+void LifetimeCheckAnalysis::markPointerOrValueTypeAsMovedFrom(
+    mlir::Value addr, mlir::Location loc) {
   // Don't mark temporaries as moved-from
   if (isSkippableTemporary(addr))
     return;
@@ -1891,12 +1899,14 @@ void LifetimeCheckPass::markPointerOrValueTypeAsMovedFrom(mlir::Value addr,
 // This is specific to std::unique_ptr and std::shared_ptr because they have
 // well-defined null-after-move semantics. Other owner types may have different
 // contracts for moved-from state.
-bool LifetimeCheckPass::isSmartPointerSafeMethod(llvm::StringRef methodName) {
+bool LifetimeCheckAnalysis::isSmartPointerSafeMethod(
+    llvm::StringRef methodName) {
   return methodName == "get" || methodName == "release" ||
          methodName == "reset" || methodName == "operator bool";
 }
 
-void LifetimeCheckPass::checkMoveCtor(CallOp callOp, cir::CXXCtorAttr ctor) {
+void LifetimeCheckAnalysis::checkMoveCtor(CallOp callOp,
+                                          cir::CXXCtorAttr ctor) {
   // Move constructors are already marked via CXXCtorAttr with CtorKind::Move
   // (set during CIRGen in CIRGenModule.cpp). This attribute is part of
   // CIR_CXXSpecialMemberAttr attached to FuncOp, which also includes move
@@ -1962,7 +1972,7 @@ resolveCallParameterKinds(CallOp callOp, LifetimeFunctionAttr lifetime) {
   return kinds;
 }
 
-void LifetimeCheckPass::checkForOwnerAndPointerArguments(
+void LifetimeCheckAnalysis::checkForOwnerAndPointerArguments(
     CallOp callOp, unsigned firstArgIdx,
     ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds) {
   auto numOperands = callOp.getNumArgOperands();
@@ -2026,7 +2036,7 @@ void LifetimeCheckPass::checkForOwnerAndPointerArguments(
       checkPointerDeref(p, callOp.getLoc(), DerefStyle::NullableCallParam);
 }
 
-void LifetimeCheckPass::checkOtherMethodsAndFunctions(
+void LifetimeCheckAnalysis::checkOtherMethodsAndFunctions(
     CallOp callOp, cir::LifetimeFunctionAttr m,
     ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds) {
   unsigned firstArgIdx = 0;
@@ -2042,7 +2052,7 @@ void LifetimeCheckPass::checkOtherMethodsAndFunctions(
   checkForOwnerAndPointerArguments(callOp, firstArgIdx, parameterKinds);
 }
 
-bool LifetimeCheckPass::isOwnerOrPointerClassMethod(
+bool LifetimeCheckAnalysis::isOwnerOrPointerClassMethod(
     CallOp callOp, cir::LifetimeFunctionAttr m) {
   // For the sake of analysis, these behave like regular functions
   if (!m || !m.getIsMethod() || !m.getHasImplicitObject())
@@ -2052,7 +2062,7 @@ bool LifetimeCheckPass::isOwnerOrPointerClassMethod(
          getThisParamOwnerCategory(callOp);
 }
 
-bool LifetimeCheckPass::isLambdaType(mlir::Type ty) {
+bool LifetimeCheckAnalysis::isLambdaType(mlir::Type ty) {
   if (IsLambdaTyCache.count(ty))
     return IsLambdaTyCache[ty];
 
@@ -2067,7 +2077,7 @@ bool LifetimeCheckPass::isLambdaType(mlir::Type ty) {
   return IsLambdaTyCache[ty];
 }
 
-bool LifetimeCheckPass::isTaskType(mlir::Value taskVal) {
+bool LifetimeCheckAnalysis::isTaskType(mlir::Value taskVal) {
   auto ty = taskVal.getType();
   if (IsTaskTyCache.count(ty))
     return IsTaskTyCache[ty];
@@ -2084,7 +2094,7 @@ bool LifetimeCheckPass::isTaskType(mlir::Value taskVal) {
   return result;
 }
 
-void LifetimeCheckPass::trackCallToCoroutine(CallOp callOp) {
+void LifetimeCheckAnalysis::trackCallToCoroutine(CallOp callOp) {
   if (auto fnName = callOp.getCallee()) {
     auto calleeFuncOp = getCalleeFromSymbol(*moduleSymbols, *fnName);
     if (calleeFuncOp &&
@@ -2105,7 +2115,7 @@ void LifetimeCheckPass::trackCallToCoroutine(CallOp callOp) {
   }
 }
 
-void LifetimeCheckPass::checkCall(
+void LifetimeCheckAnalysis::checkCall(
     CallOp callOp,
     ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds) {
   if (callOp.getNumArgOperands() == 0)
@@ -2304,9 +2314,9 @@ static void appendUnique(SmallVector<Value, 16> &to, ArrayRef<Value> from) {
       to.push_back(value);
 }
 
-LifetimeCheckPass::ObjectTargets
-LifetimeCheckPass::joinTargets(const ObjectTargets &a,
-                               const ObjectTargets &b) const {
+LifetimeCheckAnalysis::ObjectTargets
+LifetimeCheckAnalysis::joinTargets(const ObjectTargets &a,
+                                   const ObjectTargets &b) const {
   ObjectTargets result = a;
   appendUnique(result.objects, ArrayRef<ObjectId>(b.objects));
   llvm::sort(result.objects, [](Value a, Value b) {
@@ -2319,9 +2329,9 @@ LifetimeCheckPass::joinTargets(const ObjectTargets &a,
   return result;
 }
 
-LifetimeCheckPass::ValueSummary
-LifetimeCheckPass::joinValues(const ValueSummary &a,
-                              const ValueSummary &b) const {
+LifetimeCheckAnalysis::ValueSummary
+LifetimeCheckAnalysis::joinValues(const ValueSummary &a,
+                                  const ValueSummary &b) const {
   ValueSummary result = a;
   if (a.pointer && b.pointer) {
     result.pointer->targets =
@@ -2386,16 +2396,17 @@ LifetimeCheckPass::joinValues(const ValueSummary &a,
   return result;
 }
 
-std::optional<LifetimeCheckPass::ObjectInfo>
-LifetimeCheckPass::getObjectInfo(ObjectId object) const {
+std::optional<LifetimeCheckAnalysis::ObjectInfo>
+LifetimeCheckAnalysis::getObjectInfo(ObjectId object) const {
   auto found = objectInfo.find(object);
   if (found == objectInfo.end())
     return std::nullopt;
   return found->second;
 }
 
-LifetimeCheckPass::ObjectTargets
-LifetimeCheckPass::resolveAddress(Value address, const PathState &state) const {
+LifetimeCheckAnalysis::ObjectTargets
+LifetimeCheckAnalysis::resolveAddress(Value address,
+                                      const PathState &state) const {
   auto canonical = canonicalObjects.find(address);
   if (canonical != canonicalObjects.end())
     return {{canonical->second}};
@@ -2421,8 +2432,9 @@ LifetimeCheckPass::resolveAddress(Value address, const PathState &state) const {
   return result;
 }
 
-LifetimeCheckPass::ValueSummary
-LifetimeCheckPass::summarizeValue(Value value, const PathState &state) const {
+LifetimeCheckAnalysis::ValueSummary
+LifetimeCheckAnalysis::summarizeValue(Value value,
+                                      const PathState &state) const {
   if (auto found = state.values.find(value); found != state.values.end())
     return found->second;
   ValueSummary summary;
@@ -2500,8 +2512,8 @@ LifetimeCheckPass::summarizeValue(Value value, const PathState &state) const {
   return summary;
 }
 
-void LifetimeCheckPass::setValueSummary(PathState &state, Value value,
-                                        ValueSummary summary) {
+void LifetimeCheckAnalysis::setValueSummary(PathState &state, Value value,
+                                            ValueSummary summary) {
   // An SSA operation can execute again in a loop. A predicate from an older
   // iteration must not restore the old execution's value at the same SSA ID.
   visitPredicates(state, [&](std::optional<ValuePredicate> &predicate) {
@@ -2516,9 +2528,9 @@ void LifetimeCheckPass::setValueSummary(PathState &state, Value value,
   state.values[value] = std::move(summary);
 }
 
-void LifetimeCheckPass::storeSummary(PathState &state,
-                                     const ObjectTargets &targets,
-                                     const ValueSummary &summary) {
+void LifetimeCheckAnalysis::storeSummary(PathState &state,
+                                         const ObjectTargets &targets,
+                                         const ValueSummary &summary) {
   invalidatePredicates(state, targets);
   for (ObjectId object : targets.objects) {
     if (targets.isDefinite())
@@ -2529,9 +2541,9 @@ void LifetimeCheckPass::storeSummary(PathState &state,
   }
 }
 
-LifetimeCheckPass::OccupancySummary
-LifetimeCheckPass::getOccupancy(const PathState &state,
-                                const ObjectTargets &targets) const {
+LifetimeCheckAnalysis::OccupancySummary
+LifetimeCheckAnalysis::getOccupancy(const PathState &state,
+                                    const ObjectTargets &targets) const {
   OccupancySummary result;
   result.unknown = targets.unknown || targets.mayBeInvalid || targets.mayBeNull;
   if (targets.objects.empty())
@@ -2551,10 +2563,10 @@ LifetimeCheckPass::getOccupancy(const PathState &state,
   return result;
 }
 
-void LifetimeCheckPass::setOccupancy(PathState &state,
-                                     const ObjectTargets &targets,
-                                     const OccupancySummary &occupancy,
-                                     Location loc) {
+void LifetimeCheckAnalysis::setOccupancy(PathState &state,
+                                         const ObjectTargets &targets,
+                                         const OccupancySummary &occupancy,
+                                         Location loc) {
   invalidatePredicates(state, targets);
   for (ObjectId object : targets.objects) {
     auto value = occupancy;
@@ -2571,9 +2583,9 @@ void LifetimeCheckPass::setOccupancy(PathState &state,
   }
 }
 
-void LifetimeCheckPass::reinitializeObjects(PathState &state,
-                                            const ObjectTargets &targets,
-                                            Location loc) {
+void LifetimeCheckAnalysis::reinitializeObjects(PathState &state,
+                                                const ObjectTargets &targets,
+                                                Location loc) {
   invalidatePredicates(state, targets);
   for (ObjectId object : targets.objects) {
     auto info = getObjectInfo(object);
@@ -2595,7 +2607,7 @@ void LifetimeCheckPass::reinitializeObjects(PathState &state,
   }
 }
 
-void LifetimeCheckPass::detachOwner(PathState &state, ObjectId owner) {
+void LifetimeCheckAnalysis::detachOwner(PathState &state, ObjectId owner) {
   invalidateConditionalOwnership(state, owner);
   state.ownershipGroups.erase(owner);
   for (auto &entry : state.ownershipGroups)
@@ -2608,9 +2620,10 @@ void LifetimeCheckPass::detachOwner(PathState &state, ObjectId owner) {
     state.ownershipGroups.erase(object);
 }
 
-void LifetimeCheckPass::retargetOwnerContents(PathState &state, ObjectId source,
-                                              ObjectId destination,
-                                              bool retainSource) {
+void LifetimeCheckAnalysis::retargetOwnerContents(PathState &state,
+                                                  ObjectId source,
+                                                  ObjectId destination,
+                                                  bool retainSource) {
   invalidateConditionalDependencies(state, source, false);
   for (auto &entry : state.pmap) {
     // The holder's own initializedness is separate from pointers borrowing its
@@ -2641,10 +2654,9 @@ void LifetimeCheckPass::retargetOwnerContents(PathState &state, ObjectId source,
     visitValueSummary(entry.second, retarget);
 }
 
-void LifetimeCheckPass::transferOwnerContents(PathState &state,
-                                              const ObjectTargets &destinations,
-                                              const ObjectTargets &sources,
-                                              bool sharedCopy) {
+void LifetimeCheckAnalysis::transferOwnerContents(
+    PathState &state, const ObjectTargets &destinations,
+    const ObjectTargets &sources, bool sharedCopy) {
   if (!destinations.isDefinite() || !sources.isDefinite()) {
     // An uncertain move can associate a borrower with either holder. Retain
     // both possible dependencies; neither is a guaranteed co-owner.
@@ -2683,9 +2695,9 @@ void LifetimeCheckPass::transferOwnerContents(PathState &state,
       state.ownershipGroups[holder] = holders;
 }
 
-void LifetimeCheckPass::endOwnerContents(PathState &state,
-                                         const ObjectTargets &targets,
-                                         Location loc, InvalidStyle style) {
+void LifetimeCheckAnalysis::endOwnerContents(PathState &state,
+                                             const ObjectTargets &targets,
+                                             Location loc, InvalidStyle style) {
   auto end = [&] {
     for (ObjectId owner : targets.objects) {
       ObjectId survivor;
@@ -2716,9 +2728,9 @@ void LifetimeCheckPass::endOwnerContents(PathState &state,
   }
 }
 
-void LifetimeCheckPass::releaseOwnerContents(PathState &state,
-                                             const ObjectTargets &targets,
-                                             Location loc) {
+void LifetimeCheckAnalysis::releaseOwnerContents(PathState &state,
+                                                 const ObjectTargets &targets,
+                                                 Location loc) {
   invalidatePredicates(state, targets);
   // Only a definite release can remove a dependency. A may-release leaves the
   // original dependency because the resource may still belong to that holder.
@@ -2736,9 +2748,8 @@ void LifetimeCheckPass::releaseOwnerContents(PathState &state,
   retargetOwnerContents(state, owner, survivor);
 }
 
-void LifetimeCheckPass::invalidateOwnerContents(PathState &state,
-                                                const ObjectTargets &targets,
-                                                Location loc) {
+void LifetimeCheckAnalysis::invalidateOwnerContents(
+    PathState &state, const ObjectTargets &targets, Location loc) {
   endOwnerContents(state, targets, loc, InvalidStyle::NonConstUseOfOwner);
   auto advance = [&] {
     for (ObjectId owner : targets.objects)
@@ -2753,17 +2764,17 @@ void LifetimeCheckPass::invalidateOwnerContents(PathState &state,
   }
 }
 
-void LifetimeCheckPass::replaceOwnerContents(PathState &state,
-                                             const ObjectTargets &targets,
-                                             const OccupancySummary &occupancy,
-                                             Operation *operation) {
+void LifetimeCheckAnalysis::replaceOwnerContents(
+    PathState &state, const ObjectTargets &targets,
+    const OccupancySummary &occupancy, Operation *operation) {
   invalidateOwnerContents(state, targets, operation->getLoc());
   reinitializeObjects(state, targets, operation->getLoc());
   setOccupancy(state, targets, occupancy, operation->getLoc());
 }
 
-void LifetimeCheckPass::markMoved(PathState &state,
-                                  const ObjectTargets &targets, Location loc) {
+void LifetimeCheckAnalysis::markMoved(PathState &state,
+                                      const ObjectTargets &targets,
+                                      Location loc) {
   invalidatePredicates(state, targets);
   auto &history = activeState == &state ? invalidHist : state.invalidHist;
   for (ObjectId object : targets.objects) {
@@ -2793,8 +2804,9 @@ void LifetimeCheckPass::markMoved(PathState &state,
   }
 }
 
-bool LifetimeCheckPass::checkUse(PathState &state, const ObjectTargets &targets,
-                                 Location loc, DerefStyle style) {
+bool LifetimeCheckAnalysis::checkUse(PathState &state,
+                                     const ObjectTargets &targets, Location loc,
+                                     DerefStyle style) {
   auto check = [&] {
     bool invalid = false;
     for (ObjectId object : targets.objects)
@@ -2807,7 +2819,7 @@ bool LifetimeCheckPass::checkUse(PathState &state, const ObjectTargets &targets,
   return check();
 }
 
-void LifetimeCheckPass::indexObjects(FuncOp function) {
+void LifetimeCheckAnalysis::indexObjects(FuncOp function) {
   objectInfo.clear();
   canonicalObjects.clear();
   scopeLocals.clear();
@@ -2920,8 +2932,8 @@ void LifetimeCheckPass::indexObjects(FuncOp function) {
   }
 }
 
-void LifetimeCheckPass::initializeObject(PathState &state, ObjectId object,
-                                         Location loc) {
+void LifetimeCheckAnalysis::initializeObject(PathState &state, ObjectId object,
+                                             Location loc) {
   auto info = getObjectInfo(object);
   if (!info)
     return;
@@ -2955,7 +2967,7 @@ void LifetimeCheckPass::initializeObject(PathState &state, ObjectId object,
         initializeObject(state, field, loc);
 }
 
-void LifetimeCheckPass::synchronizeSummaries(PathState &state) {
+void LifetimeCheckAnalysis::synchronizeSummaries(PathState &state) {
   for (ObjectId pointer : ptrs) {
     auto found = state.pmap.find(pointer);
     if (found == state.pmap.end())
@@ -2986,8 +2998,8 @@ void LifetimeCheckPass::synchronizeSummaries(PathState &state) {
   }
 }
 
-void LifetimeCheckPass::checkAddressUse(Value address, Location loc,
-                                        PathState &state) {
+void LifetimeCheckAnalysis::checkAddressUse(Value address, Location loc,
+                                            PathState &state) {
   auto summary = summarizeValue(address, state);
   if (!summary.pointer || (!summary.pointer->targets.mayBeNull &&
                            !summary.pointer->targets.mayBeInvalid))
@@ -3021,7 +3033,7 @@ void LifetimeCheckPass::checkAddressUse(Value address, Location loc,
   recordWitness(state, std::move(witness));
 }
 
-void LifetimeCheckPass::transferLoad(LoadOp load, PathState &state) {
+void LifetimeCheckAnalysis::transferLoad(LoadOp load, PathState &state) {
   checkAddressUse(load.getAddr(), load.getLoc(), state);
   if (auto field = load.getAddr().getDefiningOp<GetMemberOp>()) {
     auto parents = resolveAddress(field.getAddr(), state);
@@ -3088,7 +3100,7 @@ void LifetimeCheckPass::transferLoad(LoadOp load, PathState &state) {
                                     load.getResult(), false);
 }
 
-void LifetimeCheckPass::forgetAggregateCallFields(
+void LifetimeCheckAnalysis::forgetAggregateCallFields(
     PathState &state, const ObjectTargets &targets) {
   // A returned record overwrites the destination's old member contents. Only
   // forget fields already tracked by the pointer-lifetime model; the opaque
@@ -3121,7 +3133,7 @@ void LifetimeCheckPass::forgetAggregateCallFields(
   }
 }
 
-void LifetimeCheckPass::transferStore(StoreOp store, PathState &state) {
+void LifetimeCheckAnalysis::transferStore(StoreOp store, PathState &state) {
   checkAddressUse(store.getAddr(), store.getLoc(), state);
   ObjectTargets targets = resolveAddress(store.getAddr(), state);
   ValueSummary summary = summarizeValue(store.getValue(), state);
@@ -3206,7 +3218,7 @@ void LifetimeCheckPass::transferStore(StoreOp store, PathState &state) {
   }
 }
 
-void LifetimeCheckPass::transferCopy(CopyOp copy, PathState &state) {
+void LifetimeCheckAnalysis::transferCopy(CopyOp copy, PathState &state) {
   // The existing copy model transfers pointer-like record payloads, not
   // arbitrary boolean subobjects. A bulk write can overwrite those subobjects
   // or previously escaped storage, including when the copy itself is unmodeled.
@@ -3298,7 +3310,7 @@ void LifetimeCheckPass::transferCopy(CopyOp copy, PathState &state) {
                                     destinations.objects.front(), true);
 }
 
-void LifetimeCheckPass::visitPredicates(
+void LifetimeCheckAnalysis::visitPredicates(
     PathState &state,
     llvm::function_ref<void(std::optional<ValuePredicate> &)> visit) {
   auto visitValue = [&](ValueSummary &value) {
@@ -3320,8 +3332,8 @@ void LifetimeCheckPass::visitPredicates(
     visitValueSummary(entry.second, visitValue);
 }
 
-void LifetimeCheckPass::invalidatePredicates(PathState &state,
-                                             const ObjectTargets &targets) {
+void LifetimeCheckAnalysis::invalidatePredicates(PathState &state,
+                                                 const ObjectTargets &targets) {
   auto affected = [&](ObjectId object) {
     return targets.unknown || llvm::is_contained(targets.objects, object);
   };
@@ -3353,9 +3365,9 @@ void LifetimeCheckPass::invalidatePredicates(PathState &state,
     state.lastWrites[object] = activeOperation;
 }
 
-void LifetimeCheckPass::invalidateConditionalDependencies(PathState &state,
-                                                          ObjectId object,
-                                                          bool storage) {
+void LifetimeCheckAnalysis::invalidateConditionalDependencies(PathState &state,
+                                                              ObjectId object,
+                                                              bool storage) {
   auto affected = [&](const std::optional<PointerValueSummary> &pointer) {
     return pointer &&
            (llvm::is_contained(pointer->borrowedOwners, object) ||
@@ -3382,8 +3394,8 @@ void LifetimeCheckPass::invalidateConditionalDependencies(PathState &state,
   });
 }
 
-void LifetimeCheckPass::invalidateConditionalOwnership(PathState &state,
-                                                       ObjectId object) {
+void LifetimeCheckAnalysis::invalidateConditionalOwnership(PathState &state,
+                                                           ObjectId object) {
   visitPredicates(state, [&](std::optional<ValuePredicate> &predicate) {
     if (!predicate || predicate->domain != ValuePredicate::ConditionalMove)
       return;
@@ -3395,7 +3407,7 @@ void LifetimeCheckPass::invalidateConditionalOwnership(PathState &state,
   });
 }
 
-void LifetimeCheckPass::copyConditionalPointerSnapshots(
+void LifetimeCheckAnalysis::copyConditionalPointerSnapshots(
     PathState &state, Value source, bool sourceStored, Value destination,
     bool destinationStored) {
   visitPredicates(state, [&](std::optional<ValuePredicate> &predicate) {
@@ -3473,11 +3485,10 @@ void LifetimeCheckPass::copyConditionalPointerSnapshots(
   });
 }
 
-LifetimeCheckPass::ValuePredicate
-LifetimeCheckPass::makeConditionalMovePredicate(const PathState &before,
-                                                const PathState &after,
-                                                const ObjectTargets &targets,
-                                                Operation *site) {
+LifetimeCheckAnalysis::ValuePredicate
+LifetimeCheckAnalysis::makeConditionalMovePredicate(
+    const PathState &before, const PathState &after,
+    const ObjectTargets &targets, Operation *site) {
   ValuePredicate predicate;
   predicate.domain = ValuePredicate::ConditionalMove;
   predicate.objects = targets;
@@ -3562,7 +3573,7 @@ LifetimeCheckPass::makeConditionalMovePredicate(const PathState &before,
   return predicate;
 }
 
-void LifetimeCheckPass::setConditionalMoveSite(
+void LifetimeCheckAnalysis::setConditionalMoveSite(
     PathState &state, const ValuePredicate &predicate) {
   for (const auto &snapshot : predicate.before)
     state.lastWrites[snapshot.object] = predicate.conditionSite;
@@ -3571,8 +3582,8 @@ void LifetimeCheckPass::setConditionalMoveSite(
       state.lastWrites[snapshot.value] = predicate.conditionSite;
 }
 
-void LifetimeCheckPass::joinStateInto(PathState &result,
-                                      const PathState &state) {
+void LifetimeCheckAnalysis::joinStateInto(PathState &result,
+                                          const PathState &state) {
   assert(&result != &state && "join inputs must not alias");
   for (const auto &entry : state.pmap)
     llvm::set_union(result.pmap[entry.first], entry.second);
@@ -3663,8 +3674,8 @@ void LifetimeCheckPass::joinStateInto(PathState &result,
   }
 }
 
-LifetimeCheckPass::PathState
-LifetimeCheckPass::joinStates(ArrayRef<const PathState *> states) {
+LifetimeCheckAnalysis::PathState
+LifetimeCheckAnalysis::joinStates(ArrayRef<const PathState *> states) {
   if (states.empty())
     return {};
   PathState result = *states.front();
@@ -3673,8 +3684,8 @@ LifetimeCheckPass::joinStates(ArrayRef<const PathState *> states) {
   return result;
 }
 
-bool LifetimeCheckPass::equivalentStates(const PathState &a,
-                                         const PathState &b) {
+bool LifetimeCheckAnalysis::equivalentStates(const PathState &a,
+                                             const PathState &b) {
   // Diagnostic accumulation does not drive the fixed point. Every witness is
   // retained separately and emitted once after solving the function.
   return a.pmap == b.pmap && a.invalidHist == b.invalidHist &&
@@ -3685,7 +3696,8 @@ bool LifetimeCheckPass::equivalentStates(const PathState &a,
          a.ownershipGroups == b.ownershipGroups;
 }
 
-void LifetimeCheckPass::mergeFlow(FlowResult &destination, FlowResult source) {
+void LifetimeCheckAnalysis::mergeFlow(FlowResult &destination,
+                                      FlowResult source) {
   if (source.normal) {
     if (destination.normal)
       joinStateInto(*destination.normal, *source.normal);
@@ -3731,7 +3743,8 @@ void LifetimeCheckPass::mergeFlow(FlowResult &destination, FlowResult source) {
 }
 
 std::optional<bool>
-LifetimeCheckPass::evaluateCondition(Value condition, const PathState &state) {
+LifetimeCheckAnalysis::evaluateCondition(Value condition,
+                                         const PathState &state) {
   if (auto constant = condition.getDefiningOp<ConstantOp>())
     if (auto value = dyn_cast<cir::BoolAttr>(constant.getValue()))
       return value.getValue();
@@ -3757,9 +3770,9 @@ LifetimeCheckPass::evaluateCondition(Value condition, const PathState &state) {
   return occupancy.mayBePresent == predicate.trueMeansPresent;
 }
 
-LifetimeCheckPass::PathState
-LifetimeCheckPass::refineCondition(Value condition, bool truth,
-                                   PathState state) {
+LifetimeCheckAnalysis::PathState
+LifetimeCheckAnalysis::refineCondition(Value condition, bool truth,
+                                       PathState state) {
   auto summary = summarizeValue(condition, state);
   if (!summary.predicate)
     return state;
@@ -3853,9 +3866,8 @@ LifetimeCheckPass::refineCondition(Value condition, bool truth,
   return state;
 }
 
-LifetimeCheckPass::PathState
-LifetimeCheckPass::finishRegionOperation(Operation *operation,
-                                         ValueRange yielded, PathState state) {
+LifetimeCheckAnalysis::PathState LifetimeCheckAnalysis::finishRegionOperation(
+    Operation *operation, ValueRange yielded, PathState state) {
   for (auto pair : llvm::zip(operation->getResults(), yielded)) {
     setValueSummary(state, std::get<0>(pair),
                     summarizeValue(std::get<1>(pair), state));
@@ -3865,8 +3877,8 @@ LifetimeCheckPass::finishRegionOperation(Operation *operation,
   return state;
 }
 
-LifetimeCheckPass::FlowResult
-LifetimeCheckPass::analyzeCall(Operation *operation, PathState state) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::analyzeCall(Operation *operation, PathState state) {
   auto call = dyn_cast<CallOp>(operation);
   if (!call)
     return {std::move(state)};
@@ -4031,9 +4043,9 @@ LifetimeCheckPass::analyzeCall(Operation *operation, PathState state) {
   return result;
 }
 
-LifetimeCheckPass::FlowResult
-LifetimeCheckPass::leaveScope(FlowResult flow, ArrayRef<ObjectId> locals,
-                              Location loc) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::leaveScope(FlowResult flow, ArrayRef<ObjectId> locals,
+                                  Location loc) {
   auto end = [&](PathState &state) {
     StateGuard guard(*this, state);
     for (ObjectId object : locals) {
@@ -4073,8 +4085,8 @@ LifetimeCheckPass::leaveScope(FlowResult flow, ArrayRef<ObjectId> locals,
   return flow;
 }
 
-LifetimeCheckPass::FlowResult
-LifetimeCheckPass::leaveOperationScope(Operation *scope, FlowResult flow) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::leaveOperationScope(Operation *scope, FlowResult flow) {
   if (flow.normal && scope->getNumResults() && scope->getNumRegions()) {
     Region &body = scope->getRegion(0);
     if (!body.empty() && !body.back().empty())
@@ -4142,8 +4154,8 @@ LifetimeCheckPass::leaveOperationScope(Operation *scope, FlowResult flow) {
   return leaveScope(std::move(flow), locals, getEndLocForHist(scope));
 }
 
-LifetimeCheckPass::FlowResult LifetimeCheckPass::analyzeBlock(Block &block,
-                                                              PathState state) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::analyzeBlock(Block &block, PathState state) {
   FlowResult result{std::move(state)};
   for (Operation &operation : block) {
     if (!result.normal)
@@ -4158,8 +4170,9 @@ LifetimeCheckPass::FlowResult LifetimeCheckPass::analyzeBlock(Block &block,
   return result;
 }
 
-LifetimeCheckPass::FlowResult
-LifetimeCheckPass::analyzeRegion(Region &region, PathState state, bool scoped) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::analyzeRegion(Region &region, PathState state,
+                                     bool scoped) {
   // Full expressions can contain thousands of nested temporary cleanups.
   // Continue the same CIR analysis on a fresh stack when necessary; the
   // enclosing invocation waits, so path state and diagnostics remain serial.
@@ -4178,18 +4191,18 @@ LifetimeCheckPass::analyzeRegion(Region &region, PathState state, bool scoped) {
   // A non-threaded build cannot extend the stack. Also do not silently accept
   // an empty result if an enclosing crash-recovery context interrupted it.
   if (!result) {
-    mlir::emitError(region.getLoc(),
-                    "CIR lifetime analysis could not continue on a sufficient "
-                    "stack");
-    signalPassFailure();
+    recordDiagnostic(mlir::emitError(
+        region.getLoc(),
+        "CIR lifetime analysis could not continue on a sufficient stack"));
+    functionResult.failed = true;
     return {};
   }
   return std::move(*result);
 }
 
-LifetimeCheckPass::FlowResult
-LifetimeCheckPass::analyzeRegionImpl(Region &region, PathState state,
-                                     bool scoped) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::analyzeRegionImpl(Region &region, PathState state,
+                                         bool scoped) {
   if (region.empty())
     return {std::move(state)};
   LexicalScopeContext local{&region};
@@ -4234,8 +4247,8 @@ LifetimeCheckPass::analyzeRegionImpl(Region &region, PathState state,
       FlowResult blockFlow = analyzeBlock(*block, entries[block]);
       SmallVector<GotoState, 0> outgoing;
       for (auto &jump : blockFlow.gotos) {
-        auto target = labelTargets->find(jump.label);
-        if (target != labelTargets->end() &&
+        auto target = labelTargets.find(jump.label);
+        if (target != labelTargets.end() &&
             target->second->getParent() == &region)
           enqueue(target->second, {}, std::move(jump.state));
         else
@@ -4248,9 +4261,10 @@ LifetimeCheckPass::analyzeRegionImpl(Region &region, PathState state,
           enqueue(branch.getDest(), branch.getDestOperands(),
                   *blockFlow.normal);
         else {
-          mlir::emitError(block->getTerminator()->getLoc(),
-                          "unsupported CFG terminator in lifetime analysis");
-          signalPassFailure();
+          recordDiagnostic(mlir::emitError(
+              block->getTerminator()->getLoc(),
+              "unsupported CFG terminator in lifetime analysis"));
+          functionResult.failed = true;
         }
         blockFlow.normal.reset();
       }
@@ -4267,8 +4281,8 @@ LifetimeCheckPass::analyzeRegionImpl(Region &region, PathState state,
   return result;
 }
 
-LifetimeCheckPass::FlowResult
-LifetimeCheckPass::analyzeLoop(LoopOpInterface loop, PathState input) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::analyzeLoop(LoopOpInterface loop, PathState input) {
   PathState head = input;
   FlowResult exits;
   bool bodyFirst = &loop.getEntry() == &loop.getBody();
@@ -4318,9 +4332,9 @@ LifetimeCheckPass::analyzeLoop(LoopOpInterface loop, PathState input) {
   };
   for (unsigned iteration = 0;; ++iteration) {
     if (iteration == 4096) {
-      mlir::emitError(loop->getLoc(),
-                      "lifetime loop analysis did not converge");
-      signalPassFailure();
+      recordDiagnostic(mlir::emitError(
+          loop->getLoc(), "lifetime loop analysis did not converge"));
+      functionResult.failed = true;
       return exits;
     }
     FlowResult current{head};
@@ -4394,8 +4408,9 @@ LifetimeCheckPass::analyzeLoop(LoopOpInterface loop, PathState input) {
   return exits;
 }
 
-LifetimeCheckPass::FlowResult
-LifetimeCheckPass::transferOperation(Operation *operation, PathState state) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::transferOperation(Operation *operation,
+                                         PathState state) {
   llvm::SaveAndRestore<Operation *> operationGuard(activeOperation, operation);
   // These operations can form long, finite chains (for example, else-if
   // dispatch). Keep leaf value summaries and other transfer scratch in an
@@ -4435,8 +4450,9 @@ LifetimeCheckPass::transferOperation(Operation *operation, PathState state) {
   return transferOtherOperation(operation, std::move(state));
 }
 
-LifetimeCheckPass::FlowResult
-LifetimeCheckPass::transferOtherOperation(Operation *operation, PathState state) {
+LifetimeCheckAnalysis::FlowResult
+LifetimeCheckAnalysis::transferOtherOperation(Operation *operation,
+                                              PathState state) {
   if (auto alloca = dyn_cast<AllocaOp>(operation)) {
     initializeObject(state, alloca.getAddr(), alloca.getLoc());
   } else if (auto load = dyn_cast<LoadOp>(operation)) {
@@ -4665,8 +4681,8 @@ LifetimeCheckPass::transferOtherOperation(Operation *operation, PathState state)
   return {std::move(state)};
 }
 
-void LifetimeCheckPass::recordWitness(PathState &state,
-                                      DiagnosticWitness witness) {
+void LifetimeCheckAnalysis::recordWitness(PathState &state,
+                                          DiagnosticWitness witness) {
   auto record = [&](auto &witnesses) {
     auto found = llvm::find_if(witnesses, [&](const auto &other) {
       return witness.operation == other.operation &&
@@ -4686,7 +4702,7 @@ void LifetimeCheckPass::recordWitness(PathState &state,
   record(functionWitnesses);
 }
 
-void LifetimeCheckPass::emitWitnesses(const FlowResult &flow) {
+void LifetimeCheckAnalysis::emitWitnesses(const FlowResult &flow) {
   SmallVector<const PathState *, 4> states;
   if (flow.normal)
     states.push_back(&*flow.normal);
@@ -4722,30 +4738,51 @@ void LifetimeCheckPass::emitWitnesses(const FlowResult &flow) {
 
 #include "LifetimeCheckLibrary.inc"
 
+namespace {
+struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
+  LifetimeCheckAnalysis::Options opts;
+  void runOnOperation() override;
+};
+} // namespace
+
 void LifetimeCheckPass::runOnOperation() {
   // cir-opt does not initialize Clang's stack accounting on its own.
   clang::noteBottomOfStack();
-  opts.parseOptions(*this);
-  Operation *op = getOperation();
+  SmallVector<StringRef, 4> remarks(remarksList.begin(), remarksList.end());
+  SmallVector<StringRef, 4> history(historyList.begin(), historyList.end());
+  opts.parseOptions(remarks, history, historyLimit);
+  ModuleOp module = getOperation();
   if (opts.error) {
-    mlir::emitError(op->getLoc()) << *opts.error;
+    mlir::emitError(module.getLoc()) << *opts.error;
     return signalPassFailure();
   }
-  theModule = cast<ModuleOp>(op);
-  SmallVector<FuncOp> functions(theModule.getOps<FuncOp>());
+  SmallVector<FuncOp> functions(module.getOps<FuncOp>());
   std::vector<FunctionLabelMap> labels(functions.size());
   for (auto [index, function] : llvm::enumerate(functions))
     if (failed(validateLifetimeControlFlow(function, labels[index])))
       return signalPassFailure();
 
-  mlir::SymbolTable symbols(theModule);
-  llvm::SaveAndRestore<mlir::SymbolTable *> symbolGuard(moduleSymbols,
-                                                        &symbols);
-  for (auto [index, function] : llvm::enumerate(functions)) {
-    llvm::SaveAndRestore<const FunctionLabelMap *> labelGuard(labelTargets,
-                                                            &labels[index]);
-    checkFunc(function);
+  const mlir::SymbolTable symbols(module);
+  std::vector<FunctionAnalysisResult> results(functions.size());
+  // Finish every function even when another analysis reports a local failure.
+  mlir::parallelForEach(
+      module.getContext(), llvm::seq<size_t>(0, functions.size()),
+      [&](size_t index) {
+        LifetimeCheckAnalysis analysis(module, symbols, labels[index], opts,
+                                       results[index]);
+        analysis.checkFunc(functions[index]);
+      });
+
+  // Stack continuations may use a thread outside the MLIR pool. Replay owned
+  // diagnostics here so all consumers see the original module/function order.
+  bool analysisFailed = false;
+  for (auto &result : results) {
+    for (auto &diagnostic : result.diagnostics)
+      module.getContext()->getDiagEngine().emit(std::move(diagnostic));
+    analysisFailed |= result.failed;
   }
+  if (analysisFailed)
+    signalPassFailure();
 }
 
 std::unique_ptr<Pass> mlir::createLifetimeCheckPass() {
@@ -4765,7 +4802,7 @@ mlir::createLifetimeCheckPass(ArrayRef<llvm::StringRef> remark,
 // Dump & print helpers
 //===----------------------------------------------------------------------===//
 
-void LifetimeCheckPass::LexicalScopeContext::dumpLocalValues() {
+void LifetimeCheckAnalysis::LexicalScopeContext::dumpLocalValues() {
   llvm::errs() << "Local values: { ";
   for (auto value : localValues) {
     llvm::errs() << getVarNameFromValue(value);
@@ -4774,7 +4811,7 @@ void LifetimeCheckPass::LexicalScopeContext::dumpLocalValues() {
   llvm::errs() << "}\n";
 }
 
-void LifetimeCheckPass::State::dump(llvm::raw_ostream &OS, int ownedGen) {
+void LifetimeCheckAnalysis::State::dump(llvm::raw_ostream &OS, int ownedGen) {
   switch (val.getInt()) {
   case Invalid:
     OS << "invalid";
@@ -4797,7 +4834,7 @@ void LifetimeCheckPass::State::dump(llvm::raw_ostream &OS, int ownedGen) {
   }
 }
 
-void LifetimeCheckPass::printPset(PSetType &pset, llvm::raw_ostream &OS) {
+void LifetimeCheckAnalysis::printPset(PSetType &pset, llvm::raw_ostream &OS) {
   OS << "{ ";
   auto size = pset.size();
   for (auto s : pset) {
@@ -4812,9 +4849,9 @@ void LifetimeCheckPass::printPset(PSetType &pset, llvm::raw_ostream &OS) {
   OS << " }";
 }
 
-void LifetimeCheckPass::dumpCurrentPmap() { dumpPmap(*currPmap); }
+void LifetimeCheckAnalysis::dumpCurrentPmap() { dumpPmap(*currPmap); }
 
-void LifetimeCheckPass::dumpPmap(PMapType &pmap) {
+void LifetimeCheckAnalysis::dumpPmap(PMapType &pmap) {
   llvm::errs() << "pmap {\n";
   int entry = 0;
   for (auto &mapEntry : pmap) {

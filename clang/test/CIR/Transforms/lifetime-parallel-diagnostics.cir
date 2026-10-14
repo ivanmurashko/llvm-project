@@ -1,0 +1,84 @@
+// RUN: cir-opt %s -o %t.input.cir
+// RUN: cir-opt %s --mlir-disable-threading=true --cir-lifetime-check="history=all remarks=pset-invalid" -o %t.serial.cir 2> %t.serial
+// RUN: diff %t.input.cir %t.serial.cir
+// RUN: FileCheck %s --input-file=%t.serial --implicit-check-not='warning:' --implicit-check-not='error:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: cir-opt %s --mlir-disable-threading=false --cir-lifetime-check="history=all remarks=pset-invalid" -o %t.parallel.cir 2> %t.parallel
+// RUN: diff %t.input.cir %t.parallel.cir
+// RUN: diff %t.serial %t.parallel
+// RUN: cir-opt %s --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --mlir-disable-threading=false --cir-lifetime-check="history=all remarks=pset-invalid" -o /dev/null 2> %t.bytecode
+// RUN: diff %t.serial %t.bytecode
+
+// A warning is emitted when its in-flight diagnostic is destroyed, after its
+// pset-invalid remark. Keep that ordering, attached notes, and module function
+// order even when independent functions run on different workers. Deliberately
+// reuse the source variable name across functions and call the same declaration.
+// Synthetic locations keep the diagnostic stream free of source excerpts.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module {
+  cir.func private @observe(!i) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0], parameter_indices = [0]>}
+
+  cir.func @first() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("parallel-first":1:1)
+    cir.store %null, %pointer : !p, !pp
+    %address = cir.load %pointer : !pp, !p
+    %value = cir.load %address : !p, !i loc("parallel-first":2:1)
+    cir.call @observe(%value) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: parallel-first{{.*}}remark: pset => { nullptr }
+  // CHECK: parallel-first{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: parallel-first{{.*}}note: 'nullptr' invalidated here
+
+  cir.func @uninitialized() {
+    %pointer = cir.alloca "pointer" align(8) : !pp loc("parallel-uninitialized":1:1)
+    %address = cir.load %pointer : !pp, !p
+    %value = cir.load %address : !p, !i loc("parallel-uninitialized":2:1)
+    cir.call @observe(%value) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: parallel-uninitialized{{.*}}remark: pset => { invalid }
+  // CHECK: parallel-uninitialized{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: parallel-uninitialized{{.*}}note: uninitialized here
+
+  cir.func @dangling() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.scope {
+      %local = cir.alloca "local" align(4) : !p
+      cir.store %local, %pointer : !p, !pp
+      cir.yield
+    } loc("parallel-dangling":1:1)
+    %address = cir.load %pointer : !pp, !p
+    %value = cir.load %address : !p, !i loc("parallel-dangling":2:1)
+    cir.call @observe(%value) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: parallel-dangling{{.*}}remark: pset => { invalid }
+  // CHECK: parallel-dangling{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: parallel-dangling{{.*}}note: pointee 'local' invalidated at end of scope
+
+  cir.func @quiet() {
+    %local = cir.alloca "local" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %local : !i, !p
+    %value = cir.load %local : !p, !i
+    cir.call @observe(%value) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  cir.func @last() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("parallel-last":1:1)
+    cir.store %null, %pointer : !p, !pp
+    %address = cir.load %pointer : !pp, !p
+    %value = cir.load %address : !p, !i loc("parallel-last":2:1)
+    cir.call @observe(%value) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: parallel-last{{.*}}remark: pset => { nullptr }
+  // CHECK: parallel-last{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: parallel-last{{.*}}note: 'nullptr' invalidated here
+}

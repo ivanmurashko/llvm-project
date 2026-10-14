@@ -1,0 +1,40 @@
+// RUN: not cir-opt %s --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.serial
+// RUN: FileCheck %s --input-file=%t.serial --implicit-check-not='warning:' --implicit-check-not='error:' --implicit-check-not='note:'
+// RUN: not cir-opt %s --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.parallel
+// RUN: diff %t.serial %t.parallel
+
+// A function-local analysis failure must not cancel later functions. Unlike
+// module-level switch validation, this error occurs after analysis has begun.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module {
+  cir.func @before() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("parallel-before":1:1)
+    cir.store %null, %pointer : !p, !pp
+    %value = cir.load deref %pointer : !pp, !p loc("parallel-before":2:1)
+    cir.return
+  }
+  // CHECK: parallel-before{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: parallel-before{{.*}}note: 'nullptr' invalidated here
+
+  cir.func @unsupported(%condition: !cir.bool) {
+    cir.brcond %condition ^left, ^right loc("parallel-failure":1:1)
+  ^left:
+    cir.return
+  ^right:
+    cir.return
+  }
+  // CHECK: parallel-failure{{.*}}error: unsupported CFG terminator in lifetime analysis
+
+  cir.func @after() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("parallel-after":1:1)
+    cir.store %null, %pointer : !p, !pp
+    %value = cir.load deref %pointer : !pp, !p loc("parallel-after":2:1)
+    cir.return
+  }
+  // CHECK: parallel-after{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: parallel-after{{.*}}note: 'nullptr' invalidated here
+}
