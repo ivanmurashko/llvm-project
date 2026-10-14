@@ -52,8 +52,22 @@ also survives writing and reloading CIR.
 Recognized `std::unique_ptr` and `std::shared_ptr` owners permit safe operations
 such as `get`, `release`, `reset`, and conversion to `bool` after a move.
 Dereferencing the moved-from pointer is diagnosed. Parameter reference
-categories and method identity come from serialized CIR metadata; argument move
-tracking is skipped when CIRGen cannot prove the source-parameter mapping.
+categories and method identity come from serialized CIR metadata. Ordinary
+indirect calls through prototyped free-function pointers or references retain
+parameter categories when CIRGen proves an unambiguous source-argument mapping.
+Known direct-callee categories take precedence over call-site metadata. Missing
+categories remain unknown; variadic, member-pointer, and uncertain hidden or
+ABI argument mappings do not acquire this indirect-call support. Parameter
+categories describe binding, not whether an indirect callee reads pointee
+contents. Generic indirect-call checks continue to allow null contents, while
+checking known moved-from or dangling state.
+
+A call with a tracked `T&&` argument is conservatively treated as potentially
+consuming it, including through a function pointer. This can warn after a
+no-op `T&&` callee, just as for a direct call; the check does not inspect the
+callee body to prove consumption. Merely calling `std::move`, forming an rvalue
+cast, or binding a reference remains non-consuming. Lvalue-reference binding
+alone neither proves valid pointer contents nor reinitializes moved-from state.
 
 Verified `std::get` overloads for `std::pair` and `std::tuple` do not consume the
 containing object when returning an element reference. Existing invalid-source
@@ -80,6 +94,23 @@ The maximum number of invalidation history entries reported for a warning. The
 default is `1`. Setting it to `0` disables invalidation history notes. Null-pointer
 origin notes are controlled separately by `HistoryList`.
 
+### AnalyzeUnusedMainFileFunctions
+
+When `true`, additionally analyze explicit non-template inline definitions in the
+main file, including ordinary nonvirtual methods and friends. The default is
+`false`, which retains normal CIR emission. Eligibility uses the definition's
+expansion location, so a header macro expanded in the main file can be selected.
+Redeclarations do not cause duplicate analysis.
+
+The option excludes constructors, destructors, virtual functions, implicit,
+defaulted or deleted functions, templates and specializations, consteval
+functions, and device-specific code. It does not discover roots inside local
+classes, lambdas, or other function bodies. Normal emission of a selected root
+can require dependencies from headers, and unsupported selected bodies remain
+generation errors. Additional coverage and its cost should be measured separately
+from the default configuration. This option does not instantiate templates or
+change the analysis of C++ evaluation order.
+
 ## Limitations
 
 Coverage is limited to the functions and constructs supported and emitted by CIR
@@ -87,13 +118,15 @@ for the active compilation options. Code generation, verification, and pass
 failures are errors; an unsuccessful run does not establish that the translation
 unit is free of lifetime problems.
 
-Switch analysis supports cases whose blocks execute in source order, including
-labels connected by unconditional branches to the next block. Nested case
-labels, other case control-flow graphs, and gotos in functions containing a
-switch are reported as unsupported analysis errors.
-Jumps into nested structured regions are also unsupported. Array constructor
-and destructor regions are not generally modeled, including some forms that do
-not cause an error.
+Switch analysis supports a simple shell of direct cases. Within case bodies,
+the CIR region worklist follows unconditional branches and symbolic gotos to
+the same or an enclosing region, including backedges and outward cleanup.
+Nested case labels, cross-case or sibling-region jumps, entry into nested
+regions, and indirect gotos remain unsupported. Symbolic labels must be unique
+within a function and their target blocks must take no arguments. Unsupported
+control flow produces an explicit error rather than establishing clean analysis.
+Array constructor and destructor regions are not generally modeled, including
+some forms that do not cause an error.
 A successful run does not establish coverage of every operation.
 
 The analysis follows local aliases and captured value snapshots, joins

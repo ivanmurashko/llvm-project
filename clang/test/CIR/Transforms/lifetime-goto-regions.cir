@@ -1,0 +1,132 @@
+// RUN: cir-opt %s --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.serial
+// RUN: FileCheck %s --input-file=%t.serial --implicit-check-not='warning:' --implicit-check-not='error:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: cir-opt %s --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.parallel
+// RUN: diff %t.serial %t.parallel
+// RUN: cir-opt %s --cir-canonicalize --mlir-print-debuginfo -o %t.canonical.cir
+// RUN: cir-opt %t.canonical.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.text.serial
+// RUN: diff %t.serial %t.text.serial
+// RUN: cir-opt %t.canonical.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.text.parallel
+// RUN: diff %t.serial %t.text.parallel
+// RUN: cir-opt %s --cir-canonicalize --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.bytecode.serial
+// RUN: diff %t.serial %t.bytecode.serial
+// RUN: cir-opt %t.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.bytecode.parallel
+// RUN: diff %t.serial %t.bytecode.parallel
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+
+module {
+  cir.func private @observe(!i) attributes {nothrow}
+
+  // An outward jump from a direct case crosses the cleanup. Its null store
+  // must reach the outer target instead of the pre-cleanup valid value.
+  cir.func @outward_cleanup_changes_state(%selector: !i) {
+    %value = cir.alloca "value" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.store %value, %pointer : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(default, []) {
+        cir.cleanup.scope {
+          cir.goto "after_cleanup"
+        } cleanup normal {
+          %null = cir.const #cir.ptr<null> : !p loc("goto-cleanup-null":1:1)
+          cir.store %null, %pointer : !p, !pp
+          cir.yield
+        }
+        cir.break
+      }
+      cir.yield
+    }
+    cir.return
+  ^after_cleanup:
+    cir.label "after_cleanup"
+    %address = cir.load %pointer : !pp, !p
+    %read = cir.load %address : !p, !i loc("goto-cleanup-use":1:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: goto-cleanup-use{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: goto-cleanup-null{{.*}}note: 'nullptr' invalidated here
+
+  // Body storage stays live during cleanup but expires before the outer label.
+  // A warning from the cleanup itself would expose premature invalidation.
+  cir.func @outward_cleanup_then_storage_end(%selector: !i) {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.switch (%selector : !i) {
+      cir.case(default, []) {
+        cir.cleanup.scope {
+          %local = cir.alloca "local" align(4) : !p
+          %one = cir.const #cir.int<1> : !i
+          cir.store %one, %local : !i, !p
+          cir.store %local, %pointer : !p, !pp
+          cir.goto "after_storage"
+        } cleanup normal {
+          %address = cir.load %pointer : !pp, !p
+          %read = cir.load %address : !p, !i loc("goto-cleanup-live-use":1:1)
+          cir.call @observe(%read) nothrow : (!i) -> ()
+          cir.yield
+        } loc("goto-storage-end":1:1)
+        cir.break
+      }
+      cir.yield
+    }
+    cir.return
+  ^after_storage:
+    cir.label "after_storage"
+    %address = cir.load %pointer : !pp, !p
+    %read = cir.load %address : !p, !i loc("goto-storage-use":1:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: goto-storage-use{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: goto-storage-end{{.*}}note: pointee 'local' invalidated at end of scope
+
+  // A terminating cleanup consumes the goto. The deliberately invalid target
+  // must not be analyzed, nor may the following continuation become reachable.
+  cir.func @terminating_cleanup_suppresses_target(%selector: !i) {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p
+    cir.store %null, %pointer : !p, !pp
+    cir.switch (%selector : !i) {
+      cir.case(default, []) {
+        cir.cleanup.scope {
+          cir.goto "never_reached"
+        } cleanup normal {
+          cir.unreachable
+        }
+        cir.break
+      }
+      cir.yield
+    }
+    cir.return
+  ^never_reached:
+    cir.label "never_reached"
+    %address = cir.load %pointer : !pp, !p
+    %read = cir.load %address : !p, !i loc("goto-never-use":1:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  // A same-region symbolic edge jumps over a real store in an unreachable
+  // continuation. Merely walking blocks in source order would repair pointer.
+  cir.func @unreachable_store_does_not_repair() {
+    %value = cir.alloca "value" align(4) : !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("goto-skipped-null":1:1)
+    cir.store %null, %pointer : !p, !pp
+    cir.goto "use"
+  ^unreachable_continuation:
+    cir.store %value, %pointer : !p, !pp
+    cir.br ^use
+  ^use:
+    cir.label "use"
+    %address = cir.load %pointer : !pp, !p
+    %read = cir.load %address : !p, !i loc("goto-skipped-use":1:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: goto-skipped-use{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: goto-skipped-null{{.*}}note: 'nullptr' invalidated here
+}

@@ -103,6 +103,13 @@ RecordLayoutAttr tryGetRecordLayout(mlir::ModuleOp mod, mlir::StringAttr name);
 /// Look up lifetime facts for a record in the module's cir.lifetime_records
 /// dictionary. Returns a null attribute when the record has no entry.
 LifetimeRecordAttr getLifetimeRecord(RecordType record, mlir::ModuleOp mod);
+
+constexpr llvm::StringLiteral getLifetimeParameterKindAttrName() {
+  return "cir.lifetime_parameter_kind";
+}
+
+/// Remove source parameter categories without changing other call attributes.
+mlir::ArrayAttr stripLifetimeParameterKindAttrs(mlir::ArrayAttr attrs);
 } // namespace cir
 
 // TableGen'erated files for MLIR dialects require that a macro be defined when

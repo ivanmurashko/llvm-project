@@ -1,0 +1,151 @@
+// RUN: split-file %s %t
+// RUN: cir-opt %t/disabled.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/disabled.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/disabled.cir --cir-canonicalize --mlir-print-debuginfo -o %t/disabled.canonical.cir
+// RUN: cir-opt %t/disabled.canonical.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/disabled.canonical.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/disabled.canonical.cir --emit-bytecode -o %t/disabled.bc
+// RUN: cir-opt %t/disabled.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/disabled.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/enabled.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/enabled.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/enabled.cir --cir-canonicalize --mlir-print-debuginfo -o %t/enabled.canonical.cir
+// RUN: cir-opt %t/enabled.canonical.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/enabled.canonical.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/enabled.canonical.cir --emit-bytecode -o %t/enabled.bc
+// RUN: cir-opt %t/enabled.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/enabled.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/absent.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/absent.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/absent.cir --cir-canonicalize --mlir-print-debuginfo -o %t/absent.canonical.cir
+// RUN: cir-opt %t/absent.canonical.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/absent.canonical.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/absent.canonical.cir --emit-bytecode -o %t/absent.bc
+// RUN: cir-opt %t/absent.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/absent.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/nothrow.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/nothrow.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/nothrow.cir --cir-canonicalize --mlir-print-debuginfo -o %t/nothrow.canonical.cir
+// RUN: cir-opt %t/nothrow.canonical.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/nothrow.canonical.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/nothrow.canonical.cir --emit-bytecode -o %t/nothrow.bc
+// RUN: cir-opt %t/nothrow.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: cir-opt %t/nothrow.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+
+// The only invalid use is in an EH-only cleanup. Unlike a normal-cleanup
+// witness, it observes whether the call created an exceptional continuation.
+// Handwritten CIR deliberately retains the EH region under exceptions=false:
+// the serialized language setting must suppress that impossible continuation.
+// Missing language metadata is conservative; explicit nothrow suppresses the
+// continuation even when exceptions are enabled. A call retains the load
+// through canonicalization. Each input runs as text, canonical text, and
+// bytecode with MLIR threading both disabled and enabled.
+
+//--- disabled.cir
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module attributes {cir.lowering_lang_options = #cir.lowering_lang_options<
+  exceptions = false, threadsafe_statics = true, cuda = false,
+  cuda_is_device = false, hip = false, gpu_rdc = false, openmp = false,
+  openmp_is_target_device = false, clang_abi_compat = 17>} {
+  cir.func private @may_throw()
+  cir.func private @observe(!i) attributes {nothrow}
+  cir.func @disabled_exception_path() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.cleanup.scope {
+      cir.call @may_throw() : () -> ()
+      cir.yield
+    } cleanup eh {
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %pointer : !p, !pp
+      %address = cir.load %pointer : !pp, !p
+      %read = cir.load %address : !p, !i
+      cir.call @observe(%read) nothrow : (!i) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+}
+
+//--- enabled.cir
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module attributes {cir.lowering_lang_options = #cir.lowering_lang_options<
+  exceptions = true, threadsafe_statics = true, cuda = false,
+  cuda_is_device = false, hip = false, gpu_rdc = false, openmp = false,
+  openmp_is_target_device = false, clang_abi_compat = 17>} {
+  cir.func private @may_throw()
+  cir.func private @observe(!i) attributes {nothrow}
+  cir.func @enabled_exception_path() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.cleanup.scope {
+      cir.call @may_throw() : () -> ()
+      cir.yield
+    } cleanup eh {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %pointer : !p, !pp
+      %address = cir.load %pointer : !pp, !p
+      // expected-warning @below {{use of invalid pointer 'pointer'}}
+      %read = cir.load %address : !p, !i
+      cir.call @observe(%read) nothrow : (!i) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+}
+
+//--- absent.cir
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module {
+  cir.func private @may_throw()
+  cir.func private @observe(!i) attributes {nothrow}
+  cir.func @absent_exception_path() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.cleanup.scope {
+      cir.call @may_throw() : () -> ()
+      cir.yield
+    } cleanup eh {
+      // expected-note @below {{'nullptr' invalidated here}}
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %pointer : !p, !pp
+      %address = cir.load %pointer : !pp, !p
+      // expected-warning @below {{use of invalid pointer 'pointer'}}
+      %read = cir.load %address : !p, !i
+      cir.call @observe(%read) nothrow : (!i) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+}
+
+//--- nothrow.cir
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module attributes {cir.lowering_lang_options = #cir.lowering_lang_options<
+  exceptions = true, threadsafe_statics = true, cuda = false,
+  cuda_is_device = false, hip = false, gpu_rdc = false, openmp = false,
+  openmp_is_target_device = false, clang_abi_compat = 17>} {
+  cir.func private @may_throw()
+  cir.func private @observe(!i) attributes {nothrow}
+  cir.func @nothrow_exception_path() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.cleanup.scope {
+      cir.call @may_throw() nothrow : () -> ()
+      cir.yield
+    } cleanup eh {
+      %null = cir.const #cir.ptr<null> : !p
+      cir.store %null, %pointer : !p, !pp
+      %address = cir.load %pointer : !pp, !p
+      %read = cir.load %address : !p, !i
+      cir.call @observe(%read) nothrow : (!i) -> ()
+      cir.yield
+    }
+    cir.return
+  }
+}

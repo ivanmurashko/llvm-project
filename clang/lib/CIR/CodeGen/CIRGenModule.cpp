@@ -2927,6 +2927,10 @@ void CIRGenModule::emitTentativeDefinition(const VarDecl *d) {
 }
 
 bool CIRGenModule::mustBeEmitted(const ValueDecl *global) {
+  if (const auto *function = dyn_cast<FunctionDecl>(global))
+    if (lifetimeAnalysisRoots.contains(function->getCanonicalDecl()))
+      return true;
+
   // Never defer when EmitAllDecls is specified.
   if (langOpts.EmitAllDecls)
     return true;

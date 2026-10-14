@@ -1,0 +1,55 @@
+// RUN: cir-opt %s --cir-to-llvm | FileCheck %s --check-prefix=LLVM --implicit-check-not=cir.lifetime_parameter_kind
+// RUN: cir-opt %s --cir-call-conv-lowering=target=x86_64 | FileCheck %s --check-prefix=ABI --implicit-check-not=cir.lifetime_parameter_kind
+// RUN: cir-opt %s --cir-call-conv-lowering=target=x86_64 --cir-to-llvm | FileCheck %s --check-prefix=LLVM --implicit-check-not=cir.lifetime_parameter_kind
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!fn = !cir.ptr<!cir.func<(!p) -> !i>>
+module attributes {
+  cir.triple = "x86_64-unknown-linux-gnu",
+  dlti.dl_spec = #dlti.dl_spec<
+    #dlti.dl_entry<i32, dense<32> : vector<2xi64>>,
+    #dlti.dl_entry<i64, dense<64> : vector<2xi64>>>
+} {
+  cir.func private @callee(!p) -> !i
+  cir.func private @__gxx_personality_v0(...) -> !i
+
+  // Even a pass-through ABI classification ends the source-metadata lifetime.
+  // Preserve unrelated attributes while removing only the CIR analysis key.
+  cir.func @direct(%value : !p) -> !i {
+    %result = cir.call @callee(%value) : (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>, llvm.noundef}) -> !i
+    cir.return %result : !i
+  }
+  // ABI-LABEL: cir.func{{.*}} @direct(
+  // ABI: cir.call @callee
+  // ABI-SAME: llvm.noundef
+  // LLVM-LABEL: llvm.func @direct(
+  // LLVM: llvm.call @callee
+  // LLVM-SAME: llvm.noundef
+
+  cir.func @indirect(%callee : !fn, %value : !p) -> !i {
+    %result = cir.call %callee(%value) : (!fn, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>, llvm.noundef}) -> !i
+    cir.return %result : !i
+  }
+  // ABI-LABEL: cir.func{{.*}} @indirect(
+  // ABI: cir.call %
+  // ABI-SAME: llvm.noundef
+  // LLVM-LABEL: llvm.func @indirect(
+  // LLVM: llvm.call %
+  // LLVM-SAME: llvm.noundef
+
+  cir.func @try_call(%value : !p) personality(@__gxx_personality_v0) {
+    %result = cir.try_call @callee(%value) ^normal, ^unwind : (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>, llvm.noundef}) -> !i
+  ^normal:
+    cir.return
+  ^unwind:
+    %exception, %type = cir.eh.inflight_exception cleanup
+    cir.return
+  }
+  // ABI-LABEL: cir.func{{.*}} @try_call(
+  // ABI: cir.try_call @callee
+  // ABI-SAME: llvm.noundef
+  // LLVM-LABEL: llvm.func @try_call(
+  // LLVM: llvm.invoke @callee
+  // LLVM-SAME: llvm.noundef
+}

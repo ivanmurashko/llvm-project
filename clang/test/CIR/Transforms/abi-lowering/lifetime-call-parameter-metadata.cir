@@ -1,0 +1,39 @@
+// RUN: cir-opt %s --cir-call-conv-lowering=target=x86_64 | FileCheck %s --implicit-check-not=cir.lifetime_parameter_kind
+
+!i = !cir.int<s, 32>
+!l = !cir.int<s, 64>
+!p = !cir.ptr<!i>
+!big = !cir.struct<"Big" {data !l, data !l, data !l}>
+!fn = !cir.ptr<!cir.func<(!p, !big) -> !big>>
+module attributes {
+  dlti.dl_spec = #dlti.dl_spec<
+    #dlti.dl_entry<i32, dense<32> : vector<2xi64>>,
+    #dlti.dl_entry<i64, dense<64> : vector<2xi64>>>
+} {
+  cir.func private @reshape(!p, !big) -> !big
+
+  // Sret prepends an operand and byval changes an operand's wire type. Neither
+  // rebuilt call may retain source parameter-kind entries at the old indices.
+  cir.func @direct(%value : !p, %input : !cir.ptr<!big>, %out : !cir.ptr<!big>) {
+    %arg = cir.load %input : !cir.ptr<!big>, !big
+    %result = cir.call @reshape(%value, %arg) : (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}, !big {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<value>}) -> !big
+    cir.store %result, %out : !big, !cir.ptr<!big>
+    cir.return
+  }
+  // CHECK-LABEL: cir.func{{.*}} @direct(
+  // CHECK: cir.call @reshape
+  // CHECK-SAME: llvm.sret
+  // CHECK-SAME: llvm.byval
+
+  cir.func @indirect(%callee : !fn, %value : !p, %input : !cir.ptr<!big>, %out : !cir.ptr<!big>) {
+    %arg = cir.load %input : !cir.ptr<!big>, !big
+    %result = cir.call %callee(%value, %arg) : (!fn, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}, !big {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<value>}) -> !big
+    cir.store %result, %out : !big, !cir.ptr<!big>
+    cir.return
+  }
+  // CHECK-LABEL: cir.func{{.*}} @indirect(
+  // CHECK: cir.cast bitcast
+  // CHECK: cir.call %
+  // CHECK-SAME: llvm.sret
+  // CHECK-SAME: llvm.byval
+}

@@ -1723,6 +1723,11 @@ CIRABIRewriteContext::rewriteCallSite(mlir::Operation *callOp,
            << "call passes fewer arguments than the callee declares, which is "
               "not yet implemented in CallConvLowering";
 
+  // Source parameter categories end at this boundary even for unchanged
+  // signatures. Strip before any call rebuilding or sret argument insertion.
+  if (auto attrs = callOp->getAttrOfType<mlir::ArrayAttr>("arg_attrs"))
+    callOp->setAttr("arg_attrs", cir::stripLifetimeParameterKindAttrs(attrs));
+
   if (!fc.needsRewrite())
     return mlir::success();
 

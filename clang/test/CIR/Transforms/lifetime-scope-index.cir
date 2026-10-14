@@ -1,0 +1,201 @@
+// RUN: cir-opt %s --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.serial
+// RUN: FileCheck %s --input-file=%t.serial --implicit-check-not='warning:' --implicit-check-not='error:' --implicit-check-not='remark:' --implicit-check-not='note:'
+// RUN: cir-opt %s --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.parallel
+// RUN: diff %t.serial %t.parallel
+// RUN: cir-opt %s --cir-canonicalize --mlir-print-debuginfo -o %t.canonical.cir
+// RUN: cir-opt %t.canonical.cir --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.canonical.serial
+// RUN: diff %t.serial %t.canonical.serial
+// RUN: cir-opt %t.canonical.cir --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.canonical.parallel
+// RUN: diff %t.serial %t.canonical.parallel
+// RUN: cir-opt %s --cir-canonicalize --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --mlir-disable-threading=true --cir-lifetime-check="history=all" -o /dev/null 2> %t.bytecode.serial
+// RUN: diff %t.serial %t.bytecode.serial
+// RUN: cir-opt %t.bc --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.bytecode.parallel
+// RUN: diff %t.serial %t.bytecode.parallel
+
+// Characterize storage ownership separately from the location of an address
+// computation. Observable calls retain the checked loads through canonicalize;
+// synthetic locations make all six diagnostic streams directly comparable.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+!ppp = !cir.ptr<!pp>
+!record = !cir.struct<"Record" {data !p}>
+!recordp = !cir.ptr<!record>
+
+module {
+  cir.func private @observe(!i) attributes {nothrow}
+
+  // Leaving the inner scope ends only its allocation. The outer allocation is
+  // still usable there and ends only when its own scope exits.
+  cir.func @nested_lifetimes() {
+    %inner_pointer = cir.alloca "inner_pointer" align(8) : !pp
+    %outer_pointer = cir.alloca "outer_pointer" align(8) : !pp
+    cir.scope {
+      %outer = cir.alloca "outer" align(4) : !p
+      %one = cir.const #cir.int<1> : !i
+      cir.store %one, %outer : !i, !p
+      cir.store %outer, %outer_pointer : !p, !pp
+      cir.scope {
+        %inner = cir.alloca "inner" align(4) : !p
+        cir.store %one, %inner : !i, !p
+        cir.store %inner, %inner_pointer : !p, !pp
+        cir.yield
+      } loc("scope-inner-end":1:1)
+      %inner_address = cir.load %inner_pointer : !pp, !p
+      %bad_inner = cir.load %inner_address : !p, !i loc("scope-inner-use":1:1)
+      cir.call @observe(%bad_inner) nothrow : (!i) -> ()
+      %outer_address = cir.load %outer_pointer : !pp, !p
+      %good_outer = cir.load %outer_address : !p, !i
+      cir.call @observe(%good_outer) nothrow : (!i) -> ()
+      cir.yield
+    } loc("scope-outer-end":1:1)
+    %outer_address = cir.load %outer_pointer : !pp, !p
+    %bad_outer = cir.load %outer_address : !p, !i loc("scope-outer-use":1:1)
+    cir.call @observe(%bad_outer) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: scope-inner-use{{.*}}warning: use of invalid pointer 'inner_pointer'
+  // CHECK: scope-inner-end{{.*}}note: pointee 'inner' invalidated at end of scope
+  // CHECK: scope-outer-use{{.*}}warning: use of invalid pointer 'outer_pointer'
+  // CHECK: scope-outer-end{{.*}}note: pointee 'outer' invalidated at end of scope
+
+  // The first get_member is inside a shorter-lived scope, but its field belongs
+  // to record's storage. Retain a snapshot of the field address across that
+  // scope, then use the same canonical field through a second get_member.
+  cir.func @field_belongs_to_storage_root() {
+    %value = cir.alloca "value" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    %record = cir.alloca "record" align(8) : !recordp
+    %saved_field = cir.alloca "saved_field" align(8) : !ppp
+    cir.scope {
+      cir.scope {
+        %field = cir.get_member %record[0] {name = "pointer"} : !recordp -> !pp
+        cir.store %value, %field : !p, !pp
+        cir.store %field, %saved_field : !pp, !ppp
+        cir.yield
+      }
+      cir.yield
+    }
+    %field_address = cir.load %saved_field : !ppp, !pp
+    %address = cir.load %field_address : !pp, !p
+    %read = cir.load %address : !p, !i
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    %again = cir.get_member %record[0] {name = "pointer"} : !recordp -> !pp
+    %again_address = cir.load %again : !pp, !p
+    %again_read = cir.load %again_address : !p, !i
+    cir.call @observe(%again_read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  // Conversely, an escaped field address becomes invalid at its record's
+  // scope boundary, even though the integer stored through the field is live.
+  cir.func @field_ends_with_storage_root() {
+    %value = cir.alloca "value" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %value : !i, !p
+    %saved_field = cir.alloca "saved_field" align(8) : !ppp
+    cir.scope {
+      %record = cir.alloca "record" align(8) : !recordp
+      cir.scope {
+        %field = cir.get_member %record[0] {name = "pointer"} : !recordp -> !pp
+        cir.store %value, %field : !p, !pp
+        cir.store %field, %saved_field : !pp, !ppp
+        cir.yield
+      }
+      cir.yield
+    } loc("scope-record-end":1:1)
+    %field_address = cir.load %saved_field : !ppp, !pp
+    %address = cir.load %field_address : !pp, !p loc("scope-record-use":1:1)
+    %read = cir.load %address : !p, !i
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: scope-record-use{{.*}}warning: use of invalid pointer 'saved_field'
+  // CHECK: scope-record-end{{.*}}note: pointee 'record.pointer' invalidated at end of scope
+
+  // Caller-owned storage is not a local of any nested scope.
+  cir.func @caller_owned_survives(%reference : !p) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [1], parameter_indices = [0]>} {
+    cir.scope {
+      cir.scope {
+        %one = cir.const #cir.int<1> : !i
+        cir.store %one, %reference : !i, !p
+        cir.yield
+      }
+      cir.yield
+    }
+    %read = cir.load %reference : !p, !i
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+
+  // A body allocation remains alive in its normal cleanup, then expires.
+  cir.func @cleanup_precedes_storage_end() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.cleanup.scope {
+      %local = cir.alloca "local" align(4) : !p
+      %one = cir.const #cir.int<1> : !i
+      cir.store %one, %local : !i, !p
+      cir.store %local, %pointer : !p, !pp
+      cir.yield
+    } cleanup normal {
+      %address = cir.load %pointer : !pp, !p
+      %read = cir.load %address : !p, !i
+      cir.call @observe(%read) nothrow : (!i) -> ()
+      cir.yield
+    } loc("scope-cleanup-end":1:1)
+    %address = cir.load %pointer : !pp, !p
+    %read = cir.load %address : !p, !i loc("scope-cleanup-use":1:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: scope-cleanup-use{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: scope-cleanup-end{{.*}}note: pointee 'local' invalidated at end of scope
+
+  // Branch regions still use their dynamically collected locals. A cached
+  // operation-scope index must not replace that separate lifetime boundary.
+  cir.func @branch_local_expires(%choose : !cir.bool) {
+    %live = cir.alloca "live" align(4) : !p
+    %one = cir.const #cir.int<1> : !i
+    cir.store %one, %live : !i, !p
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.store %live, %pointer : !p, !pp
+    cir.if %choose {
+      %local = cir.alloca "branch_local" align(4) : !p
+      cir.store %one, %local : !i, !p
+      cir.store %local, %pointer : !p, !pp
+      cir.yield
+    } loc("scope-branch-end":1:1)
+    %address = cir.load %pointer : !pp, !p
+    %read = cir.load %address : !p, !i loc("scope-branch-use":1:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: scope-branch-use{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: scope-branch-end{{.*}}note: pointee 'branch_local' invalidated at end of scope
+
+  // A break still passes through the lexical scope's invalidation.
+  cir.func @break_ends_scope() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    cir.while {
+      %yes = cir.const #cir.bool<true> : !cir.bool
+      cir.condition(%yes)
+    } do {
+      cir.scope {
+        %local = cir.alloca "break_local" align(4) : !p
+        %one = cir.const #cir.int<1> : !i
+        cir.store %one, %local : !i, !p
+        cir.store %local, %pointer : !p, !pp
+        cir.break
+      } loc("scope-break-end":1:1)
+      cir.yield
+    }
+    %address = cir.load %pointer : !pp, !p
+    %read = cir.load %address : !p, !i loc("scope-break-use":1:1)
+    cir.call @observe(%read) nothrow : (!i) -> ()
+    cir.return
+  }
+  // CHECK: scope-break-use{{.*}}warning: use of invalid pointer 'pointer'
+  // CHECK: scope-break-end{{.*}}note: pointee 'break_local' invalidated at end of scope
+}

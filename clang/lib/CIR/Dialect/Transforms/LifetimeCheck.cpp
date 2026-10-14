@@ -56,12 +56,16 @@ struct LocOrdering {
   }
 };
 
+using CallParameterKinds = SmallVector<std::optional<LifetimeParameterKind>, 8>;
+using FunctionLabelMap = DenseMap<StringAttr, Block *>;
+
 struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   LifetimeCheckPass() = default;
   void runOnOperation() override;
 
   void checkFunc(cir::FuncOp fnOp);
-  void checkCall(CallOp callOp);
+  void checkCall(CallOp callOp,
+                 ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds);
   void checkReturn(ReturnOp retOp);
 
   bool isOwnerType(mlir::Type type);
@@ -115,9 +119,12 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   bool isSmartPointerType(mlir::Type type);
   bool isSmartPointerSafeMethod(llvm::StringRef methodName);
   void checkOperators(CallOp callOp, cir::LifetimeFunctionAttr m);
-  void checkOtherMethodsAndFunctions(CallOp callOp,
-                                     cir::LifetimeFunctionAttr m);
-  void checkForOwnerAndPointerArguments(CallOp callOp, unsigned firstArgIdx);
+  void checkOtherMethodsAndFunctions(
+      CallOp callOp, cir::LifetimeFunctionAttr m,
+      ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds);
+  void checkForOwnerAndPointerArguments(
+      CallOp callOp, unsigned firstArgIdx,
+      ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds);
 
   // TODO: merge both methods below and pass down an enum.
   //
@@ -136,6 +143,7 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
   ModuleOp theModule;
   // The module is read-only throughout lifetime analysis.
   mlir::SymbolTable *moduleSymbols = nullptr;
+  const FunctionLabelMap *labelTargets = nullptr;
   // Track current function under analysis
   std::optional<FuncOp> currFunc;
 
@@ -562,6 +570,7 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
     FuncOp callee;
     LifetimeFunctionAttr lifetime;
     SmallVector<Value> args;
+    CallParameterKinds parameterKinds;
     SmallVector<ValueSummary, 0> argValues;
     ObjectTargets receiver;
     bool mayThrow = false;
@@ -578,6 +587,7 @@ struct LifetimeCheckPass : public impl::LifetimeCheckBase<LifetimeCheckPass> {
 
   DenseMap<ObjectId, ObjectInfo> objectInfo;
   DenseMap<Value, ObjectId> canonicalObjects;
+  DenseMap<Operation *, SmallVector<ObjectId, 0>> scopeLocals;
   PathState *activeState = nullptr;
   Operation *activeOperation = nullptr;
   bool emittingWitnesses = false;
@@ -1928,26 +1938,50 @@ void LifetimeCheckPass::checkMoveCtor(CallOp callOp, cir::CXXCtorAttr ctor) {
   }
 }
 
-void LifetimeCheckPass::checkForOwnerAndPointerArguments(CallOp callOp,
-                                                         unsigned firstArgIdx) {
+static CallParameterKinds
+resolveCallParameterKinds(CallOp callOp, LifetimeFunctionAttr lifetime) {
+  CallParameterKinds kinds(callOp.getNumArgOperands());
+  if (lifetime && lifetime.hasParameterInfo())
+    for (unsigned param = 0; param < lifetime.getNumParams(); ++param) {
+      unsigned index = lifetime.getParamOperandIndex(param);
+      if (index < kinds.size())
+        kinds[index] = static_cast<LifetimeParameterKind>(
+            lifetime.getParameterKinds()[param]);
+    }
+  // Direct source mappings take precedence. Missing call-site facts stay
+  // unknown; a lowered pointer type does not establish a reference binding.
+  if (auto attrs = callOp.getArgAttrsAttr())
+    for (auto [index, attr] : llvm::enumerate(attrs)) {
+      if (index >= kinds.size() || kinds[index])
+        continue;
+      if (auto kind =
+              cast<DictionaryAttr>(attr).getAs<LifetimeParameterKindAttr>(
+                  getLifetimeParameterKindAttrName()))
+        kinds[index] = kind.getValue();
+    }
+  return kinds;
+}
+
+void LifetimeCheckPass::checkForOwnerAndPointerArguments(
+    CallOp callOp, unsigned firstArgIdx,
+    ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds) {
   auto numOperands = callOp.getNumArgOperands();
   if (firstArgIdx >= numOperands)
     return;
 
   llvm::SmallSetVector<mlir::Value, 8> ownersToInvalidate, ptrsToDeref,
       nullablePtrsToCheck;
-  llvm::SmallSetVector<unsigned, 4> referenceParams;
-  cir::LifetimeFunctionAttr lifetime;
-  if (auto name = callOp.getCallee())
-    if (auto callee = getCalleeFromSymbol(*moduleSymbols, *name))
-      lifetime = callee.getLifetimeAttr();
-  if (lifetime && lifetime.hasParameterInfo())
-    for (unsigned param = 0; param < lifetime.getNumParams(); ++param)
-      if (lifetime.getParameterKinds()[param] ==
-          static_cast<int32_t>(LifetimeParameterKind::LValueReference))
-        referenceParams.insert(lifetime.getParamOperandIndex(param));
   for (unsigned i = firstArgIdx, e = numOperands; i != e; ++i) {
     auto arg = callOp.getArgOperand(i);
+    // Parameter kinds describe binding, not whether an indirect callee reads
+    // pointee contents. Preserve nullable indirect checks even with known kinds.
+    bool useDirectPolicy = callOp.getCallee().has_value();
+    auto collectPointerCheck = [&](Value pointer, bool nullable = false) {
+      if (useDirectPolicy && !nullable)
+        ptrsToDeref.insert(pointer);
+      else
+        nullablePtrsToCheck.insert(pointer);
+    };
     // FIXME: apply p1179 rules as described in 2.5. Very conservative for now:
     //
     // - Owners: always invalidate.
@@ -1961,14 +1995,11 @@ void LifetimeCheckPass::checkForOwnerAndPointerArguments(CallOp callOp,
     // FIXME: even before 2.5 we should only invalidate non-const param types.
     if (owners.count(arg))
       ownersToInvalidate.insert(arg);
-    if (ptrs.count(arg)) {
-      if (referenceParams.count(i))
-        nullablePtrsToCheck.insert(arg);
-      else
-        ptrsToDeref.insert(arg);
-    }
+    if (ptrs.count(arg))
+      collectPointerCheck(arg, parameterKinds[i] ==
+                                   LifetimeParameterKind::LValueReference);
     if (tasks.count(arg))
-      ptrsToDeref.insert(arg);
+      collectPointerCheck(arg);
     if (aggregates.count(arg)) {
       int memberIdx = 0;
       auto sTy = mlir::dyn_cast<RecordType>(
@@ -1977,7 +2008,7 @@ void LifetimeCheckPass::checkForOwnerAndPointerArguments(CallOp callOp,
       for (auto m : sTy.getMembers()) {
         auto ptrMemberAddr = aggregates[arg][memberIdx];
         if (mlir::isa<PointerType>(m) && ptrMemberAddr) {
-          ptrsToDeref.insert(ptrMemberAddr);
+          collectPointerCheck(ptrMemberAddr);
         }
         memberIdx++;
       }
@@ -1989,16 +2020,15 @@ void LifetimeCheckPass::checkForOwnerAndPointerArguments(CallOp callOp,
   for (auto o : ownersToInvalidate)
     checkNonConstUseOfOwner(o, callOp.getLoc());
   for (auto p : ptrsToDeref)
-    checkPointerDeref(p, callOp.getLoc(),
-                      callOp.getCallee() ? DerefStyle::CallParam
-                                         : DerefStyle::NullableCallParam);
+    checkPointerDeref(p, callOp.getLoc(), DerefStyle::CallParam);
   for (auto p : nullablePtrsToCheck)
     if (!ptrsToDeref.count(p))
       checkPointerDeref(p, callOp.getLoc(), DerefStyle::NullableCallParam);
 }
 
 void LifetimeCheckPass::checkOtherMethodsAndFunctions(
-    CallOp callOp, cir::LifetimeFunctionAttr m) {
+    CallOp callOp, cir::LifetimeFunctionAttr m,
+    ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds) {
   unsigned firstArgIdx = 0;
 
   // Looks at a method 'this' pointer:
@@ -2009,7 +2039,7 @@ void LifetimeCheckPass::checkOtherMethodsAndFunctions(
       callOp.getNumArgOperands() > firstArgIdx &&
       !tasks.count(callOp.getArgOperand(firstArgIdx)))
     firstArgIdx++;
-  checkForOwnerAndPointerArguments(callOp, firstArgIdx);
+  checkForOwnerAndPointerArguments(callOp, firstArgIdx, parameterKinds);
 }
 
 bool LifetimeCheckPass::isOwnerOrPointerClassMethod(
@@ -2075,7 +2105,9 @@ void LifetimeCheckPass::trackCallToCoroutine(CallOp callOp) {
   }
 }
 
-void LifetimeCheckPass::checkCall(CallOp callOp) {
+void LifetimeCheckPass::checkCall(
+    CallOp callOp,
+    ArrayRef<std::optional<LifetimeParameterKind>> parameterKinds) {
   if (callOp.getNumArgOperands() == 0)
     return;
 
@@ -2097,7 +2129,7 @@ void LifetimeCheckPass::checkCall(CallOp callOp) {
   }
 
   if (!isOwnerOrPointerMethod)
-    return checkOtherMethodsAndFunctions(callOp, methodDecl);
+    return checkOtherMethodsAndFunctions(callOp, methodDecl, parameterKinds);
 
   // From this point on only owner and pointer class methods handling,
   // starting from special methods.
@@ -2130,16 +2162,15 @@ void LifetimeCheckPass::checkCall(CallOp callOp) {
     checkPointerDeref(addr, callOp.getLoc());
 }
 
-// Labels can split a case into several blocks even without a goto. Walking
-// those blocks in order is sound only when each branch goes to the next block.
-static bool hasLinearBlockOrder(Region &region) {
+// Only the switch shell is traversed in order. Each case body uses the normal
+// CIR region worklist, so labels and backedges inside a case need not be linear.
+static bool hasLinearSwitchShell(Region &region) {
   bool reachedExit = false;
   for (Block &block : region) {
     if (block.empty() || block.getNumArguments())
       return false;
     if (reachedExit) {
-      // CIRGen creates these unreachable continuations after terminators.
-      // They have no analysis effects and cannot be entered by a branch.
+      // CIRGen can leave an unreachable continuation after a terminator.
       if (!block.hasNoPredecessors() || !llvm::hasSingleElement(block) ||
           !isa<YieldOp, BreakOp, ContinueOp>(block.front()))
         return false;
@@ -2155,49 +2186,91 @@ static bool hasLinearBlockOrder(Region &region) {
     } else {
       reachedExit = true;
     }
-    for (Operation &op : block)
-      for (Region &nested : op.getRegions())
-        if (!hasLinearBlockOrder(nested))
-          return false;
   }
   return true;
 }
 
-static LogicalResult validateSwitchControlFlow(Operation *op) {
-  auto result = op->walk([](cir::FuncOp function) -> WalkResult {
-    bool hasSwitch = false;
-    function.walk([&](SwitchOp) { hasSwitch = true; });
-    if (!hasSwitch)
-      return WalkResult::advance();
-
-    return function.walk([](Operation *nested) -> WalkResult {
-      // Symbolic gotos can enter a case from outside its region, bypassing the
-      // state at switch entry. Until CFG analysis is available, reject them
-      // anywhere in a function containing a switch.
-      if (isa<cir::GotoOp, cir::IndirectGotoOp>(nested)) {
-        mlir::emitError(nested->getLoc(),
+static LogicalResult validateLifetimeControlFlow(FuncOp function,
+                                                 FunctionLabelMap &labels) {
+  bool hasSwitch = false;
+  bool hasSymbolicJump = false;
+  auto indexed = function.walk([&](Operation *op) -> WalkResult {
+    hasSwitch |= isa<SwitchOp>(op);
+    hasSymbolicJump |= isa<GotoOp, IndirectGotoOp>(op);
+    if (auto label = dyn_cast<LabelOp>(op)) {
+      if (label->getBlock()->getNumArguments()) {
+        mlir::emitError(label.getLoc(),
                         "unsupported control flow in lifetime analysis: "
-                        "goto in a function containing a switch");
+                        "symbolic label block must not take arguments");
         return WalkResult::interrupt();
       }
-      if (auto switchOp = dyn_cast<SwitchOp>(nested)) {
-        auto &body = switchOp.getBody();
-        if (body.empty())
-          return WalkResult::advance();
-        SmallVector<CaseOp> cases;
-        if (!hasLinearBlockOrder(body) || !switchOp.isSimpleForm(cases) ||
-            llvm::any_of(cases, [&](CaseOp caseOp) {
-              return caseOp.getRegion().empty() ||
-                     caseOp->getParentOp() != switchOp.getOperation();
-            })) {
-          mlir::emitError(switchOp.getLoc(),
-                          "unsupported control flow in lifetime analysis: "
-                          "switch requires linear case blocks");
-          return WalkResult::interrupt();
-        }
+      if (!labels.try_emplace(label.getLabelAttr(), label->getBlock()).second) {
+        mlir::emitError(label.getLoc(),
+                        "unsupported control flow in lifetime analysis: "
+                        "duplicate symbolic label");
+        return WalkResult::interrupt();
       }
-      return WalkResult::advance();
-    });
+    }
+    return WalkResult::advance();
+  });
+  if (indexed.wasInterrupted())
+    return failure();
+  if (!hasSwitch && !hasSymbolicJump)
+    return success();
+
+  auto result = function.walk([&](Operation *op) -> WalkResult {
+    if (auto jump = dyn_cast<GotoOp>(op)) {
+      auto target = labels.find(jump.getLabelAttr());
+      if (target == labels.end()) {
+        mlir::emitError(jump.getLoc(),
+                        "unsupported control flow in lifetime analysis: "
+                        "unresolved symbolic goto target");
+        return WalkResult::interrupt();
+      }
+      Region *targetRegion = target->second->getParent();
+      Region *sourceRegion = jump->getParentRegion();
+      // Compare regions, not their owning operations: sibling cases and if
+      // branches can share an owner but cannot be entered from each other.
+      if (targetRegion != sourceRegion &&
+          !targetRegion->isProperAncestor(sourceRegion)) {
+        mlir::emitError(jump.getLoc(),
+                        "unsupported control flow in lifetime analysis: "
+                        "goto enters a nested or sibling region");
+        return WalkResult::interrupt();
+      }
+    } else if (isa<IndirectGotoOp>(op)) {
+      mlir::emitError(op->getLoc(),
+                      "unsupported control flow in lifetime analysis: "
+                      "indirect goto");
+      return WalkResult::interrupt();
+    }
+
+    // Preserve function-local failure and diagnostic replay for unsupported
+    // successors in switch-free functions. Switches retain their preflight
+    // shape validation; BrOp is handled by the existing CIR region worklist.
+    if (hasSwitch && op->getNumSuccessors() && !isa<BrOp>(op)) {
+      mlir::emitError(op->getLoc(),
+                      "unsupported control flow in lifetime analysis: "
+                      "unsupported successor terminator in switch function");
+      return WalkResult::interrupt();
+    }
+    if (auto switchOp = dyn_cast<SwitchOp>(op)) {
+      Region &body = switchOp.getBody();
+      if (body.empty())
+        return WalkResult::advance();
+      SmallVector<CaseOp> cases;
+      if (!hasLinearSwitchShell(body) || !switchOp.isSimpleForm(cases) ||
+          llvm::any_of(cases, [&](CaseOp caseOp) {
+            return caseOp.getRegion().empty() ||
+                   caseOp->getParentOp() != switchOp.getOperation();
+          })) {
+        mlir::emitError(switchOp.getLoc(),
+                        "unsupported control flow in lifetime analysis: "
+                        "switch requires a simple direct-case shell");
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
   });
   return failure(result.wasInterrupted());
 }
@@ -2737,6 +2810,7 @@ bool LifetimeCheckPass::checkUse(PathState &state, const ObjectTargets &targets,
 void LifetimeCheckPass::indexObjects(FuncOp function) {
   objectInfo.clear();
   canonicalObjects.clear();
+  scopeLocals.clear();
   ptrs.clear();
   owners.clear();
   aggregates.clear();
@@ -2807,6 +2881,42 @@ void LifetimeCheckPass::indexObjects(FuncOp function) {
             nonnull = true;
       objectInfo[argument].unknownIncomingNullness = !nonnull;
     }
+  }
+
+  // Index completed object identities by their storage root's nearest
+  // allocation scope, including scopes handled by structured-region analysis.
+  // Memoize ancestor chains so nested scopes do not repeatedly walk them.
+  DenseMap<Operation *, Operation *> enclosingScopes;
+  auto findAllocationScope = [&](Operation *parent) {
+    SmallVector<Operation *, 8> ancestors;
+    Operation *scope = nullptr;
+    while (parent) {
+      auto found = enclosingScopes.find(parent);
+      if (found != enclosingScopes.end()) {
+        scope = found->second;
+        break;
+      }
+      if (parent->hasTrait<OpTrait::AutomaticAllocationScope>()) {
+        scope = parent;
+        enclosingScopes.try_emplace(parent, scope);
+        break;
+      }
+      ancestors.push_back(parent);
+      parent = parent->getParentOp();
+    }
+    for (Operation *ancestor : ancestors)
+      enclosingScopes.try_emplace(ancestor, scope);
+    return scope;
+  };
+  // Preserve the objectInfo iteration order used by scope-exit invalidation.
+  for (const auto &entry : objectInfo) {
+    if (entry.second.callerOwned)
+      continue;
+    auto *definition = entry.second.storageRoot.getDefiningOp();
+    if (!definition)
+      continue;
+    if (auto *scope = findAllocationScope(definition->getParentOp()))
+      scopeLocals[scope].push_back(entry.first);
   }
 }
 
@@ -3786,6 +3896,7 @@ LifetimeCheckPass::analyzeCall(Operation *operation, PathState state) {
   clearStoredBooleanValues(state);
   if (auto modeled = modelLibraryCall(info, state))
     return std::move(*modeled);
+  info.parameterKinds = resolveCallParameterKinds(call, info.lifetime);
 
   std::optional<PathState> exceptional;
   if (info.mayThrow)
@@ -3848,7 +3959,7 @@ LifetimeCheckPass::analyzeCall(Operation *operation, PathState state) {
   }
   if (!handledSpecial) {
     StateGuard guard(*this, state);
-    checkCall(call);
+    checkCall(call, info.parameterKinds);
   }
   if ((ctor || assignment) && !handledSpecial && info.receiver.isDefinite()) {
     auto object = info.receiver.objects.front();
@@ -3857,33 +3968,30 @@ LifetimeCheckPass::analyzeCall(Operation *operation, PathState state) {
       reinitializeObjects(state, info.receiver, call.getLoc());
   }
 
-  if (info.lifetime && info.lifetime.hasParameterInfo()) {
-    for (unsigned param = 0; param < info.lifetime.getNumParams(); ++param) {
-      unsigned index = info.lifetime.getParamOperandIndex(param);
-      if (index >= info.args.size() || (handledSpecial && index == 1))
-        continue;
-      auto targets = resolveAddress(info.args[index], state);
-      if (!info.lifetime.isParamRValueReference(param)) {
-        for (ObjectId object : targets.objects) {
-          auto type = getObjectInfo(object);
-          if (type && !tasks.count(object) &&
-              (type->category == ObjectInfo::Record ||
-               type->category == ObjectInfo::Aggregate) &&
-              state.pmap[object].count(State::getInvalid()))
-            checkUse(state, ObjectTargets{{object}}, call.getLoc());
-        }
-        continue;
+  for (auto [index, kind] : llvm::enumerate(info.parameterKinds)) {
+    if (!kind || (handledSpecial && index == 1))
+      continue;
+    auto targets = resolveAddress(info.args[index], state);
+    if (*kind != LifetimeParameterKind::RValueReference) {
+      for (ObjectId object : targets.objects) {
+        auto type = getObjectInfo(object);
+        if (type && !tasks.count(object) &&
+            (type->category == ObjectInfo::Record ||
+             type->category == ObjectInfo::Aggregate) &&
+            state.pmap[object].count(State::getInvalid()))
+          checkUse(state, ObjectTargets{{object}}, call.getLoc());
       }
-      checkUse(state, targets, call.getLoc(), UseAfterMove);
-      // Obtaining an element reference does not consume the containing tuple.
-      // Keep the generic source checks, result summary, and exceptional flow.
-      if (info.lifetime.getLibraryFunction() ==
-          LifetimeLibraryFunction::TupleGet)
-        continue;
-      markMoved(state, targets, call.getLoc());
-      if (exceptional)
-        markMoved(*exceptional, targets, call.getLoc());
+      continue;
     }
+    checkUse(state, targets, call.getLoc(), UseAfterMove);
+    // Obtaining an element reference does not consume the containing tuple.
+    // Keep the generic source checks, result summary, and exceptional flow.
+    if (info.lifetime &&
+        info.lifetime.getLibraryFunction() == LifetimeLibraryFunction::TupleGet)
+      continue;
+    markMoved(state, targets, call.getLoc());
+    if (exceptional)
+      markMoved(*exceptional, targets, call.getLoc());
   }
   if (info.lifetime && info.lifetime.getIsMethod() && !ctor && !assignment &&
       !dyn_cast_if_present<CXXDtorAttr>(special)) {
@@ -4028,18 +4136,9 @@ LifetimeCheckPass::leaveOperationScope(Operation *scope, FlowResult flow) {
       run(std::move(jump.state), 5, {}, {}, jump.label);
     flow = std::move(cleaned);
   }
-  SmallVector<ObjectId> locals;
-  for (auto entry : objectInfo) {
-    auto *definition = entry.second.storageRoot.getDefiningOp();
-    if (entry.second.callerOwned || !definition)
-      continue;
-    auto *parent = definition->getParentOp();
-    while (parent && parent != scope &&
-           !parent->hasTrait<OpTrait::AutomaticAllocationScope>())
-      parent = parent->getParentOp();
-    if (parent == scope)
-      locals.push_back(entry.first);
-  }
+  ArrayRef<ObjectId> locals;
+  if (auto found = scopeLocals.find(scope); found != scopeLocals.end())
+    locals = found->second;
   return leaveScope(std::move(flow), locals, getEndLocForHist(scope));
 }
 
@@ -4112,11 +4211,6 @@ LifetimeCheckPass::analyzeRegionImpl(Region &region, PathState state,
     // CIR is normally structured here. Follow explicit block edges as well:
     // unreachable continuation blocks after return/throw are not executable.
     DenseMap<Block *, PathState> entries;
-    DenseMap<StringAttr, Block *> labels;
-    for (Block &block : region)
-      for (Operation &operation : block)
-        if (auto label = dyn_cast<LabelOp>(operation))
-          labels[label.getLabelAttr()] = &block;
     SmallVector<Block *> worklist;
     auto enqueue = [&](Block *successor, ValueRange operands, PathState next) {
       for (auto pair : llvm::zip(successor->getArguments(), operands))
@@ -4140,8 +4234,9 @@ LifetimeCheckPass::analyzeRegionImpl(Region &region, PathState state,
       FlowResult blockFlow = analyzeBlock(*block, entries[block]);
       SmallVector<GotoState, 0> outgoing;
       for (auto &jump : blockFlow.gotos) {
-        auto target = labels.find(jump.label);
-        if (target != labels.end())
+        auto target = labelTargets->find(jump.label);
+        if (target != labelTargets->end() &&
+            target->second->getParent() == &region)
           enqueue(target->second, {}, std::move(jump.state));
         else
           outgoing.push_back(std::move(jump));
@@ -4636,14 +4731,21 @@ void LifetimeCheckPass::runOnOperation() {
     mlir::emitError(op->getLoc()) << *opts.error;
     return signalPassFailure();
   }
-  if (failed(validateSwitchControlFlow(op)))
-    return signalPassFailure();
   theModule = cast<ModuleOp>(op);
+  SmallVector<FuncOp> functions(theModule.getOps<FuncOp>());
+  std::vector<FunctionLabelMap> labels(functions.size());
+  for (auto [index, function] : llvm::enumerate(functions))
+    if (failed(validateLifetimeControlFlow(function, labels[index])))
+      return signalPassFailure();
+
   mlir::SymbolTable symbols(theModule);
   llvm::SaveAndRestore<mlir::SymbolTable *> symbolGuard(moduleSymbols,
                                                         &symbols);
-  for (auto function : theModule.getOps<FuncOp>())
+  for (auto [index, function] : llvm::enumerate(functions)) {
+    llvm::SaveAndRestore<const FunctionLabelMap *> labelGuard(labelTargets,
+                                                            &labels[index]);
     checkFunc(function);
+  }
 }
 
 std::unique_ptr<Pass> mlir::createLifetimeCheckPass() {

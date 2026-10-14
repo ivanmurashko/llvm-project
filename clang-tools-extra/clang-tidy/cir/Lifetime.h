@@ -31,6 +31,7 @@ private:
   const std::vector<StringRef> RemarksList;
   const std::vector<StringRef> HistoryList;
   const unsigned HistLimit;
+  const bool AnalyzeUnusedMainFileFunctions;
 };
 
 } // namespace clang::tidy::cir

@@ -1,0 +1,65 @@
+// RUN: cir-opt %s --verify-roundtrip | FileCheck %s
+// RUN: cir-opt %s --cir-canonicalize --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --verify-roundtrip | FileCheck %s
+
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!fn = !cir.ptr<!cir.func<(!i, !p, !p)>>
+!callback = !cir.ptr<!cir.func<()>>
+module {
+  cir.func private @mixed(!i, !p, !p) attributes {lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [0, 1, 2], parameter_indices = [0, 1, 2]>}
+  cir.func private @unknown(!p)
+  cir.func private @use_callback(!callback)
+
+  cir.func @indirect(%callee : !fn, %value : !i, %left : !p, %right : !p) {
+    cir.call %callee(%value, %left, %right) : (!fn, !i {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<value>}, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}) -> ()
+    cir.return
+  }
+  // CHECK-LABEL: cir.func @indirect(
+  // CHECK: cir.call %
+  // CHECK-SAME: #cir.lifetime_parameter_kind<value>
+  // CHECK-SAME: #cir.lifetime_parameter_kind<lvalue_ref>
+  // CHECK-SAME: #cir.lifetime_parameter_kind<rvalue_ref>
+
+  // A direct declaration's mapped entries agree. Missing call-site entries
+  // remain unknown rather than silently defaulting to value.
+  cir.func @direct(%value : !i, %left : !p, %right : !p) {
+    cir.call @mixed(%value, %left, %right) : (!i, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}) -> ()
+    cir.call @unknown(%right) : (!p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}) -> ()
+    cir.call @unknown(%right) : (!p) -> ()
+    cir.return
+  }
+  // CHECK-LABEL: cir.func @direct(
+  // CHECK: cir.call @mixed
+  // CHECK-SAME: #cir.lifetime_parameter_kind<lvalue_ref>
+  // CHECK-SAME: #cir.lifetime_parameter_kind<rvalue_ref>
+  // CHECK: cir.call @unknown
+  // CHECK-SAME: #cir.lifetime_parameter_kind<rvalue_ref>
+  // CHECK: cir.call @unknown
+  // CHECK-NOT: cir.lifetime_parameter_kind
+  // CHECK: cir.return
+
+  cir.func @function_reference(%callback : !callback) {
+    cir.call @use_callback(%callback) : (!callback {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}) -> ()
+    cir.return
+  }
+  // CHECK-LABEL: cir.func @function_reference(
+  // CHECK: cir.call @use_callback
+  // CHECK-SAME: #cir.lifetime_parameter_kind<lvalue_ref>
+
+  // The same serialized contract survives EH lowering to TryCallOp. F2 does
+  // not add TryCallOp lifetime analysis or change exceptional state semantics.
+  cir.func @try_call(%callee : !fn, %value : !i, %left : !p, %right : !p) {
+    cir.try_call %callee(%value, %left, %right) ^normal, ^unwind : (!fn, !i {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<value>}, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<lvalue_ref>}, !p {cir.lifetime_parameter_kind = #cir.lifetime_parameter_kind<rvalue_ref>}) -> ()
+  ^normal:
+    cir.return
+  ^unwind:
+    %exception, %type = cir.eh.inflight_exception cleanup
+    cir.return
+  }
+  // CHECK-LABEL: cir.func @try_call(
+  // CHECK: cir.try_call %
+  // CHECK-SAME: #cir.lifetime_parameter_kind<value>
+  // CHECK-SAME: #cir.lifetime_parameter_kind<lvalue_ref>
+  // CHECK-SAME: #cir.lifetime_parameter_kind<rvalue_ref>
+}

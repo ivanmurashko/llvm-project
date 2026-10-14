@@ -337,6 +337,31 @@ def CIR_LifetimeParameterKind : CIR_I32Enum<
   I32EnumCase<"RValueReference", 2, "rvalue_ref">
 ]>;
 
+def CIR_LifetimeParameterKindAttr
+    : CIR_EnumAttr<CIR_LifetimeParameterKind, "lifetime_parameter_kind"> {
+  let summary = "Source parameter category for a CIR call argument";
+  let description = [{
+    Stored under the `cir.lifetime_parameter_kind` key in a `cir.call` or
+    `cir.try_call` argument dictionary. The containing `arg_attrs` array is
+    indexed by call arguments, excluding an indirect callee operand. An absent
+    key is unknown; it does not imply a value parameter.
+
+    This is the source parameter's reference category, not the argument
+    expression's value category or a guarantee that the callee consumes the
+    object. Reference categories require a CIR pointer operand, including
+    references to functions. They do not promise nonnull pointer contents.
+    When a direct callee has a complete source parameter map, a present
+    call-site kind must name an entry in that map and agree with it. It cannot
+    annotate an implicit object or an unmapped hidden argument. Existing
+    `cir.func` lifetime metadata remains the declaration-level representation.
+
+    CIRGen emits this call-site information only for proven one-to-one
+    ordinary indirect-call mappings with lifetime preservation enabled.
+    ABI call rewriting and direct LLVM lowering remove it, even when the
+    call's signature does not change.
+  }];
+}
+
 def CIR_LifetimeFunctionAttr : CIR_Attr<"LifetimeFunction", "lifetime_function"> {
   let summary = "Function properties used by lifetime analysis";
   let description = [{

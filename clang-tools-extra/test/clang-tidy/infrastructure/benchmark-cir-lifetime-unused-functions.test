@@ -1,0 +1,87 @@
+# RUN: split-file %s %t
+# RUN: %python %t/test.py %S/../../../clang-tidy/tool/benchmark-cir-lifetime.py
+
+#--- test.py
+import argparse
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import unittest
+
+spec = importlib.util.spec_from_file_location("runner", Path(sys.argv.pop(1)))
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+CIR = "cir-lifetime-check"
+BUGPRONE = "bugprone-use-after-move"
+OPTION = "AnalyzeUnusedMainFileFunctions"
+
+
+def arguments(**changes):
+    values = dict(baseline_check=CIR, candidate_check=CIR, check_option=[],
+                  baseline_check_option=[], candidate_check_option=[],
+                  header_filter=".*", system_headers=False)
+    values.update(changes)
+    return argparse.Namespace(**values)
+
+
+class UnusedFunctionOptionsTest(unittest.TestCase):
+    def test_default_config_is_unchanged(self):
+        expected = {
+            "Checks": "-*," + CIR,
+            "CheckOptions": {CIR + ".HistoryList": "all",
+                             CIR + ".RemarksList": "", CIR + ".HistLimit": "1"},
+            "WarningsAsErrors": "", "HeaderFilterRegex": ".*",
+            "SystemHeaders": False,
+        }
+        for variant in (None, "baseline", "candidate"):
+            self.assertEqual(json.dumps(runner.analysis_config(arguments(), variant)),
+                             json.dumps(expected))
+
+    def test_explicit_shared_booleans_are_canonical(self):
+        for value in ("true", "false", "TRUE", "False"):
+            args = arguments(check_option=[OPTION + "=" + value])
+            for variant in ("baseline", "candidate"):
+                config = runner.analysis_config(args, variant)
+                self.assertEqual(config["CheckOptions"][CIR + "." + OPTION],
+                                 value.lower())
+
+    def test_per_variant_option_does_not_leak(self):
+        args = arguments(candidate_check_option=[CIR + "." + OPTION + "=true"])
+        self.assertNotIn(CIR + "." + OPTION,
+                         runner.analysis_config(args, "baseline")["CheckOptions"])
+        self.assertEqual(runner.analysis_config(args, "candidate")["CheckOptions"]
+                         [CIR + "." + OPTION], "true")
+
+    def test_mixed_checks_allow_only_the_cir_variant(self):
+        args = arguments(baseline_check=BUGPRONE,
+                         candidate_check_option=[OPTION + "=false"])
+        baseline = runner.analysis_config(args, "baseline")["CheckOptions"]
+        self.assertEqual(baseline, {BUGPRONE + ".InvalidationFunctions": "",
+                                    BUGPRONE + ".ReinitializationFunctions": ""})
+        self.assertEqual(runner.analysis_config(args, "candidate")["CheckOptions"]
+                         [CIR + "." + OPTION], "false")
+        args.baseline_check_option = [OPTION + "=true"]
+        with self.assertRaisesRegex(ValueError, "unknown check option"):
+            runner.analysis_config(args, "baseline")
+
+    def test_mixed_checks_reject_shared_options(self):
+        args = arguments(baseline_check=BUGPRONE, check_option=[OPTION + "=true"])
+        with self.assertRaisesRegex(ValueError, "matching checks"):
+            runner.analysis_config(args, "candidate")
+
+    def test_only_explicit_boolean_values_are_accepted(self):
+        for value in ("", "1", "0", "yes", "no", " true", "true ", "null"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be true or false"):
+                    runner.analysis_config(arguments(check_option=[OPTION + "=" + value]))
+
+    def test_other_unknown_options_still_fail(self):
+        for setting in ("OtherOption=true", "OtherCheck." + OPTION + "=true",
+                        OPTION, "HistLimit=not-a-number"):
+            with self.subTest(setting=setting):
+                with self.assertRaises(ValueError):
+                    runner.analysis_config(arguments(check_option=[setting]))
+
+
+unittest.main()

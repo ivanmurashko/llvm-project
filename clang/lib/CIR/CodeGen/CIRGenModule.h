@@ -37,6 +37,7 @@
 #include "clang/Basic/TargetInfo.h"
 #include "clang/CIR/Dialect/IR/CIROpsEnums.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/TargetParser/Triple.h"
@@ -86,6 +87,7 @@ private:
 
   const clang::CodeGenOptions &codeGenOpts;
   bool preserveLifetimeScopes;
+  llvm::SmallPtrSet<const clang::FunctionDecl *, 8> lifetimeAnalysisRoots;
 
   /// A "module" matches a c/cpp source file: containing a list of functions.
   mlir::ModuleOp theModule;
@@ -186,6 +188,9 @@ public:
   const clang::TargetInfo &getTarget() const { return target; }
   const clang::CodeGenOptions &getCodeGenOpts() const { return codeGenOpts; }
   bool shouldPreserveLifetimeScopes() const { return preserveLifetimeScopes; }
+  bool addLifetimeAnalysisRoot(const clang::FunctionDecl *function) {
+    return lifetimeAnalysisRoots.insert(function->getCanonicalDecl()).second;
+  }
   clang::DiagnosticsEngine &getDiags() const { return diags; }
   CIRGenTypes &getTypes() { return genTypes; }
   const clang::LangOptions &getLangOpts() const { return langOpts; }

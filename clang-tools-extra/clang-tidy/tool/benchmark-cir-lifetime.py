@@ -183,7 +183,10 @@ def parse_args():
         action="append",
         default=[],
         metavar="NAME=VALUE",
-        help="HistoryList, RemarksList, or HistLimit; identical for both tools",
+        help=(
+            "HistoryList, RemarksList, HistLimit, or AnalyzeUnusedMainFileFunctions; "
+            "identical for both tools"
+        ),
     )
     parser.add_argument("--header-filter", default=".*")
     parser.add_argument(
@@ -271,8 +274,13 @@ def analysis_config(args, variant=None):
     for setting in settings:
         name, separator, value = setting.partition("=")
         name = name.removeprefix(check + ".")
-        if not separator or name not in options:
+        unused_functions = check == CHECK and name == "AnalyzeUnusedMainFileFunctions"
+        if not separator or (name not in options and not unused_functions):
             raise ValueError("unknown check option: " + setting)
+        if unused_functions:
+            if value.lower() not in ("true", "false"):
+                raise ValueError("AnalyzeUnusedMainFileFunctions must be true or false")
+            value = value.lower()
         options[name] = value
     if check == CHECK and (
         not options["HistLimit"].isdigit() or int(options["HistLimit"]) > 2**32 - 1

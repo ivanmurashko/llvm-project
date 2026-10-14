@@ -177,6 +177,9 @@ static LogicalResult verifyOpenCLVersionAttr(Operation *op,
 LogicalResult cir::CIRDialect::verifyRegionArgAttribute(
     Operation *op, unsigned /*regionIndex*/, unsigned /*argIndex*/,
     NamedAttribute attr) {
+  if (attr.getName().getValue() == getLifetimeParameterKindAttrName())
+    return op->emitOpError()
+           << "cir.lifetime_parameter_kind is only valid on call arguments";
   if (!isOpenCLVersionAttrName(attr.getName().getValue()))
     return success();
 
@@ -186,6 +189,9 @@ LogicalResult cir::CIRDialect::verifyRegionArgAttribute(
 LogicalResult cir::CIRDialect::verifyRegionResultAttribute(
     Operation *op, unsigned /*regionIndex*/, unsigned /*resultIndex*/,
     NamedAttribute attr) {
+  if (attr.getName().getValue() == getLifetimeParameterKindAttrName())
+    return op->emitOpError()
+           << "cir.lifetime_parameter_kind is only valid on call arguments";
   if (!isOpenCLVersionAttrName(attr.getName().getValue()))
     return success();
 
@@ -254,6 +260,9 @@ LogicalResult
 cir::CIRDialect::verifyOperationAttribute(mlir::Operation *op,
                                           mlir::NamedAttribute attr) {
   llvm::StringRef attrName = attr.getName().getValue();
+  if (attrName == getLifetimeParameterKindAttrName())
+    return op->emitOpError()
+           << "cir.lifetime_parameter_kind is only valid on call arguments";
   if (isOpenCLVersionAttrName(attrName))
     return verifyOpenCLVersionAttr(op, attr);
 
@@ -1498,6 +1507,12 @@ static mlir::ParseResult parseCallCommon(mlir::OpAsmParser &parser,
                                                   resultTypes, resultAttrs))
     return mlir::failure();
 
+  if (!calleeAttr && !argAttrs.empty() && argAttrs.front() &&
+      argAttrs.front().get(getLifetimeParameterKindAttrName()))
+    return parser.emitError(
+        opsLoc,
+        "cir.lifetime_parameter_kind cannot annotate an indirect callee");
+
   if (resultTypes.size() > 1 || resultAttrs.size() > 1)
     return parser.emitError(
         parser.getCurrentLocation(),
@@ -1645,6 +1660,84 @@ void cir::CallOp::print(mlir::OpAsmPrinter &p) {
                   getArgAttrsAttr(), getResAttrsAttr());
 }
 
+mlir::ArrayAttr cir::stripLifetimeParameterKindAttrs(mlir::ArrayAttr attrs) {
+  if (!attrs || llvm::none_of(attrs, [](Attribute attr) {
+        return cast<DictionaryAttr>(attr).get(
+            getLifetimeParameterKindAttrName());
+      }))
+    return attrs;
+  SmallVector<Attribute> stripped;
+  stripped.reserve(attrs.size());
+  for (Attribute attr : attrs) {
+    auto dict = cast<DictionaryAttr>(attr);
+    if (!dict.get(getLifetimeParameterKindAttrName())) {
+      stripped.push_back(dict);
+      continue;
+    }
+    NamedAttrList entries(dict);
+    entries.erase(getLifetimeParameterKindAttrName());
+    stripped.push_back(entries.getDictionary(attrs.getContext()));
+  }
+  return ArrayAttr::get(attrs.getContext(), stripped);
+}
+
+static LogicalResult verifyCallLifetimeParameters(Operation *op,
+                                                  cir::FuncOp callee) {
+  auto call = cast<cir::CIRCallOpInterface>(op);
+  auto attrs = op->getAttrOfType<ArrayAttr>(CIRDialect::getArgAttrsAttrName());
+  if (attrs && attrs.size() != call.getNumArgOperands())
+    return op->emitOpError()
+           << "call argument attributes must match the number of argument "
+              "operands";
+  if (attrs) {
+    for (auto [index, attr] : llvm::enumerate(attrs)) {
+      auto value =
+          cast<DictionaryAttr>(attr).get(getLifetimeParameterKindAttrName());
+      if (!value)
+        continue;
+      auto kind = dyn_cast<LifetimeParameterKindAttr>(value);
+      if (!kind)
+        return op->emitOpError() << "cir.lifetime_parameter_kind must be a "
+                                    "#cir.lifetime_parameter_kind attribute";
+      if (kind.getValue() != LifetimeParameterKind::Value &&
+          !isa<cir::PointerType>(call.getArgOperand(index).getType()))
+        return op->emitOpError()
+               << "a lifetime reference argument must have pointer type";
+    }
+  }
+  if (auto results =
+          op->getAttrOfType<ArrayAttr>(CIRDialect::getResAttrsAttrName()))
+    for (Attribute attr : results)
+      if (cast<DictionaryAttr>(attr).get(getLifetimeParameterKindAttrName()))
+        return op->emitOpError()
+               << "cir.lifetime_parameter_kind is only valid on call arguments";
+
+  auto lifetime = callee ? callee.getLifetimeAttr() : LifetimeFunctionAttr{};
+  if (attrs && lifetime && lifetime.hasParameterInfo()) {
+    auto indices = lifetime.getParameterIndices().asArrayRef();
+    unsigned parameter = 0;
+    for (auto [index, attr] : llvm::enumerate(attrs)) {
+      auto kind = cast<DictionaryAttr>(attr).getAs<LifetimeParameterKindAttr>(
+          getLifetimeParameterKindAttrName());
+      if (!kind)
+        continue;
+      while (parameter < indices.size() &&
+             indices[parameter] < static_cast<int32_t>(index))
+        ++parameter;
+      if (parameter == indices.size() ||
+          indices[parameter] != static_cast<int32_t>(index))
+        return op->emitOpError()
+               << "call lifetime parameter kind does not name a mapped source "
+                  "parameter";
+      if (static_cast<int32_t>(kind.getValue()) !=
+          lifetime.getParameterKinds()[parameter])
+        return op->emitOpError()
+               << "call lifetime parameter kind conflicts with callee metadata";
+    }
+  }
+  return success();
+}
+
 static LogicalResult
 verifyCallCommInSymbolUses(mlir::Operation *op,
                            SymbolTableCollection &symbolTable) {
@@ -1653,6 +1746,7 @@ verifyCallCommInSymbolUses(mlir::Operation *op,
   // An indirect call is checked against the function type its callee pointer
   // points to, and a direct call against its callee's declaration.
   cir::FuncType fnType;
+  cir::FuncOp directCallee;
   bool hasPrototype = true;
   auto fnAttr =
       op->getAttrOfType<FlatSymbolRefAttr>(CIRDialect::getCalleeAttrName());
@@ -1673,6 +1767,7 @@ verifyCallCommInSymbolUses(mlir::Operation *op,
                                << "' does not reference a valid function";
     fnType = fn.getFunctionType();
     hasPrototype = !fn.getNoProto();
+    directCallee = fn;
   }
 
   // Verify that the operand and result types match the callee.  Operands are
@@ -1712,7 +1807,7 @@ verifyCallCommInSymbolUses(mlir::Operation *op,
            << op->getResult(0).getType();
   }
 
-  return mlir::success();
+  return verifyCallLifetimeParameters(op, directCallee);
 }
 
 LogicalResult
