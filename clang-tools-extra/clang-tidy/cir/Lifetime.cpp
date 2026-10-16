@@ -15,6 +15,7 @@
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/Timing.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/DeclCXX.h"
@@ -29,13 +30,76 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/raw_ostream.h"
 #include <optional>
 
 using namespace clang::ast_matchers;
 
 namespace clang::tidy::cir {
 namespace {
+
+/// Keep profiling separate from safety diagnostics. A partial profile records
+/// early exits, and an output failure does not prevent lifetime analysis.
+class CIRProfile {
+public:
+  CIRProfile(StringRef Output, StringRef File, unsigned RequestedThreads)
+      : Output(Output.str()), File(File.str()),
+        RequestedThreads(RequestedThreads), TimingStream(TimingJSON) {
+    Timing.setOutput(mlir::createOutputStrategy(
+        mlir::DefaultTimingManager::OutputFormat::Json, TimingStream));
+    Timing.setEnabled(true);
+    Root = Timing.getRootScope();
+  }
+
+  ~CIRProfile() {
+    Root.stop();
+    Timing.print();
+    Timing.setEnabled(false);
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(Output, EC, llvm::sys::fs::CD_CreateNew);
+    if (EC) {
+      llvm::errs() << "Unable to write CIR profile '" << Output
+                   << "': " << EC.message() << '\n';
+      return;
+    }
+    llvm::json::OStream JSON(OS, 2);
+    JSON.object([&] {
+      JSON.attribute("schema_version", 1);
+      JSON.attribute("file", File);
+      JSON.attribute("complete", Complete);
+      JSON.attribute("requested_threads", RequestedThreads);
+      JSON.attribute("effective_threads", EffectiveThreads);
+      JSON.attributeBegin("timing");
+      JSON.rawValue([&](llvm::raw_ostream &Stream) { Stream << TimingJSON; });
+      JSON.attributeEnd();
+    });
+    OS << '\n';
+    OS.close();
+    if (OS.has_error()) {
+      llvm::errs() << "Unable to finish CIR profile '" << Output
+                   << "': " << OS.error().message() << '\n';
+      OS.clear_error();
+    }
+  }
+
+  mlir::TimingScope &getRootScope() { return Root; }
+  void setEffectiveThreads(unsigned Threads) { EffectiveThreads = Threads; }
+  void complete() { Complete = true; }
+
+private:
+  const std::string Output;
+  const std::string File;
+  const unsigned RequestedThreads;
+  unsigned EffectiveThreads = 1;
+  bool Complete = false;
+  std::string TimingJSON;
+  llvm::raw_string_ostream TimingStream;
+  mlir::DefaultTimingManager Timing;
+  mlir::TimingScope Root;
+};
 
 /// Keep diagnostics in clang-tidy's diagnostic stream, including attached notes
 /// and remarks, so filtering and YAML export retain the check's name.
@@ -218,6 +282,7 @@ Lifetime::Lifetime(StringRef Name, ClangTidyContext *Context)
           utils::options::parseStringList(Options.get("HistoryList", "all"))),
       HistLimit(Options.get("HistLimit", 1U)),
       NumThreads(Options.get("NumThreads", 0U)),
+      ProfileOutput(Options.get("ProfileOutput", "")),
       AnalyzeUnusedMainFileFunctions(
           Options.get("AnalyzeUnusedMainFileFunctions", false)) {}
 
@@ -228,6 +293,7 @@ void Lifetime::storeOptions(ClangTidyOptions::OptionMap &Opts) {
                 utils::options::serializeStringList(HistoryList));
   Options.store(Opts, "HistLimit", HistLimit);
   Options.store(Opts, "NumThreads", NumThreads);
+  Options.store(Opts, "ProfileOutput", ProfileOutput);
   Options.store(Opts, "AnalyzeUnusedMainFileFunctions",
                 AnalyzeUnusedMainFileFunctions);
 }
@@ -242,10 +308,20 @@ void Lifetime::check(const MatchFinder::MatchResult &Result) {
     return;
 
   SourceManager &SourceMgr = AST.getSourceManager();
+  std::unique_ptr<CIRProfile> Profile;
+  if (!ProfileOutput.empty())
+    Profile = std::make_unique<CIRProfile>(
+        ProfileOutput,
+        SourceMgr.getFilename(
+            SourceMgr.getLocForStartOfFile(SourceMgr.getMainFileID())),
+        NumThreads);
+  mlir::TimingScope Generation;
+  if (Profile)
+    Generation = Profile->getRootScope().nest("CIR generation");
+  // The externally supplied pool must outlive Generator's MLIRContext.
+  std::optional<llvm::DefaultThreadPool> Pool;
   ScopedCIRGenDiagnosticConsumer CodeGenDiags(
       AST.getDiagnostics(), TidyContext.getDiagnosticsEngine());
-  // The supplied pool must outlive Generator's MLIRContext.
-  std::optional<llvm::DefaultThreadPool> Pool;
   ::cir::CIRGenerator Generator(
       AST.getDiagnostics(),
       SourceMgr.getFileManager().getVirtualFileSystemPtr(), CodeGenOpts,
@@ -259,6 +335,8 @@ void Lifetime::check(const MatchFinder::MatchResult &Result) {
     Pool.emplace(llvm::hardware_concurrency(NumThreads));
     Context.setThreadPool(*Pool);
   }
+  if (Profile)
+    Profile->setEffectiveThreads(Context.getNumThreads());
   if (AST.getDiagnostics().hasErrorOccurred())
     return;
   // User-facing diagnostics should not serialize entire CIR operations.
@@ -290,21 +368,33 @@ void Lifetime::check(const MatchFinder::MatchResult &Result) {
       return;
   }
   Generator.HandleTranslationUnit(AST);
+  Generation.stop();
   if (AST.getDiagnostics().hasErrorOccurred())
     return;
-  if (!Generator.verifyModule()) {
+  mlir::TimingScope Verification;
+  if (Profile)
+    Verification = Profile->getRootScope().nest("CIR verification");
+  bool Verified = Generator.verifyModule();
+  Verification.stop();
+  if (!Verified) {
     diag("CIR verification failed; lifetime analysis did not complete",
          DiagnosticIDs::Error);
     return;
   }
 
   mlir::PassManager PM(&Generator.getMLIRContext());
+  if (Profile)
+    PM.enableTiming(Profile->getRootScope());
   PM.enableVerifier(true);
   PM.addPass(mlir::createCIRCanonicalizePass());
   PM.addPass(
       mlir::createLifetimeCheckPass(RemarksList, HistoryList, HistLimit));
-  if (mlir::failed(PM.run(Generator.getModule())))
+  if (mlir::failed(PM.run(Generator.getModule()))) {
     diag("CIR lifetime analysis failed", DiagnosticIDs::Error);
+    return;
+  }
+  if (Profile)
+    Profile->complete();
 }
 
 } // namespace clang::tidy::cir

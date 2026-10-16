@@ -32,6 +32,7 @@ private:
   const std::vector<StringRef> HistoryList;
   const unsigned HistLimit;
   const unsigned NumThreads;
+  const std::string ProfileOutput;
   const bool AnalyzeUnusedMainFileFunctions;
 };
 

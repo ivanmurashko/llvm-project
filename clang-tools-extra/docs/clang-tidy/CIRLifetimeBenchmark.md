@@ -82,6 +82,98 @@ using it for mixed checks is rejected. CIR defaults are `HistoryList=all`,
 are explicitly empty, matching its defaults. Do not set custom lists for the
 default-check comparison. The runner never applies fixes.
 
+### Check and CIR stage profiles
+
+Choose profiling independently for each variant with `--baseline-profile-mode`
+and `--candidate-profile-mode` (default `off`):
+
+| Mode | Independent TU intervals | Stock check timers | CIR stage timers |
+|---|---|---|---|
+| `off` | No | No | No |
+| `phases` | Yes | No | No |
+| `phases+cir` | Yes | No | Yes (CIR only) |
+| `legacy` | Yes | Yes | Yes (for CIR) |
+
+`--profile-checks` remains a compatibility alias for `legacy` on both variants;
+it cannot be combined with per-variant modes. Each invocation has separate
+`phase-profile/`, `check-profile/` (legacy only), and `cir-profile.json` (detailed
+CIR only) destinations. Report schema 3 records the mode per variant and run.
+Readers retain support for historical schema-2 extended stock profiles.
+
+The standalone `clang-tidy --store-phase-profile=<directory>` option is independent
+of `--enable-check-profile` and `--store-check-profile`. It does not enable matcher
+profiling. It captures four `std::chrono::steady_clock` boundaries per TU that
+reaches the translation-unit callback, regardless of matcher activity:
+
+| Interval | Boundaries | Interpretation |
+|---|---|---|
+| Consumer setup | factory entry to consumer ready | Check creation and registration, consumer setup |
+| Frontend before TU | consumer ready to TU entry | Parsing, Sema, template instantiation, frontend callbacks |
+| TU analysis | TU entry to TU exit | Complete multiplexed TU callback, including matching, dispatch, check work and in-TU diagnostics |
+
+For CIR, TU analysis includes CIR generation, verification, passes, and CIR/MLIR
+context teardown. It is **not pure solver or checker-body time**. PP callbacks
+would contribute to frontend time; neither of these two checks currently
+registers PP callbacks. Other checks or frontend configurations may do so.
+
+One collision-safe `*.phases.json` file is written per consumer, after TU exit.
+It owns its source/build-directory/check metadata, records raw integer nanosecond
+boundaries, clock period, capture count, PID/sequence, stock-profiling state,
+instantiated checks, callback completion, and frontend-error state. A consumer
+that never reaches TU entry has only setup boundaries and is incomplete. A
+failure before consumer creation has no profile. Callback completion alone does
+not prove that checker analysis succeeded. The CLI resolves relative output
+directories before entering compilation-command directories. This lifecycle is
+supported by standalone clang-tidy; the clang-tidy plugin is outside this mode.
+The capture counter counts explicit profiling clock reads; it does not measure
+the clock's cost or promise equal total overhead on different workloads.
+
+Whole-process time minus these three intervals is a **process residual**. It
+includes startup before consumer creation, AST teardown after TU exit, diagnostic
+export/printing, profile serialization and the resource supervisor. Do not call
+it shared clang-tidy overhead or pure AST time. Compute residuals per invocation
+before taking medians. Do not subtract independently rounded medians to claim an
+exact additive decomposition.
+
+For a checker comparison use matching `off` or matching `phases` modes, one outer
+process and paired order. TU-analysis ratios require matching `phases` modes.
+`phases+cir` is for within-CIR attribution, not a cross-check ratio. Stock check
+timers switch buckets on each visited AST node of a kind the matcher can match;
+bugprone's statement matcher pays this cost much more often than CIR's single
+TU matcher. Legacy measurements retain raw times but suppress comparative ratios.
+A same-binary, same-check, same-options `off` versus `phases` or `legacy` pair is
+explicitly labeled an **instrumentation-overhead comparison**, not a checker
+speedup. Parallel batches provide throughput/accounting, not paired TU ratios.
+
+The timing cohort requires all repetitions to be successful, eligible, and to
+have every requested profile parsed for both variants. Missing, malformed,
+wrong-source, wrong-directory, or incomplete profiles never become zeroes.
+A successful eligible invocation with a broken requested profile fails campaign
+measurement validation and suppresses timing ratios, even if other TUs parsed.
+Execution status stays separate. All-run and excluded-input wall times, raw
+artifacts, and profile status counts remain visible.
+
+CIR stage profiles retain generation, verification, canonicalization, lifetime,
+and requested/effective thread counts. MLIR wall timings have 0.0001-second
+resolution; its `user` field is aggregated worker elapsed time, not OS CPU.
+Stage timing and its serialization add instrumentation, so use a separate
+`phases+cir` attribution run. Neither profiler removes its own overhead.
+
+Before a timing campaign, calibrate each checker separately on the frozen,
+warning-independent 100-TU frame (seed `20261016`), keeping the two known CIR
+failures and reporting the 98 common successes without replacement. This frame
+is distinct from the historical all-success selection procedure below. Use
+separate same-check two-arm `off`/`phases` pairs, then compare both checks in
+`phases` mode; retain a separate unprofiled comparison. Pre-register an overhead
+equivalence margin (proposed 1%), use paired log process-wall differences and
+confidence intervals, and assess differential overhead between checks. Verify
+diagnostic and completion parity. Four captures are a structural property;
+only calibration bounds process perturbation. A full-corpus TU ratio requires
+serial paired runs; four-process batches answer a throughput question. Use
+PCH-free inputs and keep the original source corpus pinned separately from the
+amended checker binary. Do not reinterpret historical measurements as results
+from this profiler.
+
 Use the same header visibility for both variants: `--header-filter` defaults to
 `.*`, and system headers require `--system-headers`. These options affect
 reported diagnostics; they do not establish complete emitted-function coverage.

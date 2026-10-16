@@ -36,7 +36,13 @@
 #include "clang/Tooling/DiagnosticsYaml.h" // IWYU pragma: keep
 #include "clang/Tooling/Refactoring.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <utility>
 
@@ -330,20 +336,151 @@ private:
   unsigned WarningsAsErrors = 0U;
 };
 
+// Deliberately independent of MatchFinder's per-node profiling. Only four
+// steady-clock reads are needed, regardless of which checks or matchers run.
+// Own the metadata: CompilerInstance can destroy the ASTContext before us.
+class PhaseProfile {
+public:
+  using Clock = std::chrono::steady_clock;
+
+  PhaseProfile(StringRef Directory, Clock::time_point Start)
+      : Directory(Directory), ProcessID(llvm::sys::Process::getProcessId()),
+        Sequence(NextSequence.fetch_add(1, std::memory_order_relaxed)) {
+    record(Start);
+  }
+
+  void finishSetup(StringRef File, StringRef BuildDirectory,
+                   bool StockProfiling,
+                   ArrayRef<std::unique_ptr<ClangTidyCheck>> Checks) {
+    this->File = File.str();
+    this->BuildDirectory = BuildDirectory.str();
+    this->StockProfiling = StockProfiling;
+    for (const auto &Check : Checks)
+      CheckNames.push_back(
+          static_cast<const MatchFinder::MatchCallback &>(*Check)
+              .getID()
+              .str());
+    llvm::sort(CheckNames);
+    record(Clock::now());
+  }
+
+  void startTranslationUnit(bool FrontendError) {
+    record(Clock::now());
+    FrontendErrorBeforeTU = FrontendError;
+  }
+
+  void finishTranslationUnit() { record(Clock::now()); }
+
+  ~PhaseProfile() {
+    auto ReportError = [](const std::error_code &EC) {
+      llvm::errs() << "Unable to store clang-tidy phase profile: "
+                   << EC.message() << '\n';
+    };
+    if (std::error_code EC = llvm::sys::fs::create_directories(Directory)) {
+      ReportError(EC);
+      return;
+    }
+    SmallString<256> Model(Directory);
+    llvm::sys::path::append(Model, Twine(ProcessID) + "-" + Twine(Sequence) +
+                                       "-%%%%%%%%.phases.json");
+    int FD;
+    SmallString<256> Path;
+    if (std::error_code EC = llvm::sys::fs::createUniqueFile(Model, FD, Path)) {
+      ReportError(EC);
+      return;
+    }
+    llvm::raw_fd_ostream OS(FD, /*shouldClose=*/true);
+    {
+      llvm::json::OStream J(OS, 2);
+      J.object([&] {
+        J.attribute("schema_version", 1);
+        J.attribute("file", File);
+        J.attribute("build_directory", BuildDirectory);
+        J.attribute("pid", ProcessID);
+        J.attribute("sequence", Sequence);
+        J.attribute("stock_profiling", StockProfiling);
+        J.attributeArray("checks", [&] {
+          for (const std::string &Check : CheckNames)
+            J.value(Check);
+        });
+        J.attribute("complete", ClockReads == 4);
+        J.attribute("clock_reads", ClockReads);
+        if (FrontendErrorBeforeTU)
+          J.attribute("frontend_error_before_tu", *FrontendErrorBeforeTU);
+        J.attributeObject("clock", [&] {
+          J.attribute("name", "std::chrono::steady_clock");
+          J.attribute("is_steady", Clock::is_steady);
+          J.attribute("unit", "nanoseconds");
+          J.attribute("period_num", Clock::period::num);
+          J.attribute("period_den", Clock::period::den);
+        });
+        J.attributeObject("boundaries_ns", [&] {
+          constexpr llvm::StringLiteral Names[] = {
+              "consumer_entry", "consumer_ready", "tu_entry", "tu_exit"};
+          for (unsigned I = 0; I < ClockReads; ++I)
+            J.attribute(Names[I], Boundaries[I]);
+        });
+      });
+      OS << '\n';
+    }
+    OS.close();
+    if (OS.has_error()) {
+      ReportError(OS.error());
+      OS.clear_error();
+    }
+  }
+
+private:
+  void record(Clock::time_point Time) {
+    assert(ClockReads < Boundaries.size());
+    Boundaries[ClockReads++] =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Time.time_since_epoch())
+            .count();
+  }
+
+  static std::atomic<uint64_t> NextSequence;
+  std::string Directory, File, BuildDirectory;
+  uint64_t ProcessID, Sequence;
+  bool StockProfiling = false;
+  std::vector<std::string> CheckNames;
+  std::optional<bool> FrontendErrorBeforeTU;
+  std::array<int64_t, 4> Boundaries;
+  unsigned ClockReads = 0;
+};
+
+std::atomic<uint64_t> PhaseProfile::NextSequence{0};
+
 class ClangTidyASTConsumer : public MultiplexConsumer {
 public:
   ClangTidyASTConsumer(std::vector<std::unique_ptr<ASTConsumer>> Consumers,
                        std::unique_ptr<ClangTidyProfiling> Profiling,
+                       std::unique_ptr<PhaseProfile> Phases,
                        std::unique_ptr<ast_matchers::MatchFinder> Finder,
                        std::vector<std::unique_ptr<ClangTidyCheck>> Checks)
       : MultiplexConsumer(std::move(Consumers)),
-        Profiling(std::move(Profiling)), Finder(std::move(Finder)),
-        Checks(std::move(Checks)) {}
+        Profiling(std::move(Profiling)), Phases(std::move(Phases)),
+        Finder(std::move(Finder)), Checks(std::move(Checks)) {}
+
+  void finishSetup(StringRef File, StringRef BuildDirectory,
+                   bool StockProfiling) {
+    if (Phases)
+      Phases->finishSetup(File, BuildDirectory, StockProfiling, Checks);
+  }
+
+  void HandleTranslationUnit(ASTContext &Context) override {
+    if (Phases)
+      Phases->startTranslationUnit(Context.getDiagnostics().hasErrorOccurred());
+    MultiplexConsumer::HandleTranslationUnit(Context);
+    if (Phases)
+      Phases->finishTranslationUnit();
+  }
 
 private:
   // Destructor order matters! Profiling must be destructed last.
   // Or at least after Finder.
   std::unique_ptr<ClangTidyProfiling> Profiling;
+  std::unique_ptr<PhaseProfile> Phases;
   std::unique_ptr<ast_matchers::MatchFinder> Finder;
   std::vector<std::unique_ptr<ClangTidyCheck>> Checks;
   void anchor() override {}
@@ -417,6 +554,12 @@ static CheckersList getAnalyzerCheckersAndPackages(ClangTidyContext &Context,
 std::unique_ptr<ASTConsumer>
 ClangTidyASTConsumerFactory::createASTConsumer(CompilerInstance &Compiler,
                                                StringRef File) {
+  std::unique_ptr<PhaseProfile> Phases;
+  if (!Context.getPhaseProfileStoragePrefix().empty()) {
+    const auto Start = PhaseProfile::Clock::now();
+    Phases = std::make_unique<PhaseProfile>(
+        Context.getPhaseProfileStoragePrefix(), Start);
+  }
   // FIXME: Move this to a separate method, so that CreateASTConsumer doesn't
   // modify Compiler.
   SourceManager *SM = &Compiler.getSourceManager();
@@ -491,9 +634,12 @@ ClangTidyASTConsumerFactory::createASTConsumer(CompilerInstance &Compiler,
     Consumers.push_back(std::move(AnalysisConsumer));
   }
 #endif // CLANG_TIDY_ENABLE_STATIC_ANALYZER
-  return std::make_unique<ClangTidyASTConsumer>(
-      std::move(Consumers), std::move(Profiling), std::move(Finder),
-      std::move(Checks));
+  auto Consumer = std::make_unique<ClangTidyASTConsumer>(
+      std::move(Consumers), std::move(Profiling), std::move(Phases),
+      std::move(Finder), std::move(Checks));
+  Consumer->finishSetup(File, Context.getCurrentBuildDirectory(),
+                        Context.getEnableProfiling());
+  return Consumer;
 }
 
 std::vector<std::string> ClangTidyASTConsumerFactory::getCheckNames() {

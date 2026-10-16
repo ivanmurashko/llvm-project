@@ -258,6 +258,11 @@ An overview of all the command-line options:
     --store-check-profile=<prefix>   - By default reports are printed in tabulated
                                        format to stderr. When this option is passed,
                                        these per-TU profiles are instead stored as JSON.
+    --store-phase-profile=<directory> - Store coarse per-TU wall-time intervals as JSON
+                                       in this directory. Uses four steady-clock reads,
+                                       independently of per-check profiling. Includes
+                                       consumer setup, frontend work before TU analysis,
+                                       and the complete TU-analysis callback interval.
     --system-headers                 - Display the errors from system headers.
                                        This option overrides the 'SystemHeaders' option
                                        in .clang-tidy file, if any.

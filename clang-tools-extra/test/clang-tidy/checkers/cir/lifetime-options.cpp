@@ -12,6 +12,17 @@
 // RUN: FileCheck %s --input-file=%t.multiple.yaml --check-prefix=CHECK-MULTIPLE-YAML
 // RUN: not clang-tidy %s --checks='-*,cir-lifetime-check,clang-diagnostic-sync-alignment' --config='{}' --export-fixes=%t.pragma.yaml -- -target x86_64-unknown-linux-gnu -DPRAGMA_DIAGNOSTICS -Wno-address-of-packed-member 2>&1 | FileCheck %s --check-prefix=CHECK-PRAGMA
 // RUN: FileCheck %s --input-file=%t.pragma.yaml --check-prefix=CHECK-PRAGMA-YAML
+// RUN: rm -rf %t.profiles %t.missing
+// RUN: mkdir %t.profiles
+// RUN: clang-tidy %s --checks='-*,cir-lifetime-check' --config='{CheckOptions: {cir-lifetime-check.NumThreads: 1, cir-lifetime-check.ProfileOutput: "%t.profiles/cir.json"}}' --enable-check-profile --store-check-profile=%t.profiles/check --export-fixes=%t.profiles/serial.yaml -- -target x86_64-unknown-linux-gnu 2>&1 | FileCheck %s --check-prefix=CHECK-NO-HISTORY
+// RUN: FileCheck %s --input-file=%t.profiles/cir.json --check-prefix=CHECK-PROFILE
+// RUN: clang-tidy %s --checks='-*,cir-lifetime-check' --config='{CheckOptions: {cir-lifetime-check.NumThreads: 2}}' --export-fixes=%t.profiles/threaded.yaml -- -target x86_64-unknown-linux-gnu 2>&1 | FileCheck %s --check-prefix=CHECK-NO-HISTORY
+// RUN: diff %t.profiles/serial.yaml %t.profiles/threaded.yaml
+// RUN: %python -c "import glob,json; paths=glob.glob(r'%t.profiles/check/*.json'); assert len(paths)==1; p=json.load(open(paths[0])); assert all('time.clang-tidy.cir-lifetime-check.'+k in p['profile'] for k in ('wall','user','sys'))"
+// RUN: clang-tidy %s --checks='-*,cir-lifetime-check' --config='{CheckOptions: {cir-lifetime-check.ProfileOutput: "%t.missing/profile.json"}}' -- -target x86_64-unknown-linux-gnu 2>&1 | FileCheck %s --check-prefix=CHECK-PROFILE-ERROR
+// RUN: not clang-tidy %s --checks='-*,cir-lifetime-check' --config='{CheckOptions: {cir-lifetime-check.ProfileOutput: "%t.profiles/incomplete.json"}}' -- -target x86_64-unknown-linux-gnu -DCODEGEN_ERROR 2>&1 | FileCheck %s --check-prefix=CHECK-ERROR
+// RUN: FileCheck %s --input-file=%t.profiles/incomplete.json --check-prefix=CHECK-PARTIAL-PROFILE
+// RUN: clang-tidy %s --checks='-*,cir-lifetime-check' --config='{CheckOptions: {cir-lifetime-check.NumThreads: -1}}' -- -target x86_64-unknown-linux-gnu 2>&1 | FileCheck %s --check-prefix=CHECK-INVALID-THREADS
 
 // A CIR generation error in the first translation unit must not prevent the
 // second translation unit from being analyzed, including its warning and note.
@@ -23,10 +34,27 @@
 
 // CHECK-DEFAULTS: cir-lifetime-check.HistLimit: '1'
 // CHECK-DEFAULTS-NEXT: cir-lifetime-check.HistoryList: all
+// CHECK-DEFAULTS-NEXT: cir-lifetime-check.NumThreads: '0'
+// CHECK-DEFAULTS-NEXT: cir-lifetime-check.ProfileOutput: ''
 // CHECK-DEFAULTS-NEXT: cir-lifetime-check.RemarksList: ''
 // CHECK-CONFIG: cir-lifetime-check.HistLimit: '2'
 // CHECK-CONFIG-NEXT: cir-lifetime-check.HistoryList: {{'?}}invalid;null{{'?}}
+// CHECK-CONFIG-NEXT: cir-lifetime-check.NumThreads: '0'
+// CHECK-CONFIG-NEXT: cir-lifetime-check.ProfileOutput: ''
 // CHECK-CONFIG-NEXT: cir-lifetime-check.RemarksList: {{'?}}pset-invalid;pset-always{{'?}}
+
+// CHECK-PROFILE: "complete": true
+// CHECK-PROFILE: "requested_threads": 1
+// CHECK-PROFILE: "effective_threads": 1
+// CHECK-PROFILE-DAG: "name": "CIR generation"
+// CHECK-PROFILE-DAG: "name": "CIR verification"
+// CHECK-PROFILE-DAG: "name": "{{.*}}CIRCanonicalize{{.*}}"
+// CHECK-PROFILE-DAG: "name": "{{.*}}LifetimeCheck{{.*}}"
+// CHECK-PARTIAL-PROFILE: "complete": false
+// CHECK-PROFILE-ERROR: Unable to write CIR profile
+// CHECK-PROFILE-ERROR: warning: use of invalid pointer 'p' [cir-lifetime-check]
+// CHECK-INVALID-THREADS: warning: invalid configuration value '-1' for option 'cir-lifetime-check.NumThreads'
+// CHECK-INVALID-THREADS: warning: use of invalid pointer 'p' [cir-lifetime-check]
 
 #ifdef CODEGEN_ERROR
 void unsupported(unsigned value) {

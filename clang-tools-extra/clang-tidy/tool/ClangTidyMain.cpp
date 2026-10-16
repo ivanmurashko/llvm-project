@@ -276,6 +276,16 @@ report to stderr.
                                         cl::init(false),
                                         cl::cat(ClangTidyCategory));
 
+static cl::opt<std::string> StorePhaseProfile("store-phase-profile", desc(R"(
+Store coarse per-TU wall-time intervals as JSON
+in this directory. Uses four steady-clock reads,
+independently of per-check profiling. Includes
+consumer setup, frontend work before TU analysis,
+and the complete TU-analysis callback interval.
+)"),
+                                              cl::value_desc("directory"),
+                                              cl::cat(ClangTidyCategory));
+
 static cl::opt<std::string> StoreCheckProfile("store-check-profile", desc(R"(
 By default reports are printed in tabulated
 format to stderr. When this option is passed,
@@ -645,6 +655,7 @@ int clangTidyMain(int argc, const char **argv) {
     return 1;
 
   const SmallString<256> ProfilePrefix = makeAbsolute(StoreCheckProfile);
+  const SmallString<256> PhaseProfilePrefix = makeAbsolute(StorePhaseProfile);
 
   StringRef FileName("dummy");
   auto PathList = OptionsParser->getSourcePathList();
@@ -737,6 +748,7 @@ int clangTidyMain(int argc, const char **argv) {
   ClangTidyContext Context(
       std::move(OwningOptionsProvider), AllowEnablingAnalyzerAlphaCheckers,
       EnableModuleHeadersParsing, ExperimentalCustomChecks);
+  Context.setPhaseProfileStoragePrefix(PhaseProfilePrefix);
   std::vector<ClangTidyError> Errors =
       runClangTidy(Context, OptionsParser->getCompilations(), PathList, BaseFS,
                    FixNotes, EnableCheckProfile, ProfilePrefix, Quiet);

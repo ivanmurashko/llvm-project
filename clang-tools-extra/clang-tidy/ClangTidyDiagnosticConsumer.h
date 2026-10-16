@@ -201,6 +201,12 @@ public:
   std::optional<ClangTidyProfiling::StorageParams>
   getProfileStorageParams() const;
 
+  /// Store coarse TU intervals independently of per-check profiling.
+  void setPhaseProfileStoragePrefix(StringRef Prefix) {
+    PhaseProfilePrefix = Prefix.str();
+  }
+  StringRef getPhaseProfileStoragePrefix() const { return PhaseProfilePrefix; }
+
   /// Should be called when starting to process new translation unit.
   void setCurrentBuildDirectory(StringRef BuildDirectory) {
     CurrentBuildDirectory = std::string(BuildDirectory);
@@ -273,6 +279,7 @@ private:
 
   bool Profile = false;
   std::string ProfilePrefix;
+  std::string PhaseProfilePrefix;
 
   bool AllowEnablingAnalyzerAlphaCheckers;
   bool EnableModuleHeadersParsing;

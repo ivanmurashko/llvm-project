@@ -23,12 +23,50 @@ assert all(k.startswith(check + ".") for k in config["CheckOptions"])
 assert not any(a in ("--fix", "-fix") for a in sys.argv)
 output = Path(next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--export-fixes=")))
 source = Path(sys.argv[-1])
+if "--enable-check-profile" in sys.argv and source.stem != "missing-profile":
+    directory = Path(next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--store-check-profile=")))
+    directory.mkdir()
+    times = {"time.clang-tidy." + check + "." + key: value
+             for key, value in [("wall", 0.02), ("user", 0.01), ("sys", 0.001)]}
+    if source.stem == "invalid-profile":
+        times["time.clang-tidy." + check + ".wall"] = -1
+    phases = {name: {"wall_seconds": 0.03 if name == "tu_callbacks" else 0.01,
+                     "user_seconds": 0.008, "sys_seconds": 0.001}
+              for name in ("consumer_setup", "frontend_before_tu", "tu_callbacks")}
+    if source.stem == "invalid-phase":
+        phases["tu_callbacks"]["wall_seconds"] = -1
+    (directory / "timing.json").write_text(json.dumps({"file": str(source), "profile": times,
+                                                       "phase_schema_version": 1, "phases": phases}))
+phase_arg = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--store-phase-profile=")), None)
+if phase_arg and source.stem != "missing-profile":
+    directory = Path(phase_arg)
+    directory.mkdir()
+    bounds = dict(zip(("consumer_entry", "consumer_ready", "tu_entry", "tu_exit"),
+                      (0, 10000000, 20000000, 50000000)))
+    if source.stem == "invalid-phase": bounds["tu_exit"] = -1
+    (directory / "test.phases.json").write_text(json.dumps({
+        "schema_version": 1, "file": str(source), "build_directory": str(Path.cwd()),
+        "pid": 1, "sequence": 0, "checks": [check], "complete": True,
+        "clock_reads": 4, "stock_profiling": "--enable-check-profile" in sys.argv,
+        "frontend_error_before_tu": False,
+        "clock": {"name": "std::chrono::steady_clock", "is_steady": True,
+                  "unit": "nanoseconds", "period_num": 1, "period_den": 1000000000},
+        "boundaries_ns": bounds}))
+if check + ".ProfileOutput" in config["CheckOptions"]:
+    path = Path(config["CheckOptions"][check + ".ProfileOutput"])
+    threads = int(config["CheckOptions"].get(check + ".NumThreads", "0"))
+    nodes = [{"name": name, "wall": {"duration": 0.001}, "passes": [{}]}
+             for name in ["CIR generation", "CIR verification", "CIRCanonicalizePass", "LifetimeCheckPass"]]
+    path.write_text(json.dumps({"schema_version": 1, "file": str(source), "complete": source.stem != "incomplete-cir",
+                               "requested_threads": threads, "effective_threads": threads or 4,
+                               "timing": nodes}))
+
 event = {"variant": Path(sys.argv[0]).name, "phase": output.parent.name,
          "file": source.name, "check": check, "time": time.clock_gettime(time.CLOCK_MONOTONIC)}
 trace = Path(sys.argv[0]).parent / "trace.jsonl"
 with trace.open("a") as stream:
     stream.write(json.dumps(dict(event, event="start")) + "\n")
-time.sleep(0.03)
+time.sleep(0.06)
 if source.stem == "invalidate-input":
     (Path(sys.argv[0]).parent / "input.h").write_text("modified during run")
 if source.stem == "warmup-failure" and output.parent.name.startswith("warmup"):
@@ -119,6 +157,7 @@ class ExtendedBenchmarkTest(unittest.TestCase):
                 "--clang-source-root", str(self.source), "--compilation-database", str(self.build),
                 "--output-dir", str(self.work / "out"), "--repetitions", "2", "--timeout", "2", *extra]
         result = subprocess.run(args, capture_output=True, text=True, timeout=40)
+        self.last_stdout = result.stdout
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         if expected:
             return result
@@ -128,6 +167,227 @@ class ExtendedBenchmarkTest(unittest.TestCase):
         self.database([("clean", [])])
         report = self.run_benchmark("--source-root", str(self.source))
         self.assertEqual(report["source"]["root"], str(self.source))
+
+    def test_profiles_are_associated_with_each_invocation(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--profile-checks", "--check-option", "NumThreads=2")
+        self.assertEqual(report["profiling"]["common_profiled_units"], 1)
+        self.assertEqual(report["profiling"]["tidy_phase_profiled_units"],
+                         {"baseline": 1, "candidate": 1})
+        self.assertEqual(report["summary"]["candidate"]["tidy_phase_profile_status_counts"],
+                         {"parsed": 2})
+        self.assertEqual(report["profiling"]["per_unit"][0]["candidate"]
+                         ["tidy_phase_wall_seconds"]["tu_callbacks"], 0.03)
+        self.assertNotIn("candidate_over_baseline_check_wall_ratio", report["profiling"]["per_unit"][0])
+        for run in report["runs"]:
+            self.assertEqual(run["check_profile"]["status"], "parsed")
+            self.assertEqual(run["check_profile"]["wall_seconds"], 0.02)
+            self.assertEqual(run["tidy_phase_profile"]["status"], "parsed")
+            self.assertEqual(set(run["tidy_phase_profile"]["phases"]),
+                             {"consumer_setup", "frontend_before_tu", "tu_callbacks"})
+            self.assertGreaterEqual(run["tidy_phase_profile"]["phases"]
+                                    ["tu_callbacks"]["wall_seconds"],
+                                    run["check_profile"]["wall_seconds"])
+            self.assertEqual(run["cir_profile"]["effective_threads"], 2)
+            self.assertEqual(set(run["cir_profile"]["wall_seconds"]),
+                             {"generation", "verification", "canonicalization", "lifetime"})
+
+    def test_missing_and_invalid_profiles_do_not_become_zero_timings(self):
+        self.database([("missing-profile", []), ("invalid-profile", [])])
+        report = self.run_benchmark("--profile-checks")
+        self.assertEqual(report["profiling"]["common_profiled_units"], 0)
+        self.assertEqual(report["profiling"]["excluded_common_units"], 2)
+        for run in report["runs"]:
+            self.assertEqual(run["status"], "success")
+            self.assertEqual(run["check_profile"]["status"],
+                             "missing" if "missing" in run["relative_file"] else "invalid")
+            self.assertNotIn("wall_seconds", run["check_profile"])
+            self.assertEqual(run["tidy_phase_profile"]["status"],
+                             "missing" if "missing" in run["relative_file"] else "parsed")
+
+    def test_invalid_tidy_phase_does_not_become_zero_timing(self):
+        self.database([("invalid-phase", [])])
+        report = self.run_benchmark("--profile-checks")
+        self.assertEqual(report["profiling"]["tidy_phase_profiled_units"],
+                         {"baseline": 0, "candidate": 0})
+        self.assertEqual(report["summary"]["candidate"]["tidy_phase_profile_status_counts"],
+                         {"invalid": 2})
+        for run in report["runs"]:
+            self.assertEqual(run["status"], "success")
+            self.assertEqual(run["check_profile"]["status"], "parsed")
+            self.assertEqual(run["tidy_phase_profile"]["status"], "invalid")
+            self.assertNotIn("phases", run["tidy_phase_profile"])
+
+    def test_profiled_different_checks_do_not_claim_unbiased_timing_ratios(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--profile-checks", "--baseline-check",
+                                    "bugprone-use-after-move", "--eligibility-driver",
+                                    str(self.work / "clang++"))
+        self.assertIsNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+        self.assertIn("matcher-dependent", report["comparison"]["timing_ratio_unavailable_reason"])
+        self.assertNotIn("candidate_over_baseline_wall_ratio", report["comparison"]["per_unit"][0])
+        self.assertEqual(report["profiling"]["common_profiled_units"], 1)
+        self.assertNotIn("candidate_over_baseline_check_wall_ratio", report["profiling"]["per_unit"][0])
+
+    def test_independent_phase_modes_allow_cross_check_ratios(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--baseline-profile-mode", "phases",
+                                    "--candidate-profile-mode", "phases",
+                                    "--baseline-check", "bugprone-use-after-move",
+                                    "--eligibility-driver", str(self.work / "clang++"))
+        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["measurement_validation"]["status"], "valid")
+        self.assertIsNotNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+        self.assertEqual(report["profiling"]["per_unit"][0]
+                         ["candidate_over_baseline_tu_analysis_wall_ratio"], 1)
+        for run in report["runs"]:
+            self.assertNotIn("--enable-check-profile", run["command"])
+            self.assertTrue(any(a.startswith("--store-phase-profile=") for a in run["command"]))
+            self.assertNotIn("check_profile", run)
+            self.assertNotIn("cir_profile", run)
+            self.assertEqual(run["tidy_phase_profile"]["metadata"]["clock_reads"], 4)
+
+    def test_detailed_and_asymmetric_modes_do_not_claim_check_ratios(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--baseline-profile-mode", "phases",
+                                    "--candidate-profile-mode", "phases+cir")
+        self.assertIsNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+        self.assertNotIn("candidate_over_baseline_tu_analysis_wall_ratio", report["profiling"]["per_unit"][0])
+        for run in report["runs"]:
+            self.assertNotIn("--enable-check-profile", run["command"])
+            self.assertEqual("cir_profile" in run, run["variant"] == "candidate")
+
+    def test_bad_successful_profiles_fail_measurement_validation(self):
+        self.database([("clean", []), ("invalid-phase", [])])
+        report = self.run_benchmark("--baseline-profile-mode", "phases",
+                                    "--candidate-profile-mode", "phases")
+        self.assertEqual(report["measurement_validation"]["failure_count"], 4)
+        self.assertEqual(report["comparison"]["timing_units"], ["clean.cpp"])
+        self.assertIn("Validated timing cohort: 1/2 units", self.last_stdout)
+        self.assertIn("Measurement validation failed: 4", self.last_stdout)
+        self.assertIsNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+        self.assertTrue(all(r["status"] == "success" for r in report["runs"]))
+        self.assertGreater(report["summary"]["candidate"]["excluded_input_wall_seconds"], 0)
+
+    def test_profile_mode_conflicts_fail_before_running(self):
+        self.database([("clean", [])])
+        result = self.run_benchmark("--profile-checks", "--baseline-profile-mode", "off", expected=2)
+        self.assertIn("cannot be combined", result.stderr)
+        result = self.run_benchmark("--baseline-check", "bugprone-use-after-move",
+                                    "--baseline-profile-mode", "phases+cir", expected=2)
+        self.assertIn("requires cir-lifetime-check", result.stderr)
+
+    def test_same_binary_instrumentation_overhead_is_labeled(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--candidate", str(self.work / "baseline"),
+                                    "--candidate-profile-mode", "phases")
+        self.assertEqual(report["comparison"]["comparison_kind"], "instrumentation_overhead")
+        self.assertIsNotNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+        self.assertNotIn("candidate_over_baseline_tu_analysis_wall_ratio", report["profiling"]["per_unit"][0])
+
+    def test_different_binary_asymmetric_modes_suppress_ratio(self):
+        self.database([("clean", [])])
+        candidate = self.work / "candidate"
+        candidate.write_text(candidate.read_text() + "\n# distinct executable identity\n")
+        report = self.run_benchmark("--candidate-profile-mode", "phases")
+        self.assertIsNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+        self.assertEqual(report["comparison"]["comparison_kind"], "checker_comparison")
+
+    def test_legacy_overhead_pair_is_labeled(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--candidate", str(self.work / "baseline"),
+                                    "--candidate-profile-mode", "legacy")
+        self.assertEqual(report["comparison"]["comparison_kind"], "instrumentation_overhead")
+        self.assertIsNotNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+        self.assertNotIn("candidate_over_baseline_tu_analysis_wall_ratio", report["profiling"]["per_unit"][0])
+
+    def test_matching_detailed_modes_suppress_ratio(self):
+        self.database([("clean", [])])
+        report = self.run_benchmark("--baseline-profile-mode", "phases+cir",
+                                    "--candidate-profile-mode", "phases+cir")
+        self.assertIsNone(report["comparison"]["candidate_over_baseline_wall_ratio"])
+        self.assertNotIn("candidate_over_baseline_tu_analysis_wall_ratio", report["profiling"]["per_unit"][0])
+
+    def test_profile_intervals_cannot_exceed_process_time(self):
+        spec = importlib.util.spec_from_file_location("wall_runner", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        run = {"profile_mode": "phases", "status": "success", "eligibility": {"eligible": True},
+               "check": "bugprone-use-after-move", "wall_seconds": .5,
+               "tidy_phase_profile": {"status": "parsed", "phases": {"tu_callbacks": {"wall_seconds": 1}}}}
+        self.assertEqual(runner.validate_profiles(run), {"status": "failed", "failures": {
+                         "tidy_phase_profile": "intervals exceed process wall time"}})
+        run["status"] = "frontend_failure"
+        self.assertEqual(runner.validate_profiles(run), {"status": "not_applicable"})
+
+    def test_historical_schema_two_retains_legacy_interpretation(self):
+        spec = importlib.util.spec_from_file_location("historical_runner", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        phases = {name: {"wall_seconds": .03, "user_seconds": .008, "sys_seconds": .001}
+                  for name in ("consumer_setup", "frontend_before_tu", "tu_callbacks")}
+        stock = {"file": str(self.source / "clean.cpp"), "phase_schema_version": 1,
+                 "phases": phases, "profile": {"time.clang-tidy.cir-lifetime-check." + k: v
+                                               for k, v in (("wall", .02), ("user", .01), ("sys", .001))}}
+        directory = self.work / "historical"
+        directory.mkdir()
+        (directory / "timing.json").write_text(json.dumps(stock))
+        profile = runner.support.read_check_profile(directory, "cir-lifetime-check", self.source / "clean.cpp", self.build)
+        phase = runner.support.read_tidy_phase_profile(directory, self.source / "clean.cpp", self.build)
+        self.assertEqual(phase, {"status": "parsed", "files": [str(directory / "timing.json")], "phases": phases})
+        report = {"schema_version": 2, "measurement": {"repetitions": 1, "check_profiling": True},
+                  "selection": {"units": [{"relative_file": "clean.cpp"}]},
+                  "binaries": {v: {"check": "cir-lifetime-check"} for v in ("baseline", "candidate")},
+                  "runs": [{"variant": v, "relative_file": "clean.cpp", "status": "success", "wall_seconds": wall,
+                            "peak_rss_bytes": 100, "diagnostics": [], "check_profile": profile,
+                            "tidy_phase_profile": phase} for v, wall in (("baseline", 2), ("candidate", 3))]}
+        runner.summarize(report)
+        # These are the pre-amendment schema-2 results, including its legacy
+        # same-check stock-profile ratio. New schema-3 gates must not alter them.
+        self.assertEqual(report["comparison"]["candidate_over_baseline_wall_ratio"], 1.5)
+        self.assertEqual(report["profiling"]["per_unit"], [{"relative_file": "clean.cpp",
+            "baseline": {"wall_seconds": .02, "user_seconds": .01, "sys_seconds": .001,
+                         "tidy_phase_wall_seconds": {n: .03 for n in phases}},
+            "candidate": {"wall_seconds": .02, "user_seconds": .01, "sys_seconds": .001,
+                          "tidy_phase_wall_seconds": {n: .03 for n in phases}},
+            "candidate_over_baseline_check_wall_ratio": 1.0}])
+        self.assertNotIn("measurement_validation", report)
+
+    def test_invalid_thread_count_is_a_setup_error(self):
+        self.database([("clean", [])])
+        result = self.run_benchmark("--check-option", "NumThreads=-1", expected=2)
+        self.assertIn("NumThreads must be an unsigned 32-bit integer", result.stderr)
+
+    def test_incomplete_cir_stages_have_a_separate_denominator(self):
+        self.database([("incomplete-cir", [])])
+        report = self.run_benchmark("--profile-checks")
+        self.assertEqual(report["profiling"]["common_profiled_units"], 0)
+        self.assertEqual(report["measurement_validation"]["failure_count"], 4)
+        self.assertEqual(report["profiling"]["cir_stage_profiled_units"], {"baseline":0, "candidate":0})
+        for run in report["runs"]:
+            self.assertEqual(run["status"], "success")
+            self.assertEqual(run["check_profile"]["status"], "parsed")
+            self.assertEqual(run["cir_profile"]["status"], "incomplete")
+
+    def test_extreme_and_malformed_profile_numbers_are_invalid(self):
+        spec = importlib.util.spec_from_file_location("profile_runner", RUNNER)
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        source = self.work / "source.cpp"
+        directory = self.work / "profile"
+        directory.mkdir()
+        check = "cir-lifetime-check"
+        for value in (10**400, True, float("nan")):
+            profile = {"file":str(source), "profile":{
+                "time.clang-tidy." + check + "." + key: value for key in ("wall","user","sys")}}
+            (directory / "check.json").write_text(json.dumps(profile))
+            self.assertEqual(runner.support.read_check_profile(directory,check,source,self.work)["status"], "invalid")
+            cir = {"schema_version":1, "file":str(source), "complete":True,
+                   "requested_threads":1, "effective_threads":1,
+                   "timing":[{"name":"CIR generation", "wall":{"duration":value}}]}
+            path = self.work / "cir.json"
+            path.write_text(json.dumps(cir))
+            self.assertEqual(runner.support.read_cir_profile(path,source,self.work)["status"], "invalid")
 
     @unittest.skipUnless(HAS_YAML, "optional PyYAML dependency")
     def test_independent_checks_options_and_yaml_groups(self):

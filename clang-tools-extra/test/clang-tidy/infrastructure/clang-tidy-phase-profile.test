@@ -1,0 +1,198 @@
+# RUN: split-file %s %t
+# RUN: %python %t/test.py %t %S/../../../clang-tidy/tool
+
+#--- test.py
+import importlib.util
+import copy
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import unittest
+
+ROOT = Path(sys.argv.pop(1)).resolve()
+TOOLS = Path(sys.argv.pop(1)).resolve()
+TIDY = shutil.which("clang-tidy")
+spec = importlib.util.spec_from_file_location("support", TOOLS / "cir_lifetime_benchmark_support.py")
+support = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(support)
+CIR = "cir-lifetime-check"
+probe = subprocess.run([TIDY, "--list-checks", "--checks=-*," + CIR, "--allow-no-checks", "--config={}"],
+                       capture_output=True, text=True, check=True, timeout=30)
+CIR_AVAILABLE = CIR in [line.strip() for line in probe.stdout.splitlines()]
+CHECKS = ("bugprone-use-after-move", CIR) if CIR_AVAILABLE else ("bugprone-use-after-move",)
+if not CIR_AVAILABLE:
+    print("CIR is unavailable; running the generic profiler cases with bugprone", file=sys.stderr)
+BODY = """namespace std {
+template<class T> T &&move(T &x) { return static_cast<T &&>(x); }
+}
+void consume(int &&);
+int bad() { int x = 1; consume(std::move(x)); return x; }
+"""
+
+
+class PhaseProfileTest(unittest.TestCase):
+    def setUp(self):
+        self.work = ROOT / self._testMethodName
+        shutil.rmtree(self.work, ignore_errors=True)
+        self.work.mkdir()
+        self.source = self.work / "input.cpp"
+        self.source.write_text(BODY)
+        self.count = 0
+
+    def run_tidy(self, check, mode="off", sources=None, extra=(), config=None):
+        self.count += 1
+        run = self.work / str(self.count)
+        run.mkdir()
+        config = config or {}
+        if check == "cir-lifetime-check":
+            config[check + ".NumThreads"] = "1"
+            if mode in ("phases+cir", "legacy"):
+                config[check + ".ProfileOutput"] = str(run / "cir.json")
+        command = [TIDY, "--checks=-*," + check, "--config=" + json.dumps({"CheckOptions": config}),
+                   "--export-fixes=" + str(run / "fixes.yaml"), "--use-color=false"]
+        if mode != "off": command += ["--store-phase-profile=" + str(run / "phases")]
+        if mode == "legacy": command += ["--enable-check-profile", "--store-check-profile=" + str(run / "stock")]
+        result = subprocess.run([*command, *extra, *map(str, sources or [self.source]),
+                                 "--", "-std=c++17", "-target", "x86_64-unknown-linux-gnu"],
+                                cwd=self.work, capture_output=True, text=True, timeout=30)
+        return result, run
+
+    def profile(self, run, check, source=None, stock=False):
+        parsed = support.read_phase_profile(run / "phases", check, source or self.source,
+                                            self.work, stock_profiling=stock)
+        self.assertEqual(parsed["status"], "parsed", parsed)
+        data = parsed["metadata"]
+        self.assertEqual(data["clock_reads"], 4)
+        self.assertEqual(data["checks"], [check])
+        self.assertFalse(data["frontend_error_before_tu"])
+        self.assertNotIn("time.clang-tidy", json.dumps(data))
+        self.assertNotIn("user_seconds", json.dumps(data))
+        return data
+
+    def test_modes_preserve_diagnostics_and_status(self):
+        for check in CHECKS:
+            baseline, first = self.run_tidy(check)
+            self.assertEqual(baseline.returncode, 0, baseline.stderr)
+            self.assertIn("warning:", baseline.stdout + baseline.stderr)
+            self.assertFalse((first / "phases").exists())
+            modes = ("phases", "legacy") if check == CHECKS[0] else ("phases", "phases+cir", "legacy")
+            for mode in modes:
+                result, run = self.run_tidy(check, mode)
+                self.assertEqual(result.returncode, baseline.returncode, result.stderr)
+                self.assertEqual(result.stdout, baseline.stdout)
+                self.assertEqual((run / "fixes.yaml").read_bytes(), (first / "fixes.yaml").read_bytes())
+                self.profile(run, check, stock=mode == "legacy")
+                self.assertNotIn("profiling", result.stderr)
+                self.assertEqual((run / "stock").exists(), mode == "legacy")
+                if mode == "legacy":
+                    stock = json.loads(next((run / "stock").glob("*.json")).read_text())
+                    self.assertNotIn("phases", stock)
+                    self.assertNotIn("phase_schema_version", stock)
+                if check == CIR and mode in ("phases+cir", "legacy"):
+                    self.assertEqual(support.read_cir_profile(run / "cir.json", self.source, self.work)["status"], "parsed")
+
+    def test_fixed_clock_reads_for_no_matches_and_many_moves(self):
+        for body in ("int f() { return 1; }", BODY + "\n".join(
+                "int f%d() { int x=1; consume(std::move(x)); return x; }" % i for i in range(60))):
+            self.source.write_text(body)
+            for check in CHECKS:
+                result, run = self.run_tidy(check, "phases")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.profile(run, check)
+
+    def test_frontend_error_is_not_a_valid_measurement(self):
+        self.source.write_text('#include "does-not-exist.h"\n')
+        for check in CHECKS:
+            result, run = self.run_tidy(check, "phases")
+            self.assertNotEqual(result.returncode, 0)
+            parsed = support.read_phase_profile(run / "phases", check, self.source, self.work)
+            self.assertEqual(parsed["status"], "incomplete", parsed)
+            self.assertTrue(parsed["metadata"]["frontend_error_before_tu"])
+            self.assertNotIn("phases", parsed)
+
+    def test_language_filtered_check_has_incomplete_profile(self):
+        self.source.write_text("int f() { return 1; }\n")
+        result, run = self.run_tidy(CHECKS[0], "phases", extra=["--extra-arg=-std=c++98"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = support.read_phase_profile(run / "phases", CHECKS[0], self.source, self.work)
+        self.assertEqual(parsed["status"], "incomplete", parsed)
+        self.assertEqual(parsed["metadata"]["checks"], [])
+        self.assertEqual(parsed["metadata"]["clock_reads"], 4)
+        self.assertFalse(parsed["metadata"]["frontend_error_before_tu"])
+
+    def test_missing_input_has_no_profile(self):
+        result, run = self.run_tidy(CHECKS[0], "phases", sources=[self.work / "absent.cpp"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(list((run / "phases").glob("*.phases.json")))
+
+    def test_parser_rejects_malformed_and_misassociated_profiles(self):
+        result, run = self.run_tidy(CHECKS[0], "phases")
+        self.assertEqual(result.returncode, 0)
+        path = next((run / "phases").glob("*.phases.json"))
+        good = json.loads(path.read_text())
+        for key, value in (("schema_version", 2), ("clock_reads", True),
+                           ("clock_reads", 5), ("complete", False),
+                           ("file", str(self.work / "other.cpp")),
+                           ("build_directory", str(self.work / "other")),
+                           ("stock_profiling", True), ("frontend_error_before_tu", 0),
+                           ("boundaries_ns", {"consumer_entry": float("nan")})):
+            data = dict(good, **{key: value})
+            path.write_text(json.dumps(data))
+            self.assertEqual(support.read_phase_profile(run / "phases", CHECKS[0],
+                                                        self.source, self.work)["status"], "invalid", key)
+        for value in (-1, True, 2**64):
+            data = copy.deepcopy(good)
+            data["boundaries_ns"]["tu_exit"] = value
+            path.write_text(json.dumps(data))
+            self.assertEqual(support.read_phase_profile(run / "phases", CHECKS[0],
+                                                        self.source, self.work)["status"], "invalid")
+        partial = copy.deepcopy(good)
+        partial.update(clock_reads=2, complete=False)
+        del partial["frontend_error_before_tu"]
+        partial["boundaries_ns"] = {k: partial["boundaries_ns"][k] for k in ("consumer_entry", "consumer_ready")}
+        path.write_text(json.dumps(partial))
+        parsed = support.read_phase_profile(run / "phases", CHECKS[0], self.source, self.work)
+        self.assertEqual(parsed["status"], "incomplete")
+        self.assertNotIn("phases", parsed)
+        data = dict(good, checks=[])
+        path.write_text(json.dumps(data))
+        self.assertEqual(support.read_phase_profile(run / "phases", CHECKS[0], self.source, self.work)["status"], "incomplete")
+        path.write_text(json.dumps(good))
+        (path.parent / "duplicate.phases.json").write_text(json.dumps(good))
+        self.assertEqual(support.read_phase_profile(run / "phases", CHECKS[0], self.source, self.work)["status"], "invalid")
+
+    def test_write_failure_preserves_checker_outcome(self):
+        blocked = self.work / "blocked"
+        blocked.write_text("not a directory")
+        for check in CHECKS:
+            baseline, first = self.run_tidy(check)
+            result, run = self.run_tidy(check, extra=["--store-phase-profile=" + str(blocked / "out")])
+            self.assertEqual(result.returncode, baseline.returncode)
+            self.assertEqual(result.stdout, baseline.stdout)
+            self.assertEqual((run / "fixes.yaml").read_bytes(), (first / "fixes.yaml").read_bytes())
+            self.assertEqual(result.stderr.count("Unable to store clang-tidy phase profile:"), 1)
+
+    def test_relative_directory_and_repeated_same_basename_inputs(self):
+        other = self.work / "other" / self.source.name
+        other.parent.mkdir()
+        other.write_text(BODY)
+        build = self.work / "build"
+        build.mkdir()
+        (build / "compile_commands.json").write_text(json.dumps([
+            {"file": str(source), "directory": str(build), "arguments": ["clang++", "-std=c++17", "-c", str(source)]}
+            for source in (self.source, other)]))
+        result = subprocess.run([TIDY, "-p=" + str(build), "--checks=-*," + CHECKS[0], "--config={}",
+                                 "--store-phase-profile=relative", str(self.source), str(other), str(self.source)],
+                                cwd=self.work, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        profiles = [json.loads(p.read_text()) for p in (self.work / "relative").glob("*.phases.json")]
+        self.assertEqual(len(profiles), 3)
+        self.assertEqual(sorted(p["file"] for p in profiles), sorted(map(str, [self.source, other, self.source])))
+        self.assertEqual(len({(p["pid"], p["sequence"]) for p in profiles}), 3)
+        self.assertEqual({p["build_directory"] for p in profiles}, {str(build)})
+        self.assertFalse((build / "relative").exists())
+
+
+unittest.main()

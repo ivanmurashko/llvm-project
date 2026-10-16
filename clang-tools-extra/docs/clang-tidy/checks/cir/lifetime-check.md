@@ -50,7 +50,8 @@ When lifetime analysis is enabled, CIR records an xvalue read with the serialize
 also survives writing and reloading CIR.
 
 Recognized `std::unique_ptr` and `std::shared_ptr` owners permit safe operations
-such as `get`, `release`, `reset`, and conversion to `bool` after a move.
+such as `get`, `reset`, and conversion to `bool` after a move. `std::unique_ptr`
+also permits `release`.
 Dereferencing the moved-from pointer is diagnosed. Parameter reference
 categories and method identity come from serialized CIR metadata. Ordinary
 indirect calls through prototyped free-function pointers or references retain
@@ -110,6 +111,35 @@ can require dependencies from headers, and unsupported selected bodies remain
 generation errors. Additional coverage and its cost should be measured separately
 from the default configuration. This option does not instantiate templates or
 change the analysis of C++ evaluation order.
+
+### NumThreads
+
+The requested number of CIR worker threads. The default, `0`, preserves the
+MLIR context's automatic thread selection. `1` disables multithreading, while
+larger values supply a pool with the requested maximum concurrency. The pool
+applies to CIR generation and passes, including independent per-function
+lifetime analyses. The profile records the effective count, which can differ
+on builds without threading support.
+
+### ProfileOutput
+
+An optional JSON output filename. The default is empty, which disables CIR
+profiling. Use a unique filename for each translation unit and invocation;
+existing files are preserved. Failure to write the profile is reported on
+standard error and does not prevent safety diagnostics.
+
+The profile contains the source filename, completion flag, requested/effective
+thread counts, and MLIR timing for CIR generation, explicit verification,
+canonicalization, and lifetime analysis. Early generation or pass failures
+produce incomplete profiles. MLIR wall durations have 0.0001-second output
+resolution; its `user` durations aggregate worker elapsed time and are not OS
+CPU time.
+
+Use clang-tidy's `--enable-check-profile` and `--store-check-profile` together
+for check-level wall/user/system CPU profiles. The CIR check timer includes
+matching, CIR generation, verification, and passes; it excludes frontend AST
+construction. Whole-process time minus check time includes other overhead and
+does not isolate AST construction.
 
 ## Limitations
 

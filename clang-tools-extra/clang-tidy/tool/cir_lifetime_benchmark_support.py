@@ -11,6 +11,7 @@ only the standard library.
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -19,6 +20,199 @@ import signal
 import socket
 import sys
 import time
+
+
+def read_check_profile(directory, check, source, cwd):
+    """Read one invocation's stock clang-tidy profile, never inventing zeroes."""
+    paths = sorted(Path(directory).glob("*.json"))
+    result = {"status": "missing", "files": [str(p) for p in paths]}
+    if not paths:
+        return result
+    try:
+        if len(paths) != 1:
+            raise ValueError("expected exactly one clang-tidy profile")
+        data = json.loads(paths[0].read_text())
+        recorded = Path(data["file"])
+        if not recorded.is_absolute():
+            recorded = Path(cwd) / recorded
+        if recorded.resolve() != Path(source).resolve():
+            raise ValueError("profile source differs from invocation")
+        times = {}
+        for field in ("wall", "user", "sys"):
+            value = data["profile"]["time.clang-tidy." + check + "." + field]
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError("invalid check timing: " + field)
+            times[field + "_seconds"] = value
+        result.update(status="parsed", **times)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as error:
+        result.update(status="invalid", reason=str(error))
+    return result
+
+
+def read_tidy_phase_profile(directory, source, cwd):
+    """Read frontend intervals; the TU callback interval contains check timers."""
+    paths = sorted(Path(directory).glob("*.json"))
+    result = {"status": "missing", "files": [str(p) for p in paths]}
+    if not paths:
+        return result
+    try:
+        if len(paths) != 1:
+            raise ValueError("expected exactly one clang-tidy profile")
+        data = json.loads(paths[0].read_text())
+        recorded = Path(data["file"])
+        if not recorded.is_absolute():
+            recorded = Path(cwd) / recorded
+        if recorded.resolve() != Path(source).resolve():
+            raise ValueError("profile source differs from invocation")
+        if type(data["phase_schema_version"]) is not int or data["phase_schema_version"] != 1:
+            raise ValueError("unsupported clang-tidy phase schema")
+        phases = data["phases"]
+        names = {"consumer_setup", "frontend_before_tu", "tu_callbacks"}
+        if not isinstance(phases, dict) or set(phases) != names:
+            raise ValueError("missing clang-tidy phase intervals")
+        parsed = {}
+        for name in names:
+            values = phases[name]
+            if not isinstance(values, dict) or set(values) != {
+                "wall_seconds", "user_seconds", "sys_seconds"
+            }:
+                raise ValueError("invalid clang-tidy phase: " + name)
+            for value in values.values():
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise ValueError("invalid clang-tidy phase duration: " + name)
+            parsed[name] = values
+        result.update(status="parsed", phases=parsed)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as error:
+        result.update(status="invalid", reason=str(error))
+    return result
+
+
+def read_phase_profile(directory, check, source, cwd, stock_profiling=False):
+    """Validate independent steady-clock boundaries for this exact invocation.
+
+    Completion of the TU callback does not establish checker success. Frontend
+    errors and language-filtered checks are explicitly incomplete measurements.
+    """
+    paths = sorted(Path(directory).glob("*.phases.json"))
+    result = {"status": "missing", "files": [str(p) for p in paths]}
+    if not paths:
+        return result
+    try:
+        if len(paths) != 1:
+            raise ValueError("expected exactly one independent phase profile")
+        data = json.loads(paths[0].read_text())
+        if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+            raise ValueError("unsupported independent phase schema")
+        recorded = Path(data["file"])
+        directory = Path(data["build_directory"])
+        if not directory.is_absolute() or directory.resolve() != Path(cwd).resolve():
+            raise ValueError("phase profile build directory differs from invocation")
+        if not recorded.is_absolute():
+            recorded = directory / recorded
+        if recorded.resolve() != Path(source).resolve():
+            raise ValueError("phase profile source differs from invocation")
+        if data["stock_profiling"] is not stock_profiling:
+            raise ValueError("phase profile stock-profiling mode differs")
+        for key, minimum in (("pid", 1), ("sequence", 0)):
+            if type(data[key]) is not int or data[key] < minimum:
+                raise ValueError("invalid phase profile " + key)
+        checks = data["checks"]
+        if (not isinstance(checks, list)
+                or not all(isinstance(c, str) for c in checks)
+                or len(set(checks)) != len(checks)):
+            raise ValueError("invalid instantiated check list")
+        clock = data["clock"]
+        if (clock["name"] != "std::chrono::steady_clock"
+                or clock["is_steady"] is not True
+                or clock["unit"] != "nanoseconds"
+                or any(type(clock[k]) is not int or clock[k] <= 0
+                       for k in ("period_num", "period_den"))):
+            raise ValueError("invalid phase profile clock")
+        reads = data["clock_reads"]
+        names = ("consumer_entry", "consumer_ready", "tu_entry", "tu_exit")
+        if type(reads) is not int or reads not in (2, 3, 4):
+            raise ValueError("invalid phase clock-read count")
+        boundaries = data["boundaries_ns"]
+        if not isinstance(boundaries, dict) or set(boundaries) != set(names[:reads]):
+            raise ValueError("missing or unexpected phase boundaries")
+        values = [boundaries[name] for name in names[:reads]]
+        if any(type(v) is not int or not -(2**63) <= v < 2**63 for v in values):
+            raise ValueError("invalid nanosecond boundary")
+        if values != sorted(values):
+            raise ValueError("unordered phase boundaries")
+        if type(data["complete"]) is not bool or data["complete"] != (reads == 4):
+            raise ValueError("phase completion disagrees with boundaries")
+        if reads >= 3 and type(data["frontend_error_before_tu"]) is not bool:
+            raise ValueError("missing frontend error status")
+        result.update(metadata=data)
+        if reads != 4 or data.get("frontend_error_before_tu") or check not in checks:
+            result.update(status="incomplete", reason=(
+                "TU analysis did not complete" if reads != 4 else
+                "frontend error before TU analysis" if data["frontend_error_before_tu"] else
+                "requested check was not instantiated for this language"))
+            return result
+        result.update(status="parsed", phases={
+            name: {"wall_seconds": (values[i + 1] - values[i]) / 1e9}
+            for i, name in enumerate(("consumer_setup", "frontend_before_tu", "tu_callbacks"))})
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as error:
+        result.update(status="invalid", reason=str(error))
+    return result
+
+
+def read_cir_profile(path, source, cwd, allow_incomplete=False):
+    """Extract wall durations from MLIR timers; their `user` is not OS CPU."""
+    result = {"status": "missing", "file": str(path)}
+    if not Path(path).exists():
+        return result
+    try:
+        data = json.loads(Path(path).read_text())
+        recorded = Path(data["file"])
+        if not recorded.is_absolute():
+            recorded = Path(cwd) / recorded
+        if type(data["schema_version"]) is not int or data["schema_version"] != 1 or recorded.resolve() != Path(source).resolve():
+            raise ValueError("CIR profile schema or source differs")
+        if data["complete"] is not True:
+            if allow_incomplete and data["complete"] is False:
+                return dict(result, status="incomplete", reason="CIR profiling did not complete")
+            raise ValueError("CIR profiling did not complete")
+        threads = data["effective_threads"]
+        requested = data["requested_threads"]
+        if type(threads) is not int or threads < 1 or type(requested) is not int or requested < 0:
+            raise ValueError("invalid CIR thread counts")
+        if requested and threads > requested:
+            raise ValueError("effective CIR threads exceed requested cap")
+        stages = {}
+
+        def visit(nodes):
+            if not isinstance(nodes, list):
+                raise ValueError("invalid CIR timer tree")
+            for node in nodes:
+                if not isinstance(node, dict):
+                    raise ValueError("invalid CIR timer node")
+                if not node:
+                    continue  # MLIR's JSON tree ends children with an empty object.
+                name = node["name"]
+                key = next((key for token, key in (
+                    ("CIR generation", "generation"),
+                    ("CIR verification", "verification"),
+                    ("CIRCanonicalize", "canonicalization"),
+                    ("LifetimeCheck", "lifetime")) if token in name), None)
+                if key:
+                    value = node["wall"]["duration"]
+                    if key in stages or type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                        raise ValueError("invalid or duplicate CIR stage: " + key)
+                    stages[key] = value
+                visit(node.get("passes", []))
+
+        visit(data["timing"])
+        if set(stages) != {"generation", "verification", "canonicalization", "lifetime"}:
+            raise ValueError("missing CIR stage timers")
+        result.update(status="parsed", wall_seconds=stages,
+                      requested_threads=requested, effective_threads=threads,
+                      wall_resolution_seconds=0.0001)
+    except (OSError, ValueError, KeyError, TypeError, OverflowError, RecursionError) as error:
+        result.update(status="invalid", reason=str(error))
+    return result
 
 
 def file_hash(path):

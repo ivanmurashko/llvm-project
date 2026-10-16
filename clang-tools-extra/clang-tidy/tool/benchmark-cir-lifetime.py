@@ -40,6 +40,7 @@ _support_spec.loader.exec_module(support)
 
 CHECK = "cir-lifetime-check"
 CHECKS = (CHECK, "bugprone-use-after-move")
+PROFILE_MODES = ("off", "phases", "phases+cir", "legacy")
 # Compile commands can force color despite --use-color=false. Strip terminal
 # controls only when interpreting diagnostics; keep the raw log files intact.
 ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -101,6 +102,7 @@ def parse_args():
             "--" + variant + "-assertions", choices=("on", "off"), required=True
         )
         parser.add_argument("--" + variant + "-check", choices=CHECKS, default=CHECK)
+        parser.add_argument("--" + variant + "-profile-mode", choices=PROFILE_MODES)
         parser.add_argument(
             "--" + variant + "-check-option",
             action="append",
@@ -140,6 +142,10 @@ def parse_args():
     parser.add_argument("--repetitions", type=positive_int, default=3)
     parser.add_argument("--warmups", type=nonnegative_int, default=0)
     parser.add_argument("--jobs", type=positive_int, default=1)
+    parser.add_argument(
+        "--profile-checks", action="store_true",
+        help="compatibility alias: select legacy profiling for both variants",
+    )
     parser.add_argument(
         "--execution-mode",
         choices=("paired", "batches"),
@@ -184,7 +190,7 @@ def parse_args():
         default=[],
         metavar="NAME=VALUE",
         help=(
-            "HistoryList, RemarksList, HistLimit, or AnalyzeUnusedMainFileFunctions; "
+            "HistoryList, RemarksList, HistLimit, NumThreads, or AnalyzeUnusedMainFileFunctions; "
             "identical for both tools"
         ),
     )
@@ -257,6 +263,18 @@ def variant_check(args, variant):
     return getattr(args, variant + "_check", CHECK)
 
 
+def profile_mode(args, variant):
+    mode = getattr(args, variant + "_profile_mode", None)
+    if getattr(args, "profile_checks", False):
+        if mode is not None:
+            raise ValueError("--profile-checks cannot be combined with per-variant profile modes")
+        mode = "legacy"
+    mode = mode or "off"
+    if mode == "phases+cir" and variant_check(args, variant) != CHECK:
+        raise ValueError("phases+cir requires cir-lifetime-check")
+    return mode
+
+
 def analysis_config(args, variant=None):
     check = variant_check(args, variant) if variant else CHECK
     options = (
@@ -275,8 +293,11 @@ def analysis_config(args, variant=None):
         name, separator, value = setting.partition("=")
         name = name.removeprefix(check + ".")
         unused_functions = check == CHECK and name == "AnalyzeUnusedMainFileFunctions"
-        if not separator or (name not in options and not unused_functions):
+        threads = check == CHECK and name == "NumThreads"
+        if not separator or (name not in options and not unused_functions and not threads):
             raise ValueError("unknown check option: " + setting)
+        if threads and (not value.isascii() or not value.isdigit() or int(value) > 2**32 - 1):
+            raise ValueError("NumThreads must be an unsigned 32-bit integer")
         if unused_functions:
             if value.lower() not in ("true", "false"):
                 raise ValueError("AnalyzeUnusedMainFileFunctions must be true or false")
@@ -417,17 +438,26 @@ def run_analysis(
     stdout = directory / "stdout.txt"
     stderr = directory / "stderr.txt"
     yaml = directory / "diagnostics.yaml"
+    check = variant_check(args, variant)
+    mode = profile_mode(args, variant)
+    invocation_config = json.loads(json.dumps(config))
+    if mode in ("phases+cir", "legacy") and check == CHECK:
+        invocation_config["CheckOptions"][CHECK + ".ProfileOutput"] = str(directory / "cir-profile.json")
     command = [
         binary["path"],
         "-p=" + str(output / "compilation-database"),
         "--checks=" + config["Checks"],
-        "--config=" + json.dumps(config, sort_keys=True),
+        "--config=" + json.dumps(invocation_config, sort_keys=True),
         "--warnings-as-errors=",
         "--use-color=false",
         "--quiet",
         "--export-fixes=" + str(yaml),
         unit["command"]["file"],
     ]
+    if mode != "off":
+        command[1:1] = ["--store-phase-profile=" + str(directory / "phase-profile")]
+    if mode == "legacy":
+        command[1:1] = ["--enable-check-profile", "--store-check-profile=" + str(directory / "check-profile")]
     cwd = unit["command"]["directory"]
     returncode, elapsed, memory, forced_status = measure_process(
         command, cwd, environment, args.timeout, stdout, stderr
@@ -436,7 +466,6 @@ def run_analysis(
         stdout.read_text(errors="replace") + "\n" + stderr.read_text(errors="replace")
     )
     diagnostics = parse_diagnostics(diagnostics_text)
-    check = variant_check(args, variant)
     eligibility = (
         getattr(args, "_eligibility", {}).get(
             unit["id"],
@@ -455,6 +484,7 @@ def run_analysis(
         "repetition": repetition,
         "phase": phase,
         "check": check,
+        "profile_mode": mode,
         "status": forced_status
         or classify(returncode, diagnostics_text, diagnostics, check),
         "returncode": returncode,
@@ -478,11 +508,44 @@ def run_analysis(
         )
         record["diagnostic_groups"] = parsed.pop("groups")
         record["diagnostic_export"] = parsed
+    if mode != "off":
+        record["tidy_phase_profile"] = support.read_phase_profile(
+            directory / "phase-profile", check, unit["command"]["file"], cwd,
+            stock_profiling=mode == "legacy")
+    if mode == "legacy":
+        record["check_profile"] = support.read_check_profile(
+            directory / "check-profile", check, unit["command"]["file"], cwd)
+    if mode in ("phases+cir", "legacy") and check == CHECK:
+        record["cir_profile"] = support.read_cir_profile(
+            directory / "cir-profile.json", unit["command"]["file"], cwd,
+            allow_incomplete=True)
+    record["profile_validation"] = validate_profiles(record)
     (directory / "run.json").write_text(json_text(record))
     return record
 
 
-def summarize(report):
+def validate_profiles(run):
+    mode = run.get("profile_mode", "off")
+    if mode == "off":
+        return {"status": "disabled"}
+    if (run["status"] != "success"
+            or run.get("eligibility", {}).get("eligible") is not True):
+        return {"status": "not_applicable"}
+    required = ["tidy_phase_profile"]
+    if mode == "legacy":
+        required.append("check_profile")
+    if mode in ("phases+cir", "legacy") and run["check"] == CHECK:
+        required.append("cir_profile")
+    failures = {name: run.get(name, {}).get("status", "missing") for name in required
+                if run.get(name, {}).get("status") != "parsed"}
+    if not failures:
+        intervals = run["tidy_phase_profile"]["phases"]
+        if sum(p["wall_seconds"] for p in intervals.values()) > run["wall_seconds"] + 1e-6:
+            failures["tidy_phase_profile"] = "intervals exceed process wall time"
+    return {"status": "failed", "failures": failures} if failures else {"status": "parsed"}
+
+
+def summarize_legacy(report):
     def measured_maximum(records, field):
         return max(
             (run[field] for run in records
@@ -536,6 +599,13 @@ def summarize(report):
             ],
             "coverage_fraction": len(successful[variant]) / len(units),
             "status_counts": dict(Counter(run["status"] for run in selected)),
+            "check_profile_status_counts": dict(Counter(
+                run.get("check_profile", {}).get("status", "disabled") for run in selected)),
+            "tidy_phase_profile_status_counts": dict(Counter(
+                run.get("tidy_phase_profile", {}).get("status", "disabled")
+                for run in selected)),
+            "cir_profile_status_counts": dict(Counter(
+                run.get("cir_profile", {}).get("status", "disabled") for run in selected)),
             "warmup_status_counts": dict(
                 Counter(run["status"] for run in warmups if run["variant"] == variant)
             ),
@@ -578,9 +648,15 @@ def summarize(report):
         "candidate_over_baseline_wall_ratio": None,
         "per_unit": [],
     }
+    profiling_asymmetry = (
+        report["measurement"].get("check_profiling", False)
+        and report["binaries"]["baseline"]["check"]
+        != report["binaries"]["candidate"]["check"]
+    )
     paired_timing = (
         report["measurement"].get("workers", 1) == 1
         and report["measurement"].get("execution", "paired") == "paired"
+        and not profiling_asymmetry
     )
     for file in common:
         item = {"relative_file": file}
@@ -632,6 +708,9 @@ def summarize(report):
             )
         elif not paired_timing:
             comparison["timing_ratio_unavailable_reason"] = (
+                "check profiling has matcher-dependent overhead; compare unprofiled "
+                "runs for cross-check latency"
+                if profiling_asymmetry else
                 "only serial paired execution provides paired timing ratios"
             )
     else:
@@ -653,6 +732,160 @@ def summarize(report):
     report["paired_unit_outcomes"] = dict(paired_outcomes)
     report["summary"] = summary
     report["comparison"] = comparison
+    if report["measurement"].get("check_profiling"):
+        profiled = []
+        for file in common:
+            if not all(run.get("check_profile", {}).get("status") == "parsed"
+                       for variant in ("baseline", "candidate")
+                       for run in by_unit[(variant, file)]):
+                continue
+            item = {"relative_file": file}
+            for variant in ("baseline", "candidate"):
+                selected = by_unit[(variant, file)]
+                item[variant] = {
+                    field: statistics.median(run["check_profile"][field] for run in selected)
+                    for field in ("wall_seconds", "user_seconds", "sys_seconds")}
+                phases = [run.get("tidy_phase_profile", {}) for run in selected]
+                if all(phase.get("status") == "parsed" for phase in phases):
+                    item[variant]["tidy_phase_wall_seconds"] = {
+                        name: statistics.median(
+                            phase["phases"][name]["wall_seconds"] for phase in phases)
+                        for name in ("consumer_setup", "frontend_before_tu", "tu_callbacks")}
+                stages = [run.get("cir_profile", {}) for run in selected]
+                if all(stage.get("status") == "parsed" for stage in stages):
+                    item[variant]["cir_stage_wall_seconds"] = {
+                        stage: statistics.median(s["wall_seconds"][stage] for s in stages)
+                        for stage in ("generation", "verification", "canonicalization", "lifetime")}
+            baseline = item["baseline"]["wall_seconds"]
+            if paired_timing and baseline > 0:
+                item["candidate_over_baseline_check_wall_ratio"] = item["candidate"]["wall_seconds"] / baseline
+            profiled.append(item)
+        report["profiling"] = {
+            "common_profiled_units": len(profiled),
+            "excluded_common_units": len(common) - len(profiled),
+            "tidy_phase_profiled_units": {
+                variant: sum("tidy_phase_wall_seconds" in item[variant]
+                             for item in profiled)
+                for variant in ("baseline", "candidate")},
+            "cir_stage_profiled_units": {
+                variant: sum("cir_stage_wall_seconds" in item[variant] for item in profiled)
+                for variant in ("baseline", "candidate")},
+            "per_unit": profiled,
+            "timing_note": "instrumented check wall includes matching/callback and matcher-dependent timer overhead; CIR includes generation and passes; process residual is not pure AST time; cross-check timing ratios require unprofiled runs",
+        }
+
+
+def summarize(report):
+    # Historical extended-stock reports retain their original interpretation.
+    if report.get("schema_version", 2) < 3:
+        return summarize_legacy(report)
+    modes = report["measurement"]["profile_modes"]
+    # Reuse execution/coverage accounting, but never the old profiled ratios.
+    legacy = dict(report, measurement=dict(report["measurement"], check_profiling=False))
+    summarize_legacy(legacy)
+    for key in ("summary", "comparison", "paired_unit_outcomes"):
+        report[key] = legacy[key]
+    runs = [r for r in report["runs"] if r.get("phase", "measured") == "measured"]
+    by_unit = defaultdict(list)
+    for run in runs:
+        by_unit[(run["variant"], run["relative_file"])].append(run)
+    validation_failures = []
+    for variant in ("baseline", "candidate"):
+        selected = [r for r in runs if r["variant"] == variant]
+        for run in selected:
+            run["profile_validation"] = validate_profiles(run)
+            if run["profile_validation"]["status"] == "failed":
+                validation_failures.append({"variant": variant, "unit_id": run["unit_id"],
+                                           "repetition": run["repetition"],
+                                           **run["profile_validation"]})
+        report["summary"][variant]["profile_validation_status_counts"] = dict(Counter(
+            r["profile_validation"]["status"] for r in selected))
+        report["summary"][variant]["sum_wall_seconds_all_runs"] = sum(r["wall_seconds"] for r in selected)
+    report["measurement_validation"] = {
+        "status": "failed" if validation_failures else "valid",
+        "failure_count": len(validation_failures), "failures": validation_failures}
+    comparison = report["comparison"]
+    common = comparison["common_successful_units"]
+    timing_units = [file for file in common if all(
+        r["profile_validation"]["status"] in ("disabled", "parsed")
+        for variant in ("baseline", "candidate") for r in by_unit[(variant, file)])]
+    comparison["timing_units"] = timing_units
+    timing_unit_set = set(timing_units)
+    comparison["available"] = bool(timing_units)
+    if common and not timing_units:
+        comparison["unavailable_reason"] = "no common successful units have valid requested profiles"
+    comparison["excluded_profile_units"] = sorted(set(common) - set(timing_units))
+    # Do not silently salvage a campaign with broken successful measurements.
+    comparative_modes = modes["baseline"] == modes["candidate"] and modes["baseline"] in ("off", "phases")
+    same_analysis = (
+        report["binaries"]["baseline"]["check"] == report["binaries"]["candidate"]["check"]
+        and report["binaries"]["baseline"].get("sha256") is not None
+        and report["binaries"]["baseline"]["sha256"] == report["binaries"]["candidate"].get("sha256")
+        and report.get("analysis_configs", {}).get("baseline") is not None
+        and report["analysis_configs"]["baseline"] == report["analysis_configs"].get("candidate"))
+    same_instrument = same_analysis and set(modes.values()) in (
+        {"off", "phases"}, {"off", "legacy"})
+    serial = report["measurement"].get("workers", 1) == 1 and report["measurement"].get("execution", "paired") == "paired"
+    allow_ratio = serial and not validation_failures and (comparative_modes or same_instrument)
+    comparison["comparison_kind"] = (
+        "instrumentation_overhead" if same_instrument else
+        "repeatability" if same_analysis and modes["baseline"] == modes["candidate"] else
+        "checker_comparison")
+    comparison["candidate_over_baseline_wall_ratio"] = None
+    comparison.pop("timing_ratio_unavailable_reason", None)
+    comparison["per_unit"] = [item for item in comparison["per_unit"] if item["relative_file"] in timing_unit_set]
+    for item in comparison["per_unit"]:
+        item.pop("candidate_over_baseline_wall_ratio", None)
+        item.pop("candidate_over_baseline_rss_ratio", None)
+        if allow_ratio:
+            base = item["baseline"]
+            item["candidate_over_baseline_wall_ratio"] = item["candidate"]["median_wall_seconds"] / base["median_wall_seconds"] if base["median_wall_seconds"] else None
+            item["candidate_over_baseline_rss_ratio"] = item["candidate"]["median_peak_rss_bytes"] / base["median_peak_rss_bytes"] if base["median_peak_rss_bytes"] else None
+    for variant in ("baseline", "candidate"):
+        comparison[variant + "_sum_median_wall_seconds"] = sum(item[variant]["median_wall_seconds"] for item in comparison["per_unit"])
+        report["summary"][variant]["excluded_input_wall_seconds"] = sum(
+            r["wall_seconds"] for r in runs if r["variant"] == variant and r["relative_file"] not in timing_unit_set)
+    baseline = comparison["baseline_sum_median_wall_seconds"]
+    if allow_ratio and baseline:
+        comparison["candidate_over_baseline_wall_ratio"] = comparison["candidate_sum_median_wall_seconds"] / baseline
+    elif not allow_ratio:
+        comparison["timing_ratio_unavailable_reason"] = (
+            "profile validation failed on successful eligible invocations" if validation_failures else
+            "only serial paired execution provides paired timing ratios" if not serial else
+            "matcher-dependent stock timers or asymmetric detailed profiling; compare matching off or phases modes")
+    if not any(mode != "off" for mode in modes.values()):
+        return
+    profiled = []
+    for file in timing_units:
+        item = {"relative_file": file}
+        for variant in ("baseline", "candidate"):
+            selected = by_unit[(variant, file)]
+            entry = item[variant] = {"profile_mode": modes[variant]}
+            if modes[variant] != "off":
+                entry["tidy_phase_wall_seconds"] = {
+                    name: statistics.median(r["tidy_phase_profile"]["phases"][name]["wall_seconds"] for r in selected)
+                    for name in ("consumer_setup", "frontend_before_tu", "tu_callbacks")}
+                entry["median_process_residual_seconds"] = statistics.median(
+                    r["wall_seconds"] - sum(p["wall_seconds"] for p in r["tidy_phase_profile"]["phases"].values()) for r in selected)
+            if modes[variant] == "legacy":
+                entry["stock_check_seconds"] = {field: statistics.median(r["check_profile"][field] for r in selected)
+                                                for field in ("wall_seconds", "user_seconds", "sys_seconds")}
+            if modes[variant] in ("phases+cir", "legacy") and selected[0]["check"] == CHECK:
+                entry["cir_stage_wall_seconds"] = {
+                    stage: statistics.median(r["cir_profile"]["wall_seconds"][stage] for r in selected)
+                    for stage in ("generation", "verification", "canonicalization", "lifetime")}
+        # TU intervals are comparable only in matching independent modes.
+        if allow_ratio and modes["baseline"] == modes["candidate"] == "phases":
+            base = item["baseline"]["tidy_phase_wall_seconds"]["tu_callbacks"]
+            item["candidate_over_baseline_tu_analysis_wall_ratio"] = item["candidate"]["tidy_phase_wall_seconds"]["tu_callbacks"] / base if base else None
+        profiled.append(item)
+    report["profiling"] = {
+        "common_profiled_units": len(profiled),
+        "excluded_common_units": len(common) - len(profiled),
+        "tidy_phase_profiled_units": {v: sum("tidy_phase_wall_seconds" in item[v] for item in profiled) for v in modes},
+        "cir_stage_profiled_units": {v: sum("cir_stage_wall_seconds" in item[v] for item in profiled) for v in modes},
+        "per_unit": profiled,
+        "timing_note": "TU-analysis wall includes AST matching, callbacks, in-TU diagnostics, and CIR generation/passes/context teardown; it is not pure solver time. Residual includes startup, teardown, serialization and wrapper overhead, not pure AST time. Stock timers remain matcher dependent."}
 
 
 def save_report(report, output):
@@ -697,6 +930,7 @@ def benchmark(args):
     database = args.compilation_database.resolve()
     if database.is_dir():
         database /= "compile_commands.json"
+    profile_modes = {v: profile_mode(args, v) for v in ("baseline", "candidate")}
     configs = {
         variant: analysis_config(args, variant) for variant in ("baseline", "candidate")
     }
@@ -785,7 +1019,7 @@ def benchmark(args):
         (output / "eligibility.json").write_text(json_text(args._eligibility))
     support.verify_fingerprints(fingerprints)
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "started_at": timestamp(),
         "finished_at": None,
         "complete": False,
@@ -810,6 +1044,8 @@ def benchmark(args):
             "execution": mode,
             "memory": "compiler-child wait4 ru_maxrss via a fresh small supervisor, normalized to bytes; residual supervisor-image floor, not private heap or aggregate process-tree RSS",
             "warmup_runs": args.warmups,
+            "check_profiling": any(m == "legacy" for m in profile_modes.values()),
+            "profile_modes": profile_modes,
         },
         "analysis_config": (
             configs["baseline"] if configs["baseline"] == configs["candidate"] else None
@@ -987,9 +1223,13 @@ def benchmark(args):
         count = report["summary"][variant]["successful_units"]
         print(f"{variant}: {count}/{len(units)} units succeeded in all repetitions")
     comparison = report["comparison"]
-    count = len(comparison["common_successful_units"])
+    count = len(comparison["timing_units"])
     ratio = comparison["candidate_over_baseline_wall_ratio"]
-    print(f"Common-success timing cohort: {count}/{len(units)} units")
+    print(f"Validated timing cohort: {count}/{len(units)} units")
+    if report["measurement_validation"]["failure_count"]:
+        print("Measurement validation failed: " +
+              str(report["measurement_validation"]["failure_count"]) +
+              " successful eligible invocations have invalid requested profiles")
     print(
         f"Candidate/baseline wall-time ratio: {ratio:.4f}"
         if ratio is not None
