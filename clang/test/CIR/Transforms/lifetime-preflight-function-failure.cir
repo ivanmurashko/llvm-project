@@ -1,0 +1,45 @@
+// RUN: not cir-opt %s --mlir-disable-threading --cir-lifetime-check="history=all" -o /dev/null 2> %t.serial
+// RUN: FileCheck %s --input-file=%t.serial --implicit-check-not='warning:' --implicit-check-not='error:' --implicit-check-not='note:'
+// RUN: not cir-opt %s --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.parallel
+// RUN: diff %t.serial %t.parallel
+// RUN: cir-opt %s --mlir-print-debuginfo -o %t.text.cir
+// RUN: not cir-opt %t.text.cir --cir-lifetime-check="history=all" -o /dev/null 2> %t.text
+// RUN: diff %t.serial %t.text
+// RUN: cir-opt %s --emit-bytecode -o %t.bc
+// RUN: not cir-opt %t.bc --cir-lifetime-check="history=all" -o /dev/null 2> %t.bytecode
+// RUN: diff %t.serial %t.bytecode
+
+// Unsupported control flow is function-local, including preflight validation.
+// Preserve the unreachable duplicate label when serializing this input.
+!i = !cir.int<s, 32>
+!p = !cir.ptr<!i>
+!pp = !cir.ptr<!p>
+module {
+  cir.func @before() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("before":1:1)
+    cir.store %null, %pointer : !p, !pp
+    %value = cir.load deref %pointer : !pp, !p loc("before":2:1)
+    cir.return
+  }
+  cir.func @bad() {
+    cir.label "same" loc("first-label":1:1)
+    cir.return
+  ^other:
+    cir.label "same" loc("duplicate-label":1:1)
+    cir.return
+  }
+  cir.func @after() {
+    %pointer = cir.alloca "pointer" align(8) : !pp
+    %null = cir.const #cir.ptr<null> : !p loc("after":1:1)
+    cir.store %null, %pointer : !p, !pp
+    %value = cir.load deref %pointer : !pp, !p loc("after":2:1)
+    cir.return
+  }
+}
+
+// CHECK: before:2:1: warning: use of invalid pointer 'pointer'
+// CHECK: before:1:1: note: 'nullptr' invalidated here
+// CHECK: duplicate-label:1:1: error: unsupported control flow in lifetime analysis: duplicate symbolic label
+// CHECK: after:2:1: warning: use of invalid pointer 'pointer'
+// CHECK: after:1:1: note: 'nullptr' invalidated here

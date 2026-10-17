@@ -1,0 +1,51 @@
+// RUN: cir-opt %s --cir-lifetime-check="history=all" --verify-diagnostics -o /dev/null
+// RUN: sed '/expected-/d' %s > %t.clean.cir
+// RUN: cir-opt %t.clean.cir --cir-lifetime-check="history=all" --mlir-disable-threading -o /dev/null 2> %t.serial
+// RUN: FileCheck %s --input-file=%t.serial --implicit-check-not='warning:' --implicit-check-not='error:'
+// RUN: cir-opt %t.clean.cir --cir-lifetime-check="history=all" --mlir-disable-threading=false -o /dev/null 2> %t.parallel
+// RUN: diff %t.serial %t.parallel
+// RUN: cir-opt %t.clean.cir --cir-canonicalize --mlir-print-debuginfo -o %t.cir
+// RUN: cir-opt %t.cir --cir-lifetime-check="history=all" -o /dev/null 2> %t.text
+// RUN: diff %t.serial %t.text
+// RUN: cir-opt %t.cir --emit-bytecode -o %t.bc
+// RUN: cir-opt %t.bc --cir-lifetime-check="history=all" -o /dev/null 2> %t.bytecode
+// RUN: diff %t.serial %t.bytecode
+
+// An operator spelling without a complete one-parameter source mapping does
+// not prove an assignment contract. Keep the incoming moved-from receiver.
+!i = !cir.int<s, 32>
+!r = !cir.struct<"Record" {data !i}>
+!p = !cir.ptr<!r>
+module {
+  cir.func private @consume(!p) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = false, is_static = false, is_const = false, is_overloaded_operator = false, parameter_kinds = [2], parameter_indices = [0]>}
+  cir.func private @zero_parameter_assignment(!p) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = true, has_implicit_object = true, method_name = "operator=", parameter_kinds = [], parameter_indices = []>}
+  cir.func private @missing_parameter_assignment(!p) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = false, is_overloaded_operator = true, has_implicit_object = true, method_name = "operator=">}
+  cir.func private @observe(!p) attributes {nothrow, lifetime = #cir.lifetime_function<is_method = true, is_static = false, is_const = true, is_overloaded_operator = false, has_implicit_object = true, method_name = "observe", parameter_kinds = [], parameter_indices = []>}
+
+  cir.func @zero_parameter_mapping() {
+    %object = cir.alloca "object" align(4) : !p
+    // expected-note @below {{moved here}}
+    cir.call @consume(%object) nothrow : (!p) -> ()
+    // expected-warning @below {{use of moved-from value 'object'}}
+    cir.call @zero_parameter_assignment(%object) nothrow : (!p) -> ()
+    // expected-warning @below {{use of moved-from value 'object'}}
+    cir.call @observe(%object) nothrow : (!p) -> ()
+    cir.return
+  }
+
+  cir.func @missing_parameter_mapping() {
+    %object = cir.alloca "object" align(4) : !p
+    // expected-note @below {{moved here}}
+    cir.call @consume(%object) nothrow : (!p) -> ()
+    // expected-warning @below {{use of moved-from value 'object'}}
+    cir.call @missing_parameter_assignment(%object) nothrow : (!p) -> ()
+    // expected-warning @below {{use of moved-from value 'object'}}
+    cir.call @observe(%object) nothrow : (!p) -> ()
+    cir.return
+  }
+}
+
+// CHECK: warning: use of moved-from value 'object'
+// CHECK: warning: use of moved-from value 'object'
+// CHECK: warning: use of moved-from value 'object'
+// CHECK: warning: use of moved-from value 'object'

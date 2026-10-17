@@ -3,8 +3,8 @@
 // RUN: not cir-opt %s --mlir-disable-threading=false --cir-lifetime-check="history=all" -o /dev/null 2> %t.parallel
 // RUN: diff %t.serial %t.parallel
 
-// A function-local analysis failure must not cancel later functions. Unlike
-// module-level switch validation, this error occurs after analysis has begun.
+// A function-local analysis failure must not cancel later functions. This
+// exercises failure during analysis rather than control-flow preflight.
 !i = !cir.int<s, 32>
 !p = !cir.ptr<!i>
 !pp = !cir.ptr<!p>
